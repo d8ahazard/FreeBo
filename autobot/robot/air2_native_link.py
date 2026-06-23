@@ -40,12 +40,13 @@ class Air2NativeLink(RobotLink):
         self._sess_lock = threading.Lock()
         self._robot_id = int(os.environ.get("EBO_ROBOT_ID", "0") or 0)
         self.rtm = RtmNode(self._provider, on_event=self._on_rtm_event)
-        # Robot-speaker talkback needs the RTC join to declare an audio SEND codec, otherwise the gateway drops
-        # everything we publish. Opt in with AUTOBOT_AIR2_NATIVE_TALK=1. When off we keep the minimal caps
-        # (None) that the receive-only video path has always used, so the default path is untouched.
-        self._native_talk = os.environ.get("AUTOBOT_AIR2_NATIVE_TALK", "").strip().lower() in (
+        # Audio: ALWAYS declare RECV audio in the RTC join so the gateway forwards the robot's mic (needed for
+        # STT/voice — sniffing proved the RTM mic handshake was already correct; the missing piece was the
+        # recv-audio capability). SEND audio (talkback onto the robot's speaker) is on by default; disable with
+        # AUTOBOT_AIR2_NATIVE_TALK=0. Either way we now pass real caps (never None), so mic always flows.
+        self._native_talk = os.environ.get("AUTOBOT_AIR2_NATIVE_TALK", "1").strip().lower() in (
             "1", "true", "yes", "on")
-        caps = build_rtp_capabilities() if self._native_talk else None
+        caps = build_rtp_capabilities(send_audio=self._native_talk)
         self.receiver = AgoraNativeReceiver(session_provider=self._provider, hub=self.hub,
                                             rtp_capabilities=caps)
         self._media_started = False

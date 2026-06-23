@@ -54,19 +54,28 @@ _AUDIO_EXTS = [
 ]
 
 
-def build_rtp_capabilities() -> dict:
-    """rtpCapabilities for a join that PUBLISHES audio (talkback). Starts from the browser's proven caps (so
-    video reception is unchanged) and adds a PCMA send codec + the audio header extensions the gateway lists,
-    so our outbound G.711 A-law RTP is actually forwarded to the robot. Without a `send.audioCodecs` entry the
-    gateway silently drops everything we publish — which is why earlier talkback was inaudible."""
+def build_rtp_capabilities(send_audio: bool = True) -> dict:
+    """rtpCapabilities for the RTC join. Starts from the browser's proven caps (so video reception is
+    unchanged) and ALWAYS declares RECV audio codecs + the audio header extensions the gateway lists.
+
+    Why recv audio is mandatory: sniffing the EBO app showed its mic RTM handshake (102001/102003) is
+    byte-identical to ours, yet with `rtpCapabilities=None` the robot announces `audio=None` and never streams
+    its mic. The missing piece was telling the gateway we can RECEIVE audio — once declared, the robot
+    publishes its mic and we can run STT/voice commands. `send_audio` additionally declares a PCMA SEND codec
+    for talkback (robot speaker); without it the gateway silently drops anything we publish."""
     import pathlib
     caps = json.loads((pathlib.Path(__file__).with_name("agora_rtp_caps.json")).read_text(encoding="utf-8"))
     caps.setdefault("send", {}).setdefault("audioCodecs", [])
     caps.setdefault("recv", {}).setdefault("audioCodecs", [])
-    caps["send"]["audioCodecs"] = [_PCMA_CODEC]
-    caps["send"]["audioExtensions"] = []   # our published RTP carries no header extensions — don't advertise any
+    # RECV audio — always on, so we hear the robot's mic (the fix for "it won't listen").
     caps["recv"]["audioCodecs"] = [_PCMA_CODEC, _OPUS_CODEC]
     caps["recv"]["audioExtensions"] = list(_AUDIO_EXTS)
+    # SEND audio — only when talkback is enabled (publishing TTS onto the robot's speaker).
+    if send_audio:
+        caps["send"]["audioCodecs"] = [_PCMA_CODEC]
+        caps["send"]["audioExtensions"] = []   # our published RTP carries no header extensions
+    else:
+        caps["send"]["audioCodecs"] = []
     return caps
 
 
@@ -148,7 +157,7 @@ class AgoraNativeReceiver:
         self._pub_task: Optional[asyncio.Task] = None
         self._want_publish = False                # keep the talkback track alive across RTC reconnects
         self._tts_payloads: deque = deque()      # queued G.711 frames (TTS) to send on the publish loop
-        self._talk_on = os.environ.get("AUTOBOT_AIR2_NATIVE_TALK", "").strip().lower() in (
+        self._talk_on = os.environ.get("AUTOBOT_AIR2_NATIVE_TALK", "1").strip().lower() in (
             "1", "true", "yes", "on")
 
     # ---- lifecycle ----
