@@ -1,0 +1,11 @@
+python3
+python3-venv
+python3-pip
+ffmpeg
+espeak-ng
+git
+curl
+ca-certificates
+jq
+avahi-daemon
+network-manager

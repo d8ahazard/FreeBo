@@ -1,0 +1,959 @@
+"""Autobot web server: REST + WebSocket + video proxy, and it serves the UI.
+
+This is the single app the user opens. It owns the RobotLink (native or mock) and the AgentBrain, broadcasts
+events (telemetry, AI thoughts, actions) to the browser over WebSocket, proxies video (WHEP/HLS) from the
+local mediamtx so the UI is same-origin, and exposes manual controls + an always-available emergency stop.
+
+Run:  python -m autobot
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections import deque
+from pathlib import Path
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from ..brain import notify, summarizer, tts
+from ..brain.agent import AgentBrain
+from ..brain.identity import Identity
+from ..brain.memory import Memory
+from ..brain.providers import catalog_for_ui, get_provider
+from ..config import SETTINGS
+from ..robot.frames import param_set_frame
+from ..robot.link import make_link
+from . import onboarding as _onboarding
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WEBUI_DIST = REPO_ROOT / "webui" / "dist"
+FALLBACK_HTML = Path(__file__).parent / "static" / "fallback.html"
+
+app = FastAPI(title="FreeBo")
+
+# --- the single robot link + brain (with memory + identity) for this process ---
+LINK = make_link(SETTINGS.snapshot())
+MEMORY = Memory()
+IDENTITY = Identity(emit=lambda ev: emit(ev))
+brain = AgentBrain(SETTINGS, lambda ev: emit(ev), LINK, MEMORY, IDENTITY)
+ONBOARD = _onboarding.Onboarding(LINK, SETTINGS, IDENTITY, brain, lambda ev: emit(ev))
+
+# --- the live media fan-out: the camera feed is decoded once and shared with the UI preview, the VSLAM
+# mapper, and (via the brain) the AI. Frames arrive either from the native receiver or the browser bridge. ---
+from ..robot.media_hub import MediaHub, VideoFrame  # noqa: E402
+from ..brain.slam import VisualSlam  # noqa: E402
+
+MEDIA_HUB = MediaHub()
+SLAM = VisualSlam()
+AUDIO_SINK = None
+_frame_seq = 0
+
+
+def _active_hub() -> MediaHub:
+    """The hub the UI/VSLAM read from. Native links own their own hub (fed by the RTC receiver); other links
+    use the shared hub fed by browser frame POSTs."""
+    return getattr(LINK, "hub", None) or MEDIA_HUB
+
+
+def _publish_frame(jpeg: bytes) -> None:
+    """Decode an inbound JPEG camera frame and publish it to the media hub (UI preview + VSLAM read it).
+    Best-effort + cheap (imdecode of a ~640px frame is ~1ms); never raises into the request path."""
+    global _frame_seq
+    try:
+        import time as _t
+
+        import cv2
+        import numpy as np
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return
+        _frame_seq += 1
+        h, w = bgr.shape[:2]
+        MEDIA_HUB.publish_video(VideoFrame(bgr=bgr, width=w, height=h, seq=_frame_seq,
+                                           rtp_ts=int(_t.monotonic() * 90000), wall_ts=_t.monotonic()))
+    except Exception:  # noqa: BLE001
+        pass
+
+# --- event hub ---
+_ws_clients: set[WebSocket] = set()
+_event_ring: deque[dict] = deque(maxlen=300)
+
+
+async def emit(event: dict):
+    _event_ring.append(event)
+    dead = []
+    for ws in list(_ws_clients):
+        try:
+            await ws.send_json(event)
+        except Exception:  # noqa: BLE001
+            dead.append(ws)
+    for ws in dead:
+        _ws_clients.discard(ws)
+
+
+# ------------- lifecycle -------------
+# --- 2-way call: inbound robot mic audio is fanned out to call websockets (G.711 µ-law, 8 kHz) ---
+_call_clients: set[WebSocket] = set()
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _audio_in_sink(mulaw: bytes):
+    """Called from the link's audio thread; schedule a send to call clients on the event loop."""
+    if not _call_clients or _MAIN_LOOP is None:
+        return
+    import base64
+    msg = {"type": "audio", "b64": base64.b64encode(mulaw).decode()}
+    for ws in list(_call_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(msg), _MAIN_LOOP)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.on_event("startup")
+async def _startup():
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+    # Start subprocesses (native) off the event loop so a slow spawn never blocks startup.
+    await asyncio.to_thread(LINK.start)
+    # The Air 2 bridge link emits drive commands over the WS (the browser relays them to Agora RTM).
+    if hasattr(LINK, "set_emit"):
+        LINK.set_emit(emit)
+    brain.start()
+    # Attach the VSLAM mapper to whichever hub is live (native link's RTC hub, or the shared browser-fed hub).
+    with contextlib.suppress(Exception):
+        SLAM.attach(_active_hub())
+    # Let the brain's closed-loop motion check corroborate camera frame-diff with VSLAM pose.
+    with contextlib.suppress(Exception):
+        brain.motion.pose_provider = SLAM.map_data
+    # Give the brain (curiosity coverage) + spatial skills (place tagging / go_to_place) the same pose source.
+    with contextlib.suppress(Exception):
+        brain.pose_provider = SLAM.map_data
+    # Native links carry decoded robot-mic audio on their hub — turn it into speech for the brain (the agent
+    # still gates on allow_audio_in). No-op for links without a hub / without an audio stream.
+    if hasattr(LINK, "hub"):
+        with contextlib.suppress(Exception):
+            from ..brain.audio_sink import AudioSink
+            global AUDIO_SINK
+            AUDIO_SINK = AudioSink(on_utterance=lambda text: brain.feed_speech(text, "someone nearby", False))
+            AUDIO_SINK.attach(_active_hub())
+    # Tap inbound robot audio for the 2-way call (coexists with the voice/STT skill). No-op on links w/o audio.
+    try:
+        LINK.set_audio_sink(_audio_in_sink)
+    except Exception:  # noqa: BLE001
+        pass
+    asyncio.create_task(_telemetry_poller())
+    asyncio.create_task(_daily_memory_task())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await brain.stop_loop()
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(LINK.close)
+
+
+_autodock = {"active": False}
+
+
+async def _maybe_autodock(t: dict):
+    """Auto-recharge: when battery drops to/below the user's threshold (and we're not already charging),
+    send the robot to its dock once. Resets when charging resumes. 0 disables. Uses existing dock + battery
+    telemetry; goes through the link like any action (safety floor unaffected — docking isn't AI-driven motion)."""
+    s = SETTINGS.snapshot()
+    pct = s.autodock_pct
+    if pct <= 0 or s.asleep:
+        return
+    batt = t.get("battery", -1)
+    charging = t.get("charge") == 1
+    if charging:
+        _autodock["active"] = False
+        return
+    if isinstance(batt, (int, float)) and 0 <= batt <= pct and not _autodock["active"]:
+        _autodock["active"] = True
+        try:
+            # go_home = dock + RELEASE our controller heartbeat, so the robot's onboard return-to-charge can
+            # actually run (our keepalive otherwise suppresses its autonomy and it drains out on the floor).
+            await LINK.action("go_home")
+            await notify.send(emit, f"Battery {int(batt)}% — sending home + releasing control to recharge.",
+                              level="warning", source="freebo-autodock")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _feed_imu_to_slam(t: dict) -> None:
+    """Forward the Air 2's 6-axis IMU into VSLAM for visual-inertial fusion (gyro-aided yaw). Best-effort."""
+    try:
+        import time as _t
+        imu = t.get("imu") or t.get("accel")
+        gyro = t.get("gyro")
+        def vec(v, keys):
+            if isinstance(v, dict):
+                return tuple(float(v.get(k, 0) or 0) for k in keys)
+            if isinstance(v, (list, tuple)) and len(v) >= 3:
+                return (float(v[0]), float(v[1]), float(v[2]))
+            return None
+        a = vec(imu, ("ax", "ay", "az")) or vec(imu, ("x", "y", "z"))
+        g = vec(gyro, ("gx", "gy", "gz")) or vec(gyro, ("x", "y", "z")) or (0.0, 0.0, 0.0)
+        if a is not None:
+            SLAM.add_imu(_t.monotonic(), a, g)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _telemetry_poller():
+    """Push telemetry to the UI ~every 1.5s, independent of the agent loop."""
+    while True:
+        try:
+            t = await LINK.telemetry()
+            await emit({"type": "telemetry", "telemetry": t})
+            await _maybe_autodock(t)
+            _feed_imu_to_slam(t)
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(1.5)
+
+
+async def _daily_memory_task():
+    """Run the heavy-model memory cleanup ~once a day. First pass ~24h after boot."""
+    import time as _t
+    last = _t.time()
+    while True:
+        await asyncio.sleep(3600)
+        if _t.time() - last < 24 * 3600:
+            continue
+        s = SETTINGS.snapshot()
+        if not s.setup_complete:
+            continue
+        last = _t.time()
+        res = await summarizer.summarize(SETTINGS, MEMORY)
+        await emit({"type": "memory_summary", "result": res, "ts": _t.time()})
+
+
+# ------------- state + settings -------------
+def _state_payload() -> dict:
+    tts_ok, tts_backend = tts.available()
+    s = SETTINGS.snapshot()
+    return {
+        "settings": SETTINGS.public_dict(),
+        "brain": brain.status_dict(),
+        "tts": {"available": tts_ok, "backend": tts_backend, "voices": tts.list_voices(),
+                "engine": s.tts_engine, "voice": s.voice},
+        "identity": {
+            "owner": s.owner_name,
+            "present": IDENTITY.present_people(),
+            "recognizer": IDENTITY._recognizer_active,
+            "authority_active": IDENTITY.authority_active(s),
+            "pending": IDENTITY.pending(),
+        },
+        "setup": {"complete": s.setup_complete},
+    }
+
+
+@app.get("/api/state")
+async def api_state():
+    return JSONResponse(_state_payload())
+
+
+@app.get("/api/telemetry")
+async def api_telemetry():
+    """Live robot telemetry (battery/connected/awake/video+audio frame counts/eyes/sensors). The UI gets this
+    pushed over the WebSocket; this REST mirror exists for diagnostics + external health monitoring."""
+    try:
+        return JSONResponse(await LINK.telemetry())
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=503)
+
+
+@app.get("/api/diag/record_audio")
+async def api_diag_record_audio(secs: float = 4.0):
+    """Record a few seconds of the robot's mic from the media hub, save a WAV, and transcribe it. Definitive
+    check of whether the inbound audio is real speech (vs noise) and whether STT works end to end."""
+    import audioop
+    import wave
+    hub = _active_hub()
+    chunks: list[bytes] = []
+    rate = 16000
+
+    def _cb(c):
+        chunks.append(c.pcm)
+
+    unsub = hub.subscribe_audio(_cb)
+    try:
+        await asyncio.sleep(max(0.5, min(15.0, secs)))
+    finally:
+        with contextlib.suppress(Exception):
+            unsub()
+    pcm = b"".join(chunks)
+    if not pcm:
+        return JSONResponse({"ok": False, "error": "no audio captured (is 102001 audio-on sent? robot mic streaming?)"})
+    rms = audioop.rms(pcm, 2)
+    path = REPO_ROOT / "data" / "captures" / "mic_probe.wav"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+    text = ""
+    try:
+        gained = audioop.mul(pcm, 2, min(12.0, 3000.0 / rms)) if 0 < rms < 3000 else pcm
+        model = await asyncio.to_thread(_get_whisper)
+        import numpy as np
+        audio = np.frombuffer(gained, dtype="<i2").astype("float32") / 32768.0
+        segs, _ = await asyncio.to_thread(lambda: model.transcribe(audio, language="en", vad_filter=False))
+        text = " ".join(s.text.strip() for s in segs).strip()
+    except Exception as e:  # noqa: BLE001
+        text = f"(transcribe error: {type(e).__name__}: {e})"
+    return JSONResponse({"ok": True, "samples": len(pcm) // 2, "seconds": round(len(pcm) / 2 / rate, 2),
+                         "rms": rms, "wav": str(path), "transcript": text})
+
+
+@app.get("/api/diag/heard")
+async def api_diag_heard():
+    """Recent utterances the brain has heard (robot mic -> STT). Read-only; used by the self-test to verify
+    the audio-in path end to end without needing the event WebSocket."""
+    try:
+        return JSONResponse({"ok": True, "heard": list(brain.buffer.transcripts)})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e), "heard": []})
+
+
+@app.post("/api/settings")
+async def api_settings(req: Request):
+    body = await req.json()
+    changed = SETTINGS.update(**body)
+    await emit({"type": "settings", "changed": changed, "settings": SETTINGS.public_dict()})
+    return JSONResponse({"ok": True, "changed": changed, **_state_payload()})
+
+
+@app.post("/api/estop")
+async def api_estop():
+    """Emergency stop: stop the robot directly and drop to manual so the AI won't re-drive."""
+    SETTINGS.update(autonomy="manual")
+    res = await LINK.stop()
+    await emit({"type": "estop", "ok": res.get("ok", False)})
+    await emit({"type": "settings", "changed": ["autonomy"], "settings": SETTINGS.public_dict()})
+    return JSONResponse({"ok": res.get("ok", False)})
+
+
+# Remembers the autonomy mode in force before going dark, so Wake restores it (not just "auto").
+_PRE_DARK_AUTONOMY: dict[str, str | None] = {"v": None}
+
+
+async def _set_dark(on: bool) -> None:
+    """Go dark / wake: a single kill switch. Dark = stop the model + all robot I/O (drive/audio/media) and
+    release control, but keep the link session warm so Wake resumes instantly. Wake reverses it."""
+    import time as _t
+    s = SETTINGS.snapshot()
+    if on:
+        if not s.asleep:
+            _PRE_DARK_AUTONOMY["v"] = s.autonomy
+        SETTINGS.update(asleep=True, autonomy="manual")
+        with contextlib.suppress(Exception):
+            await LINK.stop()
+        with contextlib.suppress(Exception):
+            await LINK.connection("stop")
+        await emit({"type": "status", "status": "dark", "error": None, "ts": _t.time()})
+    else:
+        with contextlib.suppress(Exception):
+            await LINK.connection("start")
+        SETTINGS.update(asleep=False, autonomy=_PRE_DARK_AUTONOMY["v"] or "auto")
+    await emit({"type": "settings", "changed": ["asleep", "autonomy"], "settings": SETTINGS.public_dict()})
+
+
+@app.post("/api/sleep")
+async def api_sleep(req: Request):
+    """Go dark (on=true) or wake (on=false): cut/restore all robot comms + model activity in one action."""
+    body = await req.json()
+    on = bool(body.get("on", True))
+    await _set_dark(on)
+    return JSONResponse({"ok": True, "asleep": on})
+
+
+@app.get("/api/calibrate")
+async def api_calibrate_status():
+    """Current movement-calibration profile (used to gate autonomy + size drive steps)."""
+    from ..brain import motion_profile as mp
+    p = mp.load()
+    return JSONResponse({"ok": True, "calibrated": p is not None, "profile": p.to_dict() if p else None})
+
+
+@app.post("/api/calibrate")
+async def api_calibrate():
+    """Run the pre-flight movement calibration: the robot does a few small test moves in open space, measures
+    how much the camera view changes, and saves a motion profile. Always e-stops afterward."""
+    from ..brain import motion_profile as mp
+    s = SETTINGS.snapshot()
+    if s.asleep:
+        return JSONResponse({"ok": False, "error": "asleep (wake first)"})
+    if not s.allow_motion:
+        return JSONResponse({"ok": False, "error": "motion disabled (enable the Move ability)"})
+    try:
+        res = await mp.calibrate(LINK, max_speed=s.max_speed or 0.85, emit=emit)
+    finally:
+        with contextlib.suppress(Exception):
+            await LINK.stop()
+    with contextlib.suppress(Exception):
+        brain.reload_motion_profile()
+    return JSONResponse(res)
+
+
+@app.post("/api/tick")
+async def api_tick():
+    """Run one decision cycle now (handy in manual/assist for single-stepping the AI)."""
+    if SETTINGS.snapshot().asleep:
+        return JSONResponse({"ok": False, "error": "asleep (wake first)"})
+    res = await brain.tick(force=True)
+    return JSONResponse(res)
+
+
+@app.post("/api/chat")
+async def api_chat(req: Request):
+    """Talk to the robot by text (the owner dashboard). Feeds the message in as 'heard' speech, explicitly
+    addressed (bypasses the name gate), and runs one decision cycle so it can respond."""
+    body = await req.json()
+    text = str(body.get("text", "")).strip()
+    speaker = str(body.get("speaker", "your owner")).strip() or "your owner"
+    if not text:
+        return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
+    if brain.settings.snapshot().asleep:
+        return JSONResponse({"ok": False, "error": "asleep (wake first)"})
+    # Feed as a high-priority SPEECH event (addressed = bypasses the name gate). The event-driven reasoner
+    # preempts idle wandering and replies promptly. In manual mode (no autonomous loop), run one cycle now.
+    brain.feed_speech(text, speaker, addressed=True)
+    if brain.settings.snapshot().autonomy != "auto":
+        res = await brain.tick(force=True)
+        return JSONResponse(res)
+    return JSONResponse({"ok": True, "queued": True})
+
+
+@app.post("/api/approve")
+async def api_approve(req: Request):
+    """Owner resolves a pending command-approval request (the obedience flow)."""
+    body = await req.json()
+    ok = await IDENTITY.resolve(str(body.get("id", "")), bool(body.get("approved", False)))
+    return JSONResponse({"ok": ok})
+
+
+# ------------- first-run setup wizard -------------
+@app.get("/api/setup")
+async def api_setup():
+    """Setup wizard data: whether setup is done, the provider catalog (fast/heavy suggestions), and the
+    current (masked) settings."""
+    return JSONResponse({
+        "complete": SETTINGS.snapshot().setup_complete,
+        "providers": catalog_for_ui(),
+        "settings": SETTINGS.public_dict(),
+    })
+
+
+@app.post("/api/setup/save")
+async def api_setup_save(req: Request):
+    """Apply wizard choices. If a known provider key is given, fill base_url from the catalog unless the
+    user supplied one. Marks setup complete unless `finish` is false."""
+    body = await req.json()
+    prov = get_provider(str(body.get("ai_provider", "")))
+    if prov and not body.get("ai_base_url") and prov.get("base_url"):
+        body["ai_base_url"] = prov["base_url"]
+    finish = body.pop("finish", True)
+    body["setup_complete"] = bool(finish)
+    changed = SETTINGS.update(**body)
+    await emit({"type": "settings", "changed": changed, "settings": SETTINGS.public_dict()})
+    return JSONResponse({"ok": True, "changed": changed, **_state_payload()})
+
+
+# ------------- onboarding wizard (ADB provisioning + capture + connect test + owner pairing) -------------
+@app.get("/api/onboarding/adb")
+async def api_onboarding_adb():
+    return JSONResponse(await asyncio.to_thread(ONBOARD.adb_status))
+
+
+@app.post("/api/onboarding/pair")
+async def api_onboarding_pair(req: Request):
+    b = await req.json()
+    return JSONResponse(await asyncio.to_thread(ONBOARD.adb_pair, str(b.get("host_port", "")), str(b.get("code", ""))))
+
+
+@app.post("/api/onboarding/connect")
+async def api_onboarding_connect(req: Request):
+    b = await req.json()
+    return JSONResponse(await asyncio.to_thread(ONBOARD.adb_connect, str(b.get("host_port", ""))))
+
+
+@app.post("/api/onboarding/capture/start")
+async def api_onboarding_capture_start(req: Request):
+    b = await req.json()
+    return JSONResponse(await asyncio.to_thread(
+        ONBOARD.capture_start, str(b.get("serial", "")), str(b.get("apk_path", "")),
+        str(b.get("package", "")), int(b.get("port", 8400))))
+
+
+@app.get("/api/onboarding/capture/status")
+async def api_onboarding_capture_status():
+    return JSONResponse(await asyncio.to_thread(ONBOARD.capture_status))
+
+
+@app.post("/api/onboarding/capture/stop")
+async def api_onboarding_capture_stop():
+    return JSONResponse(await asyncio.to_thread(ONBOARD.capture_stop))
+
+
+@app.post("/api/onboarding/connect-test")
+async def api_onboarding_connect_test():
+    return JSONResponse(await ONBOARD.connect_test())
+
+
+@app.post("/api/onboarding/owner")
+async def api_onboarding_owner(req: Request):
+    b = await req.json()
+    return JSONResponse(await ONBOARD.set_owner(str(b.get("name", "")), bool(b.get("enroll", False))))
+
+
+# ------------- EBO Air 2 / Max cloud session (Agora RTC video + RTM control) -------------
+@app.get("/api/air2/session")
+async def api_air2_session():
+    """Live Agora session params for the cloud-controlled Air 2/Max. The browser uses these with the Agora
+    web SDKs to show video (RTC) and send drive commands (RTM). Tokens are short-lived — fetch per use."""
+    import os as _os
+    from ..robot.ebo_cloud import EboCloud
+    robot_id = int(_os.environ.get("EBO_ROBOT_ID", "0"))
+    if not robot_id:
+        return JSONResponse({"ok": False, "error": "EBO_ROBOT_ID not set"}, status_code=400)
+    return JSONResponse(await EboCloud().create_session(robot_id))
+
+
+@app.post("/api/air2/connected")
+async def api_air2_connected(req: Request):
+    """The Air 2 (cloud) UI tab reports whether it's connected to Agora (so the brain knows it can relay)."""
+    b = await req.json()
+    if hasattr(LINK, "set_browser"):
+        LINK.set_browser(bool(b.get("connected", False)), b.get("status"))
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/air2/frame")
+async def api_air2_frame(req: Request):
+    """The Air 2 UI tab POSTs a camera frame (base64 JPEG) from the Agora RTC video so the brain can see."""
+    import base64
+    b = await req.json()
+    data = b.get("b64", "")
+    if data:
+        try:
+            jpeg = base64.b64decode(data)
+            if hasattr(LINK, "set_frame"):
+                LINK.set_frame(jpeg)
+            _publish_frame(jpeg)  # fan out to UI preview + VSLAM mapper
+        except Exception:  # noqa: BLE001
+            pass
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/debug/rtm")
+async def api_debug_rtm():
+    """Diagnostics for the native Air2 link: RTM connectivity + recent sidecar logs (raw peer/channel msgs),
+    parsed robot telemetry, and the gateway-WS message types seen. Used to map the battery/sensor fields."""
+    rtm = getattr(LINK, "rtm", None)
+    recv = getattr(LINK, "receiver", None)
+    return JSONResponse({
+        "rtm_connected": getattr(rtm, "connected", None),
+        "rtm_status": getattr(rtm, "status", {}),
+        "rtm_logs": rtm.recent_logs()[-30:] if rtm else [],
+        "receiver_telemetry": getattr(recv, "telemetry", {}),
+        "ws_types": list(getattr(recv, "_seen_types", []) or []),
+        "media": recv.media_debug() if hasattr(recv, "media_debug") else {},
+        "audio_sink": AUDIO_SINK.debug() if (AUDIO_SINK and hasattr(AUDIO_SINK, "debug")) else {},
+    })
+
+
+@app.get("/api/slam/map")
+async def api_slam_map():
+    """Current VSLAM pose + keyframe trail for the UI minimap. Empty/disabled if OpenCV isn't present."""
+    return JSONResponse(SLAM.map_data())
+
+
+@app.get("/api/selftest")
+async def api_selftest(move: bool = False, talk: bool = False, only: str = "", skip: str = ""):
+    """Run the live capability self-test in-process and return a JSON report (the same checks as
+    scripts/robot_selftest.py). Safe by default: no driving/talk, never the interactive 'hear' check, and it
+    always restores settings + e-stops afterward. Pass ?move=1 to include the motion + autonomy checks."""
+    from ..diagnostics.checks import Options
+    from ..diagnostics.runner import selftest as _selftest
+    s = SETTINGS.snapshot()
+    base = f"http://127.0.0.1:{s.port}"
+    opts = Options(allow_move=bool(move), test_talk=bool(talk), test_hear=False, on_progress=lambda _m: None)
+    only_l = [x.strip() for x in only.split(",") if x.strip()] or None
+    skip_l = [x.strip() for x in skip.split(",") if x.strip()] or None
+    report = await _selftest(base, opts, only=only_l, skip=skip_l)
+    return JSONResponse(report)
+
+
+@app.get("/api/video/preview.mjpeg")
+async def api_video_preview():
+    """Server-side MJPEG of the live camera (from the media hub) — the UI's video when media is native
+    (no browser Agora). ~8 fps, downscaled; closes when the client disconnects."""
+    async def gen():
+        last = -1
+        while True:
+            hub = _active_hub()
+            f = hub.latest_frame()
+            if f is not None and f.seq != last:
+                last = f.seq
+                jpeg = hub.latest_video_jpeg(max_w=720, quality=70)
+                if jpeg:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                           + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
+            await asyncio.sleep(0.1)
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+# ------------- voice: server-side Whisper STT (in) + Piper TTS WAV (out, for the robot speaker) -------------
+_whisper = None
+
+
+def _get_whisper():
+    global _whisper
+    if _whisper is None:
+        import os as _os
+        from faster_whisper import WhisperModel
+        _whisper = WhisperModel(_os.environ.get("AUTOBOT_STT_MODEL", "base"), device="cpu", compute_type="int8")
+    return _whisper
+
+
+@app.post("/api/voice/stt")
+async def api_voice_stt(req: Request):
+    """Transcribe a recorded audio blob (the robot's mic) with local Whisper. Returns {text}."""
+    import os as _os
+    import tempfile
+    if not SETTINGS.snapshot().allow_audio_in:
+        return JSONResponse({"ok": False, "error": "listening disabled (Control toggle)"})
+    data = await req.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "no audio"})
+    try:
+        model = await asyncio.to_thread(_get_whisper)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": f"faster-whisper unavailable: {e} (pip install faster-whisper)"})
+    fd, path = tempfile.mkstemp(suffix=".webm"); _os.close(fd)
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+
+        def _tx():
+            # vad_filter=False: faster-whisper's silero VAD needs onnxruntime, which can crash under numpy 2.
+            segs, _info = model.transcribe(path, vad_filter=False)
+            return "".join(s.text for s in segs).strip()
+        text = await asyncio.to_thread(_tx)
+        return JSONResponse({"ok": True, "text": text})
+    finally:
+        try:
+            _os.remove(path)
+        except OSError:
+            pass
+
+
+@app.get("/api/voice/say")
+async def api_voice_say(text: str = ""):
+    """Render text to a WAV with the configured TTS (Piper). The Air 2 tab publishes this into the Agora call
+    so the robot's own speaker plays it. Gated by the audio-out toggle (talk_enabled) — except an explicit
+    UI test tone (test=1), which is allowed so you can verify the speaker even with talk off."""
+    if not text.strip():
+        return Response(content=b"", status_code=400)
+    if not SETTINGS.snapshot().talk_enabled and text.strip() != "__test__":
+        return Response(content=b"", status_code=403, headers={"X-Reason": "audio output disabled"})
+    if text.strip() == "__test__":
+        text = "Audio test. If you can hear this through the robot, two way audio works."
+    wav = await asyncio.to_thread(tts.render_wav, text)
+    if not wav:
+        return Response(content=b"", status_code=503, headers={"X-Reason": "tts unavailable"})
+    return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/memory")
+async def api_memory():
+    """The memory browser feed: curated long-term facts, recent sightings, and recent daily notes."""
+    facts = [f.to_dict() for f in MEMORY.all_facts()]
+    facts.sort(key=lambda d: d.get("ts", 0), reverse=True)
+    return JSONResponse({
+        "ok": True,
+        "facts": facts,
+        "sightings": MEMORY.recent_sightings(40)[::-1],
+        "recent": MEMORY.recent_events(days=2)[-60:][::-1],
+        "embeddings": __import__("autobot.brain.embeddings", fromlist=["embeddings_enabled"]).embeddings_enabled(),
+    })
+
+
+@app.post("/api/memory/forget")
+async def api_memory_forget(req: Request):
+    """Delete remembered facts matching a phrase (UI memory browser)."""
+    body = await req.json()
+    n = await asyncio.to_thread(MEMORY.forget, str(body.get("query", "")))
+    return JSONResponse({"ok": True, "forgot": n})
+
+
+@app.get("/api/tasks")
+async def api_tasks():
+    """List the robot's scheduled tasks/reminders (UI tasks panel)."""
+    from dataclasses import asdict
+    tasks = [asdict(t) | {"schedule": t.schedule_label()} for t in brain.tasks.list()]
+    return JSONResponse({"ok": True, "tasks": tasks})
+
+
+@app.post("/api/tasks/add")
+async def api_tasks_add(req: Request):
+    """Add a scheduled task/reminder. Provide one of in_seconds, daily_time ('HH:MM'), or every_seconds."""
+    b = await req.json()
+    text = str(b.get("text", "")).strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "text required"})
+    t = brain.tasks.add(text, in_seconds=b.get("in_seconds"), daily_time=b.get("daily_time") or None,
+                        every_seconds=b.get("every_seconds"))
+    return JSONResponse({"ok": True, "task_id": t.id, "schedule": t.schedule_label()})
+
+
+@app.post("/api/tasks/cancel")
+async def api_tasks_cancel(req: Request):
+    b = await req.json()
+    return JSONResponse({"ok": brain.tasks.cancel(str(b.get("id", "")))})
+
+
+@app.post("/api/memory/summarize")
+async def api_memory_summarize():
+    """Trigger the heavy-model daily memory cleanup now (also runs automatically ~once a day)."""
+    res = await summarizer.summarize(SETTINGS, MEMORY)
+    await emit({"type": "memory_summary", "result": res, "ts": __import__("time").time()})
+    return JSONResponse(res)
+
+
+@app.post("/api/agora/capture")
+async def api_agora_capture(req: Request):
+    """Reverse-engineering harness: append captured Agora signaling frames (from the browser WS wrapper) to
+    data/captures/agora_signaling.jsonl, so we can reconstruct the join/signaling protocol natively."""
+    import pathlib
+    try:
+        body = await req.body()
+        d = pathlib.Path("data/captures"); d.mkdir(parents=True, exist_ok=True)
+        with (d / "agora_signaling.jsonl").open("ab") as f:
+            f.write(body.rstrip() + b"\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/memory/clear")
+async def api_memory_clear():
+    """Wipe all memory (facts + daily notes + sightings + place log) for a clean slate."""
+    res = MEMORY.clear()
+    try:
+        brain.history.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return JSONResponse(res)
+
+
+# ------------- manual controls (clamped, but not autonomy-gated) -------------
+@app.post("/api/control")
+async def api_control(req: Request):
+    body = await req.json()
+    kind = body.get("kind")
+    s = SETTINGS.snapshot()
+    if kind == "stop":
+        return JSONResponse(await LINK.stop())
+    # When dark, refuse anything that talks to the robot except stop/connection (Wake re-enables I/O).
+    if s.asleep and kind in ("drive", "move", "say", "action"):
+        return JSONResponse({"ok": False, "blocked": "asleep (wake first)"})
+    if kind in ("drive", "move"):
+        d = brain.safety.check_drive(s, body.get("ly", 0.0), body.get("rx", 0.0),
+                                     body.get("duration", 0.4), source="manual")
+        if not d.allowed:
+            return JSONResponse({"ok": False, "blocked": d.reason})
+        if kind == "drive":
+            return JSONResponse(await LINK.drive(d.ly, d.rx))
+        return JSONResponse(await LINK.move(d.ly, d.rx, d.duration))
+    if kind == "action":
+        name = str(body.get("name", ""))
+        return JSONResponse(await LINK.action(name))
+    if kind == "connection":
+        return JSONResponse(await LINK.connection(str(body.get("state", "start"))))
+    if kind == "say":
+        if not s.talk_enabled:
+            return JSONResponse({"ok": False, "blocked": "talk disabled"})
+        text = str(body.get("text", ""))
+        # Links that publish audio into a call (native Air 2) take a rendered WAV; others take G.711/text.
+        pub = getattr(LINK, "publish_speech", None)
+        if pub:
+            wav = await asyncio.to_thread(tts.render_wav, text)
+            if not wav:
+                return JSONResponse({"ok": False, "error": "tts unavailable"})
+            return JSONResponse(await pub(wav))
+        g711 = tts.render_mulaw(text)
+        if g711:
+            return JSONResponse(await LINK.say_audio(g711))
+        return JSONResponse(await LINK.say_text(text))
+    return JSONResponse({"ok": False, "error": f"unknown control kind '{kind}'"}, status_code=400)
+
+
+@app.post("/api/debug/param")
+async def api_debug_param(req: Request):
+    """Raw PARAM_SET sender for eye-animation discovery (robot/native/probe_eyes.py). Native link only."""
+    send = getattr(LINK, "send_rdt", None)
+    if send is None:
+        return JSONResponse({"ok": False, "error": "not available on this link"}, status_code=501)
+    body = await req.json()
+    frame = param_set_frame(str(body.get("group", "")), str(body.get("key", "")), float(body.get("value", 0.0)))
+    await asyncio.to_thread(send, frame)
+    return JSONResponse({"ok": True, "sent": f"{body.get('group')}/{body.get('key')}={body.get('value')}"})
+
+
+# ------------- media proxy (same-origin for the browser) -------------
+@app.get("/api/snapshot.jpg")
+async def api_snapshot():
+    data, err = await LINK.snapshot()
+    if data is None:
+        return Response(content=b"", status_code=503, headers={"X-Reason": err or "unavailable"})
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/whep")
+async def whep(request: Request):
+    upstream = LINK.whep_upstream
+    if not upstream:
+        return Response(content=b"no video on this link", status_code=501)
+    offer = await request.body()
+    headers = {"Content-Type": "application/sdp", **LINK.stream_auth_header()}
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(upstream, content=offer, headers=headers)
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type=r.headers.get("Content-Type", "application/sdp"))
+    except Exception as e:  # noqa: BLE001
+        return Response(content=str(e).encode(), status_code=502)
+
+
+@app.get("/hls/{path:path}")
+async def hls(path: str, request: Request):
+    base = LINK.hls_base
+    if not base:
+        return Response(content=b"no video on this link", status_code=501)
+    url = f"{base}/{path}"
+    q = request.url.query
+    if q:
+        url += "?" + q
+    try:
+        client = httpx.AsyncClient(timeout=30)
+        req = client.build_request("GET", url, headers=LINK.stream_auth_header())
+        r = await client.send(req, stream=True)
+    except Exception as e:  # noqa: BLE001
+        return Response(content=str(e).encode(), status_code=502)
+
+    async def gen():
+        try:
+            async for chunk in r.aiter_bytes():
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    return StreamingResponse(gen(), status_code=r.status_code,
+                             media_type=r.headers.get("Content-Type", "application/octet-stream"))
+
+
+# ------------- WebSocket -------------
+@app.websocket("/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+    _ws_clients.add(ws)
+    try:
+        await ws.send_json({"type": "hello", **_state_payload()})
+        for ev in list(_event_ring)[-80:]:
+            await ws.send_json(ev)
+        while True:
+            # we don't need client messages, but keep the socket alive and drain pings
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _ws_clients.discard(ws)
+
+
+@app.websocket("/ws/call")
+async def ws_call(ws: WebSocket):
+    """2-way call audio bridge. Browser sends {type:'say_audio', b64:<G.711 µ-law 8kHz>} for push-to-talk;
+    server forwards to the robot speaker (talk-gated). Inbound robot mic audio is pushed back as {type:'audio'}.
+    Live video is the existing WHEP stream; this socket is audio-only."""
+    import base64
+    import json as _json
+    await ws.accept()
+    _call_clients.add(ws)
+    try:
+        await ws.send_json({"type": "call_hello", "talk_enabled": SETTINGS.snapshot().talk_enabled})
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = _json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if msg.get("type") == "say_audio":
+                s = SETTINGS.snapshot()
+                if not s.talk_enabled:
+                    await ws.send_json({"type": "blocked", "reason": "talk disabled (enable it in Config)"})
+                    continue
+                g711 = base64.b64decode(msg.get("b64", "") or "")
+                if g711:
+                    await LINK.say_audio(g711, "mulaw")
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _call_clients.discard(ws)
+
+
+# ------------- UI -------------
+if WEBUI_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(WEBUI_DIST / "assets")), name="assets")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    if WEBUI_DIST.exists() and (WEBUI_DIST / "index.html").exists():
+        return (WEBUI_DIST / "index.html").read_text(encoding="utf-8")
+    if FALLBACK_HTML.exists():
+        return FALLBACK_HTML.read_text(encoding="utf-8")
+    return "<h1>FreeBo</h1><p>UI not built. Run <code>cd webui && npm install && npm run build</code>.</p>"
+
+
+def _maybe_start_mqtt():
+    """Optional Home Assistant MQTT — native link only, and only if EBO_MQTT_HOST is set. MQTT runs on its
+    own threads and pokes the native link's synchronous helpers directly (no event loop involved)."""
+    import os
+    host = os.environ.get("EBO_MQTT_HOST")
+    if not host or SETTINGS.snapshot().robot_link != "native":
+        return
+    do_action = getattr(LINK, "_do_action", None)
+    do_move = getattr(LINK, "_do_move", None)
+    if do_action is None or do_move is None:
+        return
+    try:
+        from ..robot.mqtt import EBOMqtt
+        di = {"name": os.environ.get("EBO_NAME", "EBO-SE"), "model": "EBO SE",
+              "uid": os.environ.get("EBO_UID", ""), "ip": os.environ.get("EBO_ROBOT_IP", "")}
+        EBOMqtt(LINK, do_action, do_move, di, host, int(os.environ.get("EBO_MQTT_PORT", "1883")),
+                os.environ.get("EBO_MQTT_USER") or None, os.environ.get("EBO_MQTT_PASS") or None)
+        print(f"[autobot] MQTT -> {host}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("[autobot] MQTT error:", e, flush=True)
+
+
+def main():
+    s = SETTINGS.snapshot()
+    _maybe_start_mqtt()
+    uvicorn.run(app, host=s.host, port=s.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+# Tells pi-gen to export a flashable image after this stage.
+IMG_SUFFIX="-autobot"

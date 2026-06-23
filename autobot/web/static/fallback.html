@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeBo</title>
+<style>
+ :root{--bg:#0b0d12;--card:#141925;--card2:#1b2230;--line:#2a3142;--fg:#e8eaed;--mut:#8b93a3;--accent:#2563eb;--ok:#2ecc71;--warn:#eab308;--bad:#e74c3c}
+ *{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+ .wrap{max-width:1100px;margin:0 auto;padding:16px;display:grid;grid-template-columns:1fr 360px;gap:16px}
+ @media(max-width:860px){.wrap{grid-template-columns:1fr}}
+ h1{font-size:18px;margin:0 0 4px}.mut{color:var(--mut);font-size:12px}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}
+ .stage{background:#000;border-radius:12px;overflow:hidden;aspect-ratio:16/9;border:1px solid var(--line)}
+ .stage video,.stage img{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+ .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ .chip{font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;background:var(--card2);border:1px solid var(--line);color:var(--mut)}
+ .chip.ok{color:#0c1b12;background:var(--ok)}.chip.warn{color:#1c1707;background:var(--warn)}.chip.bad{color:#fff;background:var(--bad)}
+ button{font:inherit;cursor:pointer;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--fg);padding:8px 12px}
+ button:active{transform:scale(.97)} button.accent{background:var(--accent);border-color:var(--accent)}
+ button.stop{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:700;width:100%;padding:12px}
+ .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:220px}
+ .pad .b{aspect-ratio:1;font-size:20px}.pad .e{visibility:hidden}
+ input,select,textarea{font:inherit;background:var(--card2);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px}
+ label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
+ .thoughts{height:340px;overflow:auto;display:flex;flex-direction:column;gap:8px;font-size:13px}
+ .ev{padding:8px 10px;border-radius:10px;background:var(--card2);border:1px solid var(--line)}
+ .ev.t{border-left:3px solid var(--accent)} .ev.a{border-left:3px solid var(--ok)} .ev.e{border-left:3px solid var(--bad)}
+ .ev .k{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+ code{font-family:ui-monospace,monospace;font-size:11px;color:#9fb3d1}
+ .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+</style></head><body>
+<div class="wrap">
+ <div>
+  <div class="card">
+   <h1>🤖 FreeBo <span class="mut" id="brainstatus">starting…</span></h1>
+   <div class="row" id="chips"></div>
+  </div>
+  <div class="card">
+   <div class="stage" id="stage"><video id="vid" autoplay muted playsinline></video></div>
+   <div class="row" style="margin-top:8px;justify-content:space-between">
+    <span class="mut" id="telem">—</span>
+    <button onclick="refreshSnap()">📷 Snapshot</button>
+   </div>
+  </div>
+  <div class="card">
+   <div class="k mut">AI thoughts &amp; actions</div>
+   <div class="thoughts" id="thoughts"></div>
+  </div>
+ </div>
+
+ <div>
+  <div class="card">
+   <button class="stop" onclick="estop()">■ EMERGENCY STOP</button>
+   <div class="row" style="margin-top:10px;justify-content:center">
+    <div class="pad">
+     <div class="e"></div><button class="b" data-d="fwd">▲</button><div class="e"></div>
+     <button class="b" data-d="left">◀</button><button class="b" data-d="stop">■</button><button class="b" data-d="right">▶</button>
+     <div class="e"></div><button class="b" data-d="back">▼</button><div class="e"></div>
+    </div>
+   </div>
+   <div class="row" style="margin-top:10px">
+    <button onclick="tick()">▶ Single AI step</button>
+    <button onclick="ctl({kind:'action',name:'wake'})">☀ Wake</button>
+    <button onclick="ctl({kind:'action',name:'sleep'})">🌙 Sleep</button>
+    <button onclick="ctl({kind:'action',name:'dock'})">🏠 Dock</button>
+   </div>
+  </div>
+
+  <div class="card">
+   <div class="k mut">Behavior</div>
+   <label>Autonomy</label>
+   <select id="autonomy" onchange="save({autonomy:this.value})">
+    <option value="manual">manual</option><option value="assist">assist</option><option value="auto">auto</option>
+   </select>
+   <label>Max speed <span id="msv" class="mut"></span></label>
+   <input type="range" id="maxspeed" min="0" max="1" step="0.05" oninput="msv.textContent=this.value" onchange="save({max_speed:parseFloat(this.value)})" style="width:100%">
+   <label><input type="checkbox" id="talk" onchange="save({talk_enabled:this.checked})"> Allow the robot to talk</label>
+   <label>Goal</label>
+   <textarea id="goal" rows="3" style="width:100%"></textarea>
+   <button class="accent" style="margin-top:6px" onclick="save({goal:goal.value})">Save goal</button>
+  </div>
+
+  <div class="card">
+   <div class="k mut">Connections</div>
+   <label>Bridge URL</label><input id="bridge_url" style="width:100%">
+   <div class="grid2"><div><label>Bridge user</label><input id="bridge_user" style="width:100%"></div>
+    <div><label>Bridge pass</label><input id="bridge_pass" type="password" style="width:100%"></div></div>
+   <label>AI base URL</label><input id="ai_base_url" style="width:100%">
+   <label>AI API key</label><input id="ai_api_key" type="password" style="width:100%" placeholder="(unchanged)">
+   <label>AI model</label><input id="ai_model" style="width:100%">
+   <button class="accent" style="margin-top:8px;width:100%" onclick="saveConn()">Save connections</button>
+   <div class="mut" id="ttsinfo" style="margin-top:6px"></div>
+  </div>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const speed=()=>parseFloat($('maxspeed').value||0.5);
+async function api(path,body){const o={method:body?'POST':'GET'};if(body){o.headers={'Content-Type':'application/json'};o.body=JSON.stringify(body)}const r=await fetch(path,o);return r.json().catch(()=>({}))}
+const ctl=b=>api('/api/control',b);
+const save=ch=>api('/api/settings',ch);
+const tick=()=>api('/api/tick',{});
+const estop=()=>api('/api/estop',{});
+function saveConn(){const b={bridge_url:$('bridge_url').value,bridge_user:$('bridge_user').value,ai_base_url:$('ai_base_url').value,ai_model:$('ai_model').value};
+ if($('bridge_pass').value)b.bridge_pass=$('bridge_pass').value; if($('ai_api_key').value)b.ai_api_key=$('ai_api_key').value; save(b);}
+// d-pad
+const mv=(ly,rx)=>ctl({kind:'move',ly,rx,duration:0.4});
+const D={fwd:()=>mv(speed(),0),back:()=>mv(-speed(),0),left:()=>mv(0,-speed()),right:()=>mv(0,speed()),stop:()=>ctl({kind:'stop'})};
+document.querySelectorAll('.pad .b[data-d]').forEach(b=>b.onclick=()=>D[b.dataset.d]());
+// thoughts
+const T=$('thoughts');
+function add(cls,kind,html){const d=document.createElement('div');d.className='ev '+cls;d.innerHTML='<div class="k">'+kind+'</div>'+html;T.appendChild(d);T.scrollTop=T.scrollHeight;while(T.children.length>120)T.removeChild(T.firstChild);}
+const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function onEvent(e){
+ if(e.type==='thought')add('t','thinking',esc(e.text));
+ else if(e.type==='tool_call')add('a','action','<b>'+esc(e.name)+'</b> <code>'+esc(JSON.stringify(e.args))+'</code>');
+ else if(e.type==='tool_result')add('a','result','<code>'+esc(JSON.stringify(e.result))+'</code>');
+ else if(e.type==='observation')add('','sees',esc(e.summary));
+ else if(e.type==='error')add('e','error',esc(e.error||''));
+ else if(e.type==='estop')add('e','E-STOP','stopped; autonomy set to manual');
+ else if(e.type==='status'){$('brainstatus').textContent=e.status+(e.error?(' — '+e.error):'');}
+ else if(e.type==='telemetry')telem(e.telemetry);
+ if(e.type==='hello'||e.type==='settings')applyState(e);
+}
+function telem(t){if(!t)return; const c=$('chips'); const conn=t.connected,awake=t.awake;
+ c.innerHTML='';
+ const chip=(txt,cls)=>{const s=document.createElement('span');s.className='chip '+(cls||'');s.textContent=txt;c.appendChild(s)};
+ chip(conn?(t.paused?'released':(awake?'live':'asleep')):'offline',conn?(awake?'ok':'warn'):'bad');
+ if(t.battery>=0)chip((t.charge>0?'⚡':'🔋')+t.battery+'%');
+ const on=Object.entries(t.toggles||{}).filter(([k,v])=>v).map(([k])=>k); if(on.length)chip(on.join(' '));
+ if(t.eyes_animation)chip('👀 '+t.eyes_animation);
+ if(t.audio_out&&t.audio_out.available===false)chip('no talkback','warn');
+ $('telem').textContent='RX '+(t.frames_received||0)+' · '+(t.codec||'—');
+}
+function applyState(s){const set=s.settings;if(!set)return;
+ $('autonomy').value=set.autonomy;$('maxspeed').value=set.max_speed;$('msv').textContent=set.max_speed;
+ $('talk').checked=set.talk_enabled;$('goal').value=set.goal;
+ $('bridge_url').value=set.bridge_url;$('bridge_user').value=set.bridge_user;$('ai_base_url').value=set.ai_base_url;$('ai_model').value=set.ai_model;
+ if(s.tts)$('ttsinfo').textContent='TTS: '+(s.tts.available?('ready ('+s.tts.backend+')'):('unavailable — '+s.tts.backend));
+ if(s.brain)$('brainstatus').textContent=s.brain.status;}
+// snapshot fallback (no WebRTC video)
+function refreshSnap(){const img=document.createElement('img');img.src='/api/snapshot.jpg?t='+Date.now();
+ img.onload=()=>{const st=$('stage');st.innerHTML='';st.appendChild(img)};}
+// video: try WebRTC via /whep, else periodic snapshot
+const vid=$('vid');let pcTried=false;
+async function startVideo(){ if(pcTried)return; pcTried=true;
+ try{const p=new RTCPeerConnection();p.addTransceiver('video',{direction:'recvonly'});
+  p.ontrack=e=>{vid.srcObject=e.streams[0]};
+  await p.setLocalDescription(await p.createOffer());
+  await new Promise(r=>{if(p.iceGatheringState==='complete')return r();const t=setTimeout(r,1500);
+   p.addEventListener('icegatheringstatechange',()=>{if(p.iceGatheringState==='complete'){clearTimeout(t);r()}})});
+  const resp=await fetch('/whep',{method:'POST',headers:{'Content-Type':'application/sdp'},body:p.localDescription.sdp});
+  if(!resp.ok)throw 0; await p.setRemoteDescription({type:'answer',sdp:await resp.text()});
+ }catch(e){ setInterval(refreshSnap,2000); refreshSnap(); }
+}
+// websocket
+function connect(){const ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+ ws.onmessage=m=>{try{onEvent(JSON.parse(m.data))}catch(e){}};
+ ws.onclose=()=>setTimeout(connect,1500);}
+api('/api/state').then(applyState).then(startVideo);connect();
+</script></body></html>

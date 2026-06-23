@@ -1,0 +1,77 @@
+# ---- Secrets: NEVER commit ----
+**/.env
+.env
+*.env
+!*.env.example
+# deploy template is NOT a secret (collector provisions real secrets at runtime) — keep it publishable
+!deploy/**/autobot.env
+vendor/
+collector/captured/
+**/captured_secrets.json
+
+# ---- Runtime data: memory + enrolled faces + downloaded voices (personal/large; keep local) ----
+data/
+
+# ---- Large binaries / app packages (never publish; user supplies their own) ----
+*.apk
+*.xapk
+*.aab
+*.so
+*.dll
+*.dylib
+
+# ---- TTS voices (large neural models; fetch with scripts/get_voice.py) ----
+*.onnx
+*.onnx.json
+data/voices/
+
+# ---- Embedded reference repos (kept local; not part of the published FreeBo tree) ----
+# GrowBot (CC BY-NC 4.0, reference only) and ebo-se-lan-bridge (already merged into autobot/robot/ +
+# vendored under autobot/robot/native/eboproto/). Both have their own .git — don't nest them.
+/GrowBot/
+/ebo-se-lan-bridge/
+
+# ---- Pi image build: assembled payload (copied from the repo at build time) ----
+deploy/pi-gen/stage-autobot/00-autobot/files/payload/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Node / web UI ----
+node_modules/
+webui/dist/
+*.local
+.vite/
+
+# ---- Native build artifacts ----
+autobot/robot/native/ebo_bridge
+autobot/robot/native/mediamtx.yml
+*.o
+
+# ---- Collector build artifacts ----
+collector/apk_patch/build/
+collector/apk_patch/*.apk
+!collector/apk_patch/example.apk.placeholder
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.log
+*.err
+/tmp/
+
+# ---- FreeBo repo: big artifacts live in GitHub Releases, not git (see docs/REPRO.md) ----
+# Staging dir for release assets you upload (patched cred-collector APK, optional wheelhouse, etc.).
+release-staging/
+wheels/
+# pytest benchmarks + debug snapshots
+.benchmarks/
+.dock_check.jpg
+*.dock_check.jpg

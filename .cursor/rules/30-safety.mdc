@@ -1,0 +1,34 @@
+---
+description: The safety floor that sits under the AI at all times
+alwaysApply: true
+---
+
+# Safety floor (non-negotiable)
+
+This software drives a real motorized robot. Full reference: [docs/SAFETY.md](mdc:docs/SAFETY.md).
+
+## Invariants (must always hold)
+
+1. **Single chokepoint.** Every robot-affecting action passes through `autobot/brain/safety.py`
+   before reaching the `RobotLink`. No code path bypasses it.
+2. **Speed clamp.** Drive magnitude is clamped to `config.max_speed` (0..1). The AI cannot exceed it.
+3. **Deadman, twice.** The brain stops sending drive frames if the loop stalls; `NativeRobotLink` ALSO stops
+   the robot if `drive` frames stop arriving (~0.35s, `_drive_watchdog`). Both layers must remain.
+4. **Rate limit.** Actions are rate-limited per tick; a runaway model cannot spam motion commands.
+5. **Talk gating.** `say` is dropped unless `config.talk_enabled` is true (UI toggle). Default OFF.
+6. **Emergency stop.** The UI's STOP button calls `/api/estop`, which stops the robot via the `RobotLink`
+   directly and forces autonomy to `manual`. It must work even if the AI loop is wedged — it does not go
+   through the agent loop.
+7. **Fail safe, not open.** On any error (provider down, bridge unreachable, parse failure), the robot
+   stops and stays stopped. Errors never translate into motion.
+
+## When adding a capability
+
+Add its constraint to `safety.py` in the same change. If a new tool can cause motion, sound, or physical
+state change, it MUST be gated/clamped here. Document the constraint in `docs/SAFETY.md`.
+
+## Don't
+
+- Don't let the AI change `max_speed`, `talk_enabled`, or `autonomy` (those are user-only, set in the UI).
+- Don't remove or weaken the native link's deadman (`_drive_watchdog`) to "simplify".
+- Don't log robot secrets, API keys, or full credential payloads.

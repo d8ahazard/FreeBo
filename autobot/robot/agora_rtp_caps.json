@@ -1,0 +1,1070 @@
+{
+  "send": {
+    "audioCodecs": [],
+    "audioExtensions": [],
+    "videoCodecs": [
+      {
+        "payloadType": 49,
+        "rtpMap": {
+          "encodingName": "H265",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-id": "123",
+            "profile-id": "1",
+            "tier-flag": "0",
+            "tx-mode": "SRST"
+          }
+        }
+      }
+    ],
+    "videoExtensions": []
+  },
+  "recv": {
+    "audioCodecs": [],
+    "audioExtensions": [],
+    "videoCodecs": [
+      {
+        "payloadType": 35,
+        "rtpMap": {
+          "encodingName": "VP9",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "profile-id": "1"
+          }
+        }
+      },
+      {
+        "payloadType": 36,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "35"
+          }
+        }
+      },
+      {
+        "payloadType": 37,
+        "rtpMap": {
+          "encodingName": "VP9",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "profile-id": "3"
+          }
+        }
+      },
+      {
+        "payloadType": 38,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "37"
+          }
+        }
+      },
+      {
+        "payloadType": 47,
+        "rtpMap": {
+          "encodingName": "AV1",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-idx": "5",
+            "profile": "1",
+            "tier": "0"
+          }
+        }
+      },
+      {
+        "payloadType": 48,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "47"
+          }
+        }
+      },
+      {
+        "payloadType": 49,
+        "rtpMap": {
+          "encodingName": "H265",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-id": "180",
+            "profile-id": "1",
+            "tier-flag": "0",
+            "tx-mode": "SRST"
+          }
+        }
+      },
+      {
+        "payloadType": 51,
+        "rtpMap": {
+          "encodingName": "H265",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-id": "180",
+            "profile-id": "2",
+            "tier-flag": "0",
+            "tx-mode": "SRST"
+          }
+        }
+      },
+      {
+        "payloadType": 52,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "51"
+          }
+        }
+      }
+    ],
+    "videoExtensions": []
+  },
+  "sendrecv": {
+    "audioCodecs": [
+      {
+        "payloadType": 111,
+        "rtpMap": {
+          "encodingName": "opus",
+          "clockRate": 48000,
+          "encodingParameters": 2
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "minptime": "10",
+            "useinbandfec": "1"
+          }
+        }
+      },
+      {
+        "payloadType": 63,
+        "rtpMap": {
+          "encodingName": "red",
+          "clockRate": 48000,
+          "encodingParameters": 2
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "111/111": null
+          }
+        }
+      },
+      {
+        "payloadType": 9,
+        "rtpMap": {
+          "encodingName": "G722",
+          "clockRate": 8000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 0,
+        "rtpMap": {
+          "encodingName": "PCMU",
+          "clockRate": 8000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 8,
+        "rtpMap": {
+          "encodingName": "PCMA",
+          "clockRate": 8000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 13,
+        "rtpMap": {
+          "encodingName": "CN",
+          "clockRate": 8000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 110,
+        "rtpMap": {
+          "encodingName": "telephone-event",
+          "clockRate": 48000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 126,
+        "rtpMap": {
+          "encodingName": "telephone-event",
+          "clockRate": 8000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ]
+      }
+    ],
+    "audioExtensions": [
+      {
+        "entry": 14,
+        "extensionName": "urn:ietf:params:rtp-hdrext:ssrc-audio-level"
+      },
+      {
+        "entry": 2,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+      },
+      {
+        "entry": 4,
+        "extensionName": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+      },
+      {
+        "entry": 9,
+        "extensionName": "urn:ietf:params:rtp-hdrext:sdes:mid"
+      }
+    ],
+    "videoCodecs": [
+      {
+        "payloadType": 96,
+        "rtpMap": {
+          "encodingName": "VP8",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ]
+      },
+      {
+        "payloadType": 97,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "96"
+          }
+        }
+      },
+      {
+        "payloadType": 103,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "1",
+            "profile-level-id": "42001f"
+          }
+        }
+      },
+      {
+        "payloadType": 104,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "103"
+          }
+        }
+      },
+      {
+        "payloadType": 107,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "0",
+            "profile-level-id": "42001f"
+          }
+        }
+      },
+      {
+        "payloadType": 108,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "107"
+          }
+        }
+      },
+      {
+        "payloadType": 109,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "1",
+            "profile-level-id": "42e01f"
+          }
+        }
+      },
+      {
+        "payloadType": 114,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "109"
+          }
+        }
+      },
+      {
+        "payloadType": 115,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "0",
+            "profile-level-id": "42e01f"
+          }
+        }
+      },
+      {
+        "payloadType": 116,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "115"
+          }
+        }
+      },
+      {
+        "payloadType": 117,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "1",
+            "profile-level-id": "4d001f"
+          }
+        }
+      },
+      {
+        "payloadType": 118,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "117"
+          }
+        }
+      },
+      {
+        "payloadType": 39,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "0",
+            "profile-level-id": "4d001f"
+          }
+        }
+      },
+      {
+        "payloadType": 40,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "39"
+          }
+        }
+      },
+      {
+        "payloadType": 45,
+        "rtpMap": {
+          "encodingName": "AV1",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-idx": "5",
+            "profile": "0",
+            "tier": "0"
+          }
+        }
+      },
+      {
+        "payloadType": 46,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "45"
+          }
+        }
+      },
+      {
+        "payloadType": 98,
+        "rtpMap": {
+          "encodingName": "VP9",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "profile-id": "0"
+          }
+        }
+      },
+      {
+        "payloadType": 99,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "98"
+          }
+        }
+      },
+      {
+        "payloadType": 100,
+        "rtpMap": {
+          "encodingName": "VP9",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "profile-id": "2"
+          }
+        }
+      },
+      {
+        "payloadType": 101,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "100"
+          }
+        }
+      },
+      {
+        "payloadType": 119,
+        "rtpMap": {
+          "encodingName": "H264",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "goog-remb"
+          },
+          {
+            "type": "transport-cc"
+          },
+          {
+            "type": "ccm",
+            "parameter": "fir"
+          },
+          {
+            "type": "nack"
+          },
+          {
+            "type": "nack",
+            "parameter": "pli"
+          },
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "level-asymmetry-allowed": "1",
+            "packetization-mode": "1",
+            "profile-level-id": "64001f"
+          }
+        }
+      },
+      {
+        "payloadType": 120,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "119"
+          }
+        }
+      },
+      {
+        "payloadType": 50,
+        "rtpMap": {
+          "encodingName": "rtx",
+          "clockRate": 90000
+        },
+        "rtcpFeedbacks": [
+          {
+            "type": "rrtr"
+          }
+        ],
+        "fmtp": {
+          "parameters": {
+            "apt": "49"
+          }
+        }
+      }
+    ],
+    "videoExtensions": [
+      {
+        "entry": 1,
+        "extensionName": "urn:ietf:params:rtp-hdrext:toffset"
+      },
+      {
+        "entry": 2,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"
+      },
+      {
+        "entry": 3,
+        "extensionName": "urn:3gpp:video-orientation"
+      },
+      {
+        "entry": 4,
+        "extensionName": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+      },
+      {
+        "entry": 5,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
+      },
+      {
+        "entry": 6,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/video-content-type"
+      },
+      {
+        "entry": 7,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/video-timing"
+      },
+      {
+        "entry": 8,
+        "extensionName": "http://www.webrtc.org/experiments/rtp-hdrext/color-space"
+      },
+      {
+        "entry": 9,
+        "extensionName": "urn:ietf:params:rtp-hdrext:sdes:mid"
+      },
+      {
+        "entry": 10,
+        "extensionName": "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id"
+      },
+      {
+        "entry": 11,
+        "extensionName": "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id"
+      }
+    ]
+  }
+}

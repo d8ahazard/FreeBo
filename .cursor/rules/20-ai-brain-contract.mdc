@@ -1,0 +1,56 @@
+---
+description: The AI agent loop and tool/action contract
+globs: autobot/brain/**
+---
+
+# AI brain contract
+
+Full reference: [docs/AI_BRAIN.md](mdc:docs/AI_BRAIN.md).
+
+## The loop (agent.py)
+
+`perceive -> think -> act -> observe`, but **event-driven** (not a fixed timer). Background tasks keep a
+`PerceptionBuffer` fresh and a priority queue feeds one reasoner: speech/manual (0) > state/touch (1) >
+idle (2, posted every `tick_seconds`). Each event runs one cycle:
+
+1. **perceive** (`perception.py`): `RobotLink.telemetry()` + `RobotLink.snapshot()` -> `Observation`.
+2. **think** (`providers/`): system prompt + recent history + the frame (image, or the VLM's text scene
+   description in hybrid mode) + telemetry summary -> the OpenAI-compatible model, with the tool schema.
+3. **act** (`skills/` -> `safety.py` -> `RobotLink`): execute the returned tool call(s) in-process.
+4. **observe**: record the result; stream the reasoning + action to the UI over WebSocket.
+
+**Brain architectures** (`AUTOBOT_AI_PROVIDER`): a single vision model (`openai|ollama|...`); `vlm` (a local
+vision model both sees and decides, bypassing tools/memory); or `hybrid` = **reflex + cortex** — the VLM is
+the eyes (`/vlm/perceive` every `AUTOBOT_CAPTION_SECONDS`), a fast tool-calling LLM is the cortex, and a
+non-LLM ToF reflex (`AUTOBOT_REFLEX_STOP_CM`) stops the robot between decisions. See docs/AI_BRAIN.md.
+
+The model's natural-language "thoughts" (the assistant text alongside tool calls) are streamed verbatim to
+the UI's thought panel. Never hide them.
+
+## Tools = a curated set composed from SKILLS (autobot/brain/skills/)
+
+Built-in skills: `core` (drive/stop/look/say/set_eyes/set_toggle/dock/undock/wake/sleep/wait), `memory`
+(remember/recall/forget), `recognition` (note_sighting/who_do_you_see/enroll_face), `home_assistant`
+(list_entities/home_assistant), `voice` (no tools — feeds heard speech).
+
+- Each tool has a JSON schema, an async handler, and an **authority** (`anyone` or `owner`). The
+  `SkillRegistry` aggregates active skills' tools and dispatches calls; do not call the robot directly from
+  `agent.py`. Adding a capability = add/extend a `Skill` + its authority + a `safety.py` rule (if it moves
+  anything) + a line in `docs/AI_BRAIN.md`.
+- Enforcement order per call: **owner-authority gate** (obedience policy, `identity.py`) -> handler's own
+  **safety** clamps (`safety.py`). `say` needs talk enabled; `drive` is clamped to `max_speed`.
+- Optional skills (voice STT, face recognition, HA) self-deactivate if their dependency/config is missing.
+- Tools return a short structured result that is fed back to the model on the next turn.
+
+## Providers (providers/)
+
+Assume only: OpenAI-compatible `POST {base_url}/chat/completions` with `tools`, `tool_choice`, and image
+content parts. `base_url`, `api_key`, `model` come from config/UI. No vendor SDK lock-in; use plain HTTP.
+Degrade clearly if the endpoint lacks vision or tool calling (log + tell the UI).
+
+## Autonomy modes
+
+- `manual`: AI loop paused; only the UI's manual controls move the robot.
+- `assist`: AI may perceive and suggest, but actions require the user to be watching (still executes, but
+  the UI surfaces them prominently; emergency stop always available).
+- `auto`: full autonomy on the tick. Safety floor always applies.

@@ -1,0 +1,76 @@
+---
+description: Autobot project structure, internal layer boundaries, and where to add new things
+alwaysApply: true
+---
+
+# Autobot project structure
+
+Autobot is a **single deployable app** (the `autobot/` package) that runs on one ARM Linux box, plus a
+one-time credential tool. There is no separate Pi "bridge" / PC "brain" anymore — but keep the internal
+layer boundaries. **Never blur them.**
+
+```
+autobot/                 # the one app (python -m autobot)
+  __main__.py            #   entrypoint
+  config.py              #   all config + UI-settable state (NO secrets); robot_link = native|mock
+  credentials.py         #   the ONLY loader of robot secrets; masked, never sent to UI/provider
+  robot/                 #   the ONLY code that touches the robot
+    link.py              #     RobotLink contract + make_link() factory
+    native_link.py       #     NativeRobotLink: native TUTK bridge + ffmpeg/mediamtx + deadman (owns secrets)
+    mock_link.py         #     MockRobotLink: fake robot for hardware-free dev
+    frames.py            #     MAVLink builders + PARAM_TOGGLES + EYE_ANIMATIONS (protocol source of truth)
+    video.py             #     mediamtx config + ffmpeg helpers + WHEP/HLS upstreams + stream auth
+    mqtt.py              #     optional Home Assistant entities (native only)
+    native/              #     ebo_bridge.c (native TUTK), mediamtx.template.yml, build_bridge.sh, probe_eyes.py
+  brain/                 #   the AI agent loop + safety floor (calls the robot only via a RobotLink)
+    agent.py             #     event-driven perceive->think->act->observe; reflex+cortex (hybrid); scheduler
+    perception.py        #     snapshot + telemetry (+ VSLAM pose) -> Observation
+    safety.py            #     clamps, rate limit, deadman, autonomy + talk gating
+    curiosity.py         #     scene novelty + action repetition + visited-cell coverage -> anti-repeat nudge
+    memory.py            #     persistent memory: facts + daily log + sightings (atomic, rotation, embed recall)
+    embeddings.py        #     optional local embedding backend for semantic recall (AUTOBOT_EMBED_MODEL)
+    tasks.py             #     persistent scheduled tasks/reminders + scheduling math (TaskStore)
+    slam.py              #     lightweight monocular visual odometry (pose + keyframes; advisory)
+    vlm_client.py        #     client for the VLM "eyes" service (hybrid perception) -> scripts/vlm_service.py
+    identity.py          #     owner authority / pairing / approval flow (enforced with safety)
+    tts.py               #     text-to-speech -> G.711 (for talkback)
+    providers/           #     OpenAI-compatible LLM client(s)
+    skills/              #     capabilities as Skills + the SkillRegistry (the action contract)
+      core.py            #       body controls (drive/stop/say/eyes/toggles/dock/...)
+      memory_skill.py    #       remember/recall/forget
+      home_assistant.py  #       control HA devices (list/get_state/on-off/any service; optional: HASS_*)
+      recognition.py     #       face recog (insightface|face_recognition) + sightings + greet-by-name
+      voice.py           #       mic STT -> 'heard' speech (optional: faster-whisper)
+      places.py          #       named places + go_to_place (clamped steps) + topological graph
+      patrol.py          #       smart patrol mode; tasks_skill.py: schedule reminders/routines
+      mcp_skill.py       #       expose external MCP server tools to the cortex (AUTOBOT_MCP_SERVERS)
+  web/                   #   the web layer
+    server.py            #     FastAPI: REST + WebSocket + video proxy, serves the UI; owns LINK + brain
+    static/fallback.html
+webui/                   # React + Vite + TypeScript + Tailwind. Thin client, same-origin.
+collector/               # One-time credential capture (being reworked for mDNS). Writes top-level .env + vendor/.
+  apk_patch/ pc_frida/ hooks/ bionic/ receiver.py
+deploy/pi-gen/           # Turnkey RPi 4 appliance image: pi-gen config + stage-autobot + build-wsl.sh
+vendor/                  # GITIGNORED: TUTK .so, bionic runtime, ioctl9930.bin (you provide)
+Dockerfile, docker-compose.yml, run.sh, requirements.txt, .env.example
+docs/                    # ARCHITECTURE, BRIDGE_PROTOCOL, AI_BRAIN, SAFETY, COLLECTOR, SETUP, PROVENANCE
+.cursor/rules/           # these rules
+```
+
+## Where to add things
+
+- **New robot capability**: add the frame/IOCTL in `autobot/robot/frames.py` (+ `native/ebo_bridge.c` if it
+  needs a new control kind), handle it in `NativeRobotLink._do_action` (and `MockRobotLink`), document in
+  `docs/BRIDGE_PROTOCOL.md`, THEN add an AI tool in `autobot/brain/tools.py`, THEN a UI control. Never touch
+  the robot from anywhere but `autobot/robot/`.
+- **New AI capability**: add/extend a `Skill` in `autobot/brain/skills/` (register in
+  `build_default_skills()`), set each tool's authority, keep heavy deps optional + graceful.
+- **New AI loop behavior**: edit `autobot/brain/agent.py` + the system prompt.
+- **New telemetry field**: `RobotLink.telemetry()` (both impls) -> `Observation` in `perception.py` -> UI.
+- **New config knob**: `autobot/config.py` (env + UI override) -> surface in the UI config panel.
+
+## Data flow (one direction of truth)
+
+robot ⇄ ebo_bridge.c ⇄ NativeRobotLink ⇄ (RobotLink) ⇄ agent.py / web server (WS) ⇄ webui.
+The AI provider is called only from `brain/providers/` via `agent.py`. Secrets load only in
+`credentials.py` and are consumed only by `NativeRobotLink`.

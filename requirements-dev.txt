@@ -1,0 +1,9 @@
+# Dev/test dependencies (NOT needed to run the app). Install with:
+#   pip install -r requirements-dev.txt
+# Then run the fast mock-based suite with: pytest
+# Live-robot checks (need a running app): pytest --hardware   (or scripts/robot_selftest.py)
+pytest>=8.0
+pytest-asyncio>=0.23
+# httpx is already a runtime dependency (used by the diagnostics client + the hardware tests).
+# Optional: opencv-python + numpy make the motion-confirm frame-diff tests exercise real image decoding;
+# they're skipped gracefully if absent.

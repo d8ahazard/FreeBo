@@ -1,0 +1,26 @@
+# pi-gen config for the Autobot appliance image (Raspberry Pi 4, 64-bit Bookworm Lite + Autobot).
+# Used by pi-gen's build-docker.sh. The build-wsl.sh helper in this folder copies this file and the
+# stage-autobot/ stage into a pi-gen checkout, then runs the Docker build. See README.md.
+#
+# Output: a headless image that boots, runs comitup (AP + captive portal for wifi), then serves the
+# Autobot web UI on http://autobot.local:8200 with a first-run setup wizard.
+
+IMG_NAME='autobot'
+RELEASE='bookworm'
+
+# Headless appliance defaults.
+TARGET_HOSTNAME='autobot'
+FIRST_USER_NAME='autobot'
+# FIRST_USER_PASS='change-me'      # set a password, or provision via the boot partition / imager
+DISABLE_FIRST_BOOT_USER_RENAME='1'
+ENABLE_SSH='1'
+
+LOCALE_DEFAULT='en_US.UTF-8'
+KEYBOARD_KEYMAP='us'
+KEYBOARD_LAYOUT='English (US)'
+TIMEZONE_DEFAULT='Etc/UTC'
+
+# Build Lite (stage2) + our Autobot stage. build-wsl.sh sets STAGE_LIST to absolute paths.
+STAGE_LIST='stage0 stage1 stage2 stage-autobot'
+
+# Skip the other export stages we don't need (desktop, etc.) — Lite + autobot only.

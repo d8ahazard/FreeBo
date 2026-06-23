@@ -1,0 +1,22 @@
+# Run the unified Autobot app on the Raspberry Pi (native mode).
+#   1) populate ./vendor (TUTK .so + ioctl9930.bin from the collector; bionic is bundled — see below)
+#   2) build the native binary once: autobot/robot/native/build_bridge.sh  (needs the Android NDK)
+#      -> produces autobot/robot/native/ebo_bridge
+#   3) copy .env.example to .env and fill in your credentials (the collector can write this for you)
+#   4) build the web UI:  cd webui && npm install && npm run build
+#   5) docker compose up -d --build
+#
+# Before building, copy the bundled bionic into vendor/ (one-time):
+#   cp -r collector/bionic vendor/bionic    # or run collector/bionic/fetch_bionic.sh
+#
+# For hardware-free dev on a PC you don't need Docker at all:
+#   pip install -r requirements.txt && AUTOBOT_ROBOT_LINK=mock python -m autobot
+services:
+  autobot:
+    build: .
+    image: autobot:latest
+    container_name: autobot
+    restart: unless-stopped
+    # host networking keeps RTSP/WebRTC/MQTT reachable on the LAN with no port juggling
+    network_mode: host
+    env_file: .env

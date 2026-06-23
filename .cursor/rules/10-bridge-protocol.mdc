@@ -1,0 +1,50 @@
+---
+description: The EBO robot wire protocol and the in-process RobotLink contract
+globs: autobot/robot/**
+---
+
+# Robot protocol (the contract the brain calls)
+
+Full reference: [docs/BRIDGE_PROTOCOL.md](mdc:docs/BRIDGE_PROTOCOL.md). Keep that doc in sync with code.
+
+## Native <-> NativeRobotLink (stdio + fd3), inside the app
+
+`ebo_bridge` (native, `autobot/robot/native/ebo_bridge.c`) talks to `NativeRobotLink`
+(`autobot/robot/native_link.py`) over pipes:
+
+- **Native -> link (stdout):** framed `[u32 len LE][u8 codec][payload]`
+  - `codec 80` = HEVC video, `78` = H.264 video
+  - `codec 0xFF` = inbound MAVLink status (battery/telemetry)
+  - `codec 0xA0` = inbound audio (listen): payload `[codec_id:1][flags:1][G.711 data]`
+- **link -> native (fd3):** framed `[u32 len LE][u8 kind][payload]`
+  - `kind 0` = MAVLink over RDT (motor/dock/param/eyes)
+  - `kind 1` = avSendIOCtrl: payload `[u16 io_type LE][data]`
+  - `kind 2` = outbound audio (talkback): payload `[u8 codec_id][G.711 data]`  ← Autobot addition
+
+## MAVLink frames (built in `autobot/robot/frames.py` — single source of truth)
+
+- `motor_frame(ly, rx, lx, ry, buttons)` msgid 202, crc_extra 211. `ly>0` = forward (negated for the robot).
+- `param_set_frame(group, key, value)` msgid 229, crc_extra 208. Used for toggles + eye animations.
+- `command_frame(command)` msgid 200, crc_extra 196. e.g. `CMD_DOCK = 40154`.
+
+Known params (`group/key`): `display/enable` (eyes), `video/night_vision`, `control/auto_avoidance`,
+`control/fallarrest`, `security_patrol/enable`, `power/sleep`, and the eye-animation keys discovered in
+`docs/BRIDGE_PROTOCOL.md` (e.g. `display/expression`). Unknown values are probed, never assumed.
+
+## RobotLink (the in-process verbs; the ONLY way the brain touches the robot)
+
+`autobot/robot/link.py` defines the contract; `NativeRobotLink` and `MockRobotLink` implement it. Methods
+(async, returning JSON-able result dicts, fail-soft):
+
+- `info()` / `telemetry()` — connection/awake/codec/battery/toggles/eyes/audio summaries.
+- `snapshot()` — `(jpeg_bytes, error)`; `(None, reason)` while asleep / not ready.
+- `move(ly, rx, duration)` — timed move then auto-stop.
+- `drive(ly, rx)` — single continuous frame (the deadman stops the robot on silence).
+- `stop()` — immediate stop.
+- `action(name)` — wake|sleep|dock|undock|<toggle>_on|<toggle>_off|eyes_<anim>.
+- `say_audio(g711, codec)` / `say_text(text)` — talkback (also gated by the brain's talk toggle).
+- `connection(state)` — release/reclaim the single robot session for the Enabot app.
+- `whep_upstream` / `hls_base` / `stream_auth_header()` — video upstreams the web server proxies (None in mock).
+
+Every method is best-effort and must never crash the app. `NativeRobotLink` keeps its OWN deadman watchdog
+(`_drive_watchdog`): if `drive` frames stop arriving (~0.35s), it sends a stop frame regardless of the brain.

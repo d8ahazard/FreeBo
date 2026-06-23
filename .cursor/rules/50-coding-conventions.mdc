@@ -1,0 +1,34 @@
+---
+description: Coding conventions for Autobot
+alwaysApply: true
+---
+
+# Coding conventions
+
+## Python (bridge + brain)
+
+- Target Python 3.10+. Use type hints on public functions and dataclasses/pydantic for structured data.
+- Keep **`autobot/robot/` dependency-light** (stdlib + the web deps only). The whole app runs on a Pi.
+- The app uses `fastapi`, `uvicorn`, `httpx`, `pydantic` (+ optional `paho-mqtt`); avoid heavy vendor AI
+  SDKs — talk HTTP to the provider.
+- Comments explain **why / trade-offs / constraints**, never restate the code. (Mirrors the upstream
+  bridge and GrowBot style — terse, high-signal comments.)
+- Fail soft: wrap subsystem calls so one failure (audio, eyes, provider) never takes down the loop.
+- No secrets, API keys, or full credential blobs in logs.
+
+## TypeScript / React (webui)
+
+- TypeScript everywhere. Functional components + hooks. Tailwind for styling (no ad-hoc CSS files beyond
+  the single `index.css` with Tailwind directives).
+- All server access goes through `src/api.ts`. Components never `fetch` directly.
+- Keep the UI a thin client: no robot logic in the browser, just rendering + control intents.
+
+## C (ebo_bridge.c)
+
+- Keep it a single file, no libc-heavy abstractions; it's run under the Android linker on the Pi.
+- Any new control `kind` must be documented in `docs/BRIDGE_PROTOCOL.md` and mirrored in `native_link.py`.
+
+## General
+
+- Match the surrounding file's style. Small, reviewable changes. Update the relevant `docs/` file in the
+  same change as the code. When in doubt, read `AGENTS.md`.

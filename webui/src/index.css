@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+/* ─── FreeBo HUD theme — Stark Industries: arc-reactor cyan + Stark gold on deep space black ─── */
+@theme {
+  --color-bg: #03070e;
+  --color-card: #081019;
+  --color-card2: #0c1722;
+  --color-line: #16384a;
+  --color-fg: #d7f2ff;
+  --color-mut: #5f8298;
+  --color-accent: #2bd6f0;
+  --color-gold: #f5c451;
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-bad: #ff4d4d;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 700px at 70% -10%, rgba(43, 214, 240, 0.08), transparent 60%),
+    radial-gradient(900px 600px at 10% 110%, rgba(245, 196, 81, 0.05), transparent 60%),
+    var(--color-bg);
+  color: var(--color-fg);
+  font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  letter-spacing: 0.01em;
+}
+
+/* faint engineering grid behind everything */
+.hud-grid::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(43, 214, 240, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(43, 214, 240, 0.04) 1px, transparent 1px);
+  background-size: 44px 44px;
+  z-index: 0;
+}
+
+/* glassy HUD panel */
+.hud-panel {
+  background: linear-gradient(180deg, rgba(12, 23, 34, 0.85), rgba(8, 16, 25, 0.85));
+  border: 1px solid var(--color-line);
+  border-radius: 14px;
+  backdrop-filter: blur(8px);
+  box-shadow: inset 0 0 24px rgba(43, 214, 240, 0.05), 0 4px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* corner-bracket framing, Iron-Man style */
+.hud-frame {
+  position: relative;
+}
+.hud-frame::before,
+.hud-frame::after {
+  content: "";
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--color-accent);
+  opacity: 0.7;
+}
+.hud-frame::before {
+  top: 6px;
+  left: 6px;
+  border-right: 0;
+  border-bottom: 0;
+}
+.hud-frame::after {
+  bottom: 6px;
+  right: 6px;
+  border-left: 0;
+  border-top: 0;
+}
+
+.hud-glow {
+  box-shadow: 0 0 0 1px rgba(43, 214, 240, 0.35), 0 0 18px rgba(43, 214, 240, 0.25);
+}
+.text-glow {
+  text-shadow: 0 0 10px rgba(43, 214, 240, 0.55);
+}
+.text-gold {
+  color: var(--color-gold);
+}
+
+/* video scanline / vignette overlay */
+.hud-scan::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.12) 0 1px, transparent 1px 3px),
+    radial-gradient(120% 120% at 50% 50%, transparent 60%, rgba(0, 0, 0, 0.55) 100%);
+  mix-blend-mode: multiply;
+}
+
+/* arc-reactor status orb */
+@keyframes reactor {
+  0%, 100% { box-shadow: 0 0 8px var(--color-accent), 0 0 18px rgba(43, 214, 240, 0.5); }
+  50% { box-shadow: 0 0 14px var(--color-accent), 0 0 30px rgba(43, 214, 240, 0.8); }
+}
+.reactor {
+  animation: reactor 2.4s ease-in-out infinite;
+}
+
+/* mono HUD type for telemetry / terminator feed */
+.hud-mono {
+  font-family: "JetBrains Mono", "Consolas", ui-monospace, monospace;
+  letter-spacing: 0.02em;
+}
+
+@keyframes blink-feed {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.feed-in {
+  animation: blink-feed 0.25s ease-out;
+}
+
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 8px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}

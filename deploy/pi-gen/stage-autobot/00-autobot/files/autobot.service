@@ -1,0 +1,17 @@
+[Unit]
+Description=Autobot (AI companion robot app)
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/autobot
+EnvironmentFile=-/etc/autobot/autobot.env
+ExecStart=/opt/autobot/venv/bin/python -m autobot
+Restart=always
+RestartSec=3
+# Appliance: runs as root so the native TUTK bridge has the low-PID namespace + device access it needs.
+User=root
+
+[Install]
+WantedBy=multi-user.target

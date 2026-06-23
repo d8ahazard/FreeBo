@@ -1,0 +1,33 @@
+# FreeBo — OPTIONAL heavy AI stack (the "eyes" + hearing). NOT needed on the robot box itself.
+#
+# In the reflex+cortex (hybrid) brain, this stack runs on a GPU machine that hosts the VLM "eyes" service
+# (scripts/vlm_service.py) and, optionally, local hearing/recognition. The robot app talks to it over HTTP,
+# so you can keep the robot box lean and run this on a separate workstation.
+#
+# These are large + platform/CUDA-specific, so they're intentionally NOT pinned here and NOT vendored into
+# git (see docs/REPRO.md — big artifacts ship as release assets, models are fetched per-machine). Install
+# the variant that matches your hardware (CPU vs the right CUDA build of torch / onnxruntime).
+#
+#   pip install -r requirements-ai.txt
+#
+# Then download the models the first time they're used (HF cache / insightface / Piper voices) — see
+# docs/AI_BRAIN.md and scripts/get_voice.py. Models are never committed.
+
+# --- VLM "eyes" service (scripts/vlm_service.py): MiniCPM-V via transformers ---
+torch                 # install the build for your CUDA/CPU from https://pytorch.org
+transformers>=4.49
+accelerate
+pillow
+sentencepiece
+# flash-attention is optional (speeds up the VLM); falls back to sdpa if absent.
+
+# --- Hearing (speech-to-text on the robot mic) ---
+faster-whisper
+
+# --- Face recognition (greet-by-name). Pick ONE backend (insightface recommended on a GPU box): ---
+insightface
+onnxruntime            # or onnxruntime-gpu for CUDA
+# face_recognition     # classic dlib backend (CPU; needs cmake/dlib) — alternative to insightface
+
+# --- Optional: semantic memory recall uses a local embedding model via your OpenAI-compatible endpoint
+#     (e.g. `ollama pull nomic-embed-text`), no extra Python package required. ---

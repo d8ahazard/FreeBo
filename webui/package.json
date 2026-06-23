@@ -1,0 +1,32 @@
+{
+  "name": "autobot-webui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Autobot dashboard — live video, telemetry, AI thoughts, manual override, and config.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@yume-chan/adb": "^2.1.0",
+    "@yume-chan/adb-credential-web": "^2.1.0",
+    "@yume-chan/adb-daemon-webusb": "^2.1.0",
+    "agora-rtc-sdk-ng": "^4.20.0",
+    "agora-rtm-sdk": "^1.5.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
+  }
+}

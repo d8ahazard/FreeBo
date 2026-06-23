@@ -1,0 +1,33 @@
+# Autobot — the unified app (one process). Python 3.10+.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+pydantic>=2.6
+# Optional Home Assistant MQTT (native mode only). Safe to omit if you don't use HA.
+paho-mqtt>=1.6
+# TTS for talkback uses the OS speech engine (Windows SAPI / macOS say / espeak-ng) + ffmpeg; no Python dep.
+# The AI provider is reached over plain HTTP (httpx) — no vendor SDK required.
+
+# ---- Air 2 native link (RTC video + control). Required for AUTOBOT_ROBOT_LINK=air2_native (the default for
+#      EBO Air 2). The robot's media is joined in pure Python (no proprietary .so) — aiortc for the RTC
+#      transport, PyAV (av) for H.265 decode, numpy/Pillow for frames/snapshots, cryptography for DTLS. The
+#      RTM control sidecar is Node (scripts/rtm_sidecar.js) using webui/node_modules — run `npm install` in
+#      webui/ (it already lists agora-rtm-sdk + ws). Needs Node.js on PATH (or set AUTOBOT_NODE_BIN). ----
+aiortc>=1.6
+av>=11
+numpy>=1.24
+Pillow>=10
+cryptography>=42
+
+# ---- Optional skills (each degrades gracefully if missing; install only what you want) ----
+# Voice input (speech-to-text on the robot mic):
+#   pip install faster-whisper
+# Face recognition (pairing + 'remember who it sees' + greet-by-name). Two interchangeable backends —
+# AUTOBOT_FACE_BACKEND=auto picks insightface first, then face_recognition:
+#   pip install insightface onnxruntime-gpu Pillow numpy   # recommended on a GPU box (no dlib build)
+#   pip install face_recognition Pillow numpy              # classic CPU backend (needs dlib/cmake)
+# Semantic memory recall (optional): a local embedding model, e.g. `ollama pull nomic-embed-text`, then set
+#   AUTOBOT_EMBED_MODEL=nomic-embed-text   (uses the cortex base_url/key; falls back to keyword recall).
+# Home Assistant control needs no extra package (uses httpx, already a dep).
+# MCP servers (expose external Model Context Protocol tools to the cortex), configured via AUTOBOT_MCP_SERVERS:
+#   pip install mcp
