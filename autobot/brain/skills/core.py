@@ -107,7 +107,9 @@ class CoreSkill(Skill):
         d = ctx.safety.check_say(s)
         if not d.allowed:
             return {"ok": False, "blocked": d.reason}
-        text = str(a.get("text", "")).strip()
+        # Small cortex models sometimes pack `set_eyes "..."\nsay "..."` into the text — speak only the sentence.
+        from ..speech_clean import clean_spoken
+        text = clean_spoken(str(a.get("text", "")))
         if not text:
             return {"ok": False, "error": "empty text"}
         # Speak via the best path for this link:

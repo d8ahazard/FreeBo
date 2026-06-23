@@ -28,6 +28,7 @@ from ..robot.link import RobotLink
 from . import commands, locomotion, motion_model, reflex_vision, visual_motion
 from .behavior import BehaviorController
 from .reflex_vision import LoomingDetector
+from . import navigator
 from .curiosity import Curiosity
 from .identity import Identity
 from .memory import Memory
@@ -53,6 +54,9 @@ EYE_COOLDOWN = 1.2       # min seconds between reflex eye changes (anti-spam)
 # (between cortex decisions) and arm a "turn" hint for the next decision. 0 disables. See docs/AI_BRAIN.md.
 REFLEX_STOP_CM = float(os.environ.get("AUTOBOT_REFLEX_STOP_CM", "18"))
 REFLEX_PERIOD = 0.4      # how often the reflex checks the latest cached telemetry (s)
+# Hybrid roam: run the deterministic navigator for motion on most ticks; let the cortex (LLM) take every Nth
+# roam tick for cognition/narration/memory. Keeps wandering fast+robust without starving higher reasoning.
+CORTEX_EVERY = 4
 
 # Event priorities (lower = handled first). Commands + speech + manual preempt autonomous wandering.
 _PRIORITY = {"command": 0, "speech": 0, "manual": 0, "state": 1, "touch": 1, "idle": 2}
@@ -144,6 +148,10 @@ class AgentBrain:
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
         self._looming = LoomingDetector()  # camera looming reflex (substitute for ToF on sensorless robots)
         self._loom_frame_ts = 0.0
+        # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
+        self._nav_cycle = 0
+        self._nav_last_dir = "right"
+        self._nav_backed_up = False
         self._proprio_jpeg: bytes | None = None   # last frame, for the camera-based "am I moving" proprioception
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_spoken = ""       # last line we said aloud (for the SPEAK_UP "say that again" command)
@@ -1015,6 +1023,18 @@ class AgentBrain:
             if hybrid_enabled(s) and self._vlm_ok is None:
                 await self._vlm_health(s)
 
+            # Midbrain: routine wandering is decided by the deterministic navigator (fast CPU, no LLM round),
+            # so the robot reliably drives toward open space / backs off obstacles instead of waiting on the
+            # cortex to format a move. The cortex still owns conversation/goals (any heard/directive trigger)
+            # and takes every CORTEX_EVERY-th roam tick for cognition + narration + memory.
+            roam_motion = (hybrid_enabled(s) and trigger in ("idle", "state") and beh.scope == "roam"
+                           and s.allow_motion and not resting and not self._heard_line(s)
+                           and not (s.directive or "").strip())
+            if roam_motion:
+                self._nav_cycle += 1
+                if self._nav_cycle % CORTEX_EVERY != 0:
+                    return await self._navigate_roam(trigger, s, obs)
+
             provider = OpenAICompatibleClient(s.ai_base_url, s.ai_api_key, s.ai_model)
             tools = self.registry.schemas(eye_anims, exclude=self._tool_exclusions(s, resting))
             system = self.build_system_prompt(s)
@@ -1092,6 +1112,44 @@ class AgentBrain:
                 return {"ok": False, "error": str(e)}
 
             return {"ok": True, "actions": actions, "observation": obs.text_summary()}
+
+    # --- midbrain navigator (deterministic roam motion; no LLM round) ---
+    async def _navigate_roam(self, trigger: str, s: Settings, obs: Observation) -> dict:
+        """Pick + execute one wandering move from the VLM clearance + CPU reflexes, with no cortex call. CPU
+        reflexes (looming / confirmed-blocked) override the caption so we back off / turn instead of crashing."""
+        looming = self._reflex_blocked
+        blocked = self._stuck_forward("forward") or looming
+        clear = navigator.parse_clearance(obs.caption or self.buffer.caption)
+        mv = navigator.choose(clear, blocked_ahead=blocked, looming=looming,
+                              last_dir=self._nav_last_dir, backed_up_last=self._nav_backed_up)
+        # Consume the one-shot reflex/stuck flags now that we've reacted to them.
+        self._reflex_blocked = False
+        self._motion_reaction = None
+        action = mv.action
+        self._nav_backed_up = (action == "back")
+        if action in ("left", "right"):
+            self._nav_last_dir = action
+
+        await self.emit({"type": "thought", "text": f"(nav: {mv.reason})", "ts": time.time()})
+        await self._express("surprised" if (looming or blocked or action == "back") else "curious")
+
+        actions: list[dict] = []
+        vec = self._calib_drive(action)
+        if vec and self._motion_allowed(s, resting=False):
+            ly, rx, _dur = vec
+            await self._set_status("acting")
+            await self.emit({"type": "tool_call", "name": "drive", "args": {"action": action},
+                             "ts": time.time()})
+            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
+                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
+            self.motion.record(obs.jpeg, ly, rx)
+            self.curiosity.note_action(action)
+            actions.append({"name": "drive", "args": {"action": action}, "result": res})
+            await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
+        elif action == "stop":
+            await self._safe_stop()
+        await self._set_status("idle")
+        return {"ok": True, "actions": actions, "nav": True, "action": action}
 
     # --- modular vision brain (light VLM decides; Whisper hears; Piper speaks) ---
     async def _reason_vlm(self, trigger: str, s: Settings, obs: Observation, resting: bool) -> dict:
@@ -1178,6 +1236,10 @@ class AgentBrain:
 
     async def _speak(self, text: str) -> None:
         from . import audio_state, tts
+        from .speech_clean import clean_spoken
+        text = clean_spoken(text)
+        if not text:
+            return
         self._last_spoken = text
         try:
             wav = tts.render_wav(text)
