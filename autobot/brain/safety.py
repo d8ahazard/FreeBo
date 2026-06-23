@@ -48,8 +48,10 @@ class SafetyFloor:
 
     def check_drive(self, s: Settings, ly: float, rx: float, duration: float, *,
                     source: str = "ai") -> Decision:
-        """Clamp a drive/move request. `source` 'ai' is rate-limited + autonomy-gated; 'manual' (UI) is
-        only speed/duration-clamped (the human is in control)."""
+        """Clamp a drive/move request. `source` 'ai' is rate-limited + autonomy-gated; 'manual' (UI) and
+        'overseer' (the human/agent puppeting the robot in overseer mode) are only speed/duration-clamped —
+        the human is in control, so they bypass the AI motion/autonomy/rate gates but still cannot exceed
+        the speed/duration caps (the speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
         if source == "ai" and not getattr(s, "allow_motion", True):
             return Decision(False, "motion disabled by the user (Control toggle)")
         if source == "ai" and not self.autonomy_allows_motion(s):

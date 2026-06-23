@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, connectWs } from "../api";
-import type { AutobotEvent, BrainStatus, FeedItem, Identity, PendingApproval, Settings, Telemetry, TtsState } from "../types";
+import type { AutobotEvent, BrainStatus, FeedItem, Identity, OverseerLogItem, PendingApproval, Settings, Telemetry, TtsState } from "../types";
 
 let _feedId = 0;
+let _overseerId = 0;
 
 export function useAutobot() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -12,12 +13,20 @@ export function useAutobot() {
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [overseerLog, setOverseerLog] = useState<OverseerLogItem[]>([]);
   const [connected, setConnected] = useState(false);
 
   const pushFeed = useCallback((item: Omit<FeedItem, "id">) => {
     setFeed((f) => {
       const next = [...f, { ...item, id: _feedId++ }];
       return next.length > 200 ? next.slice(-200) : next;
+    });
+  }, []);
+
+  const pushOverseer = useCallback((item: Omit<OverseerLogItem, "id">) => {
+    setOverseerLog((l) => {
+      const next = [...l, { ...item, id: _overseerId++ }];
+      return next.length > 80 ? next.slice(-80) : next;
     });
   }, []);
 
@@ -76,9 +85,15 @@ export function useAutobot() {
           setApprovals((a) => a.filter((p) => p.id !== e.id));
           pushFeed({ kind: "approval", text: e.approved ? "You approved a command" : "You denied a command", ts: e.ts });
           break;
+        case "proposal":
+          pushOverseer({ kind: "proposal", verb: e.verb, args: e.args, ts: e.ts });
+          break;
+        case "overseer_act":
+          pushOverseer({ kind: "act", verb: e.kind, args: e.args, result: e.result, ts: e.ts });
+          break;
       }
     },
-    [pushFeed]
+    [pushFeed, pushOverseer]
   );
 
   useEffect(() => {
@@ -101,5 +116,5 @@ export function useAutobot() {
     return res;
   }, []);
 
-  return { settings, telemetry, brain, tts, feed, identity, approvals, connected, save, pushFeed };
+  return { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, save, pushFeed };
 }

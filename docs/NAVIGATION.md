@@ -1,5 +1,9 @@
 # Navigation, mapping & "V-SLAM" on FreeBo (honest scope)
 
+> For how the robot physically moves (the drivetrain, deadbands, the closed-loop motor control that makes
+> movement reliable, and the nervous-system layering), see [MOTION.md](MOTION.md). This file covers the
+> spatial/mapping side.
+
 Enabot EBO robots (SE, Air, Air 2) are **monocular** — one camera, no LIDAR, no depth/ToF sensor, no wheel
 odometry exposed to us. So true metric **V-SLAM** (a real floor-plan map + autonomous path planning) is not
 achievable from our side, even though the commercial app advertises it. We don't fake it. Here's what FreeBo

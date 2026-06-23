@@ -57,8 +57,14 @@ class Observation:
         tof = t.get("tof", t.get("distance"))
         if isinstance(tof, (int, float)) and tof >= 0:
             parts.append(f"obstacle {int(tof)}cm ahead" if tof < 30 else f"clear ~{int(tof)}cm ahead")
-        if t.get("resting"):
-            parts.append("RESTING (charging/docked) — cannot drive")
+        # Charging/docked. A topped-up battery (>90%) is free to leave the dock and roam, so don't tell the
+        # model it "cannot drive" in that case (matches AgentBrain._resting).
+        if t.get("resting") or t.get("charge") == 1:
+            batt = t.get("battery", -1)
+            if isinstance(batt, (int, float)) and batt > 90:
+                parts.append("on the dock, fully charged — free to head out")
+            else:
+                parts.append("RESTING (charging/docked) — cannot drive")
         if t.get("touched"):
             parts.append("⚠ JUST TOUCHED/BUMPED — react to it")
         cam = "camera frame attached" if self.has_image else f"no camera frame ({self.snapshot_error or 'n/a'})"

@@ -147,6 +147,17 @@ class Settings:
     allow_audio_in: bool = field(default_factory=lambda: _env_bool("AUTOBOT_ALLOW_AUDIO_IN", True))  # listen / STT -> brain
     # Master sleep: the whole bot goes dormant (brain stops reasoning entirely; UI disconnects the robot).
     asleep: bool = field(default_factory=lambda: _env_bool("AUTOBOT_ASLEEP", False))
+    # Overseer puppet mode: the AI brain keeps perceiving/thinking and "thinks" it is driving, but every
+    # robot-affecting call it makes is INTERCEPTED (recorded as a proposal, never sent to the robot). A human/
+    # agent overseer then drives the real robot via /api/overseer/act. Lets us study + calibrate movement
+    # without the dumb brain crashing the robot. Orthogonal to autonomy. See autobot/robot/overseer_gate.py.
+    overseer: bool = field(default_factory=lambda: _env_bool("AUTOBOT_OVERSEER", False))
+    # Optional "smart supervises dumb": before a forward step, a (usually stronger/cloud) model vets the
+    # camera for a clear path. OFF by default to protect the GPU budget — the cerebellum + reflex are the
+    # primary protection. Provider-agnostic; uses ai_base_url/ai_api_key with ai_supervisor_model (falls back
+    # to ai_model). Zero local VRAM if pointed at a cloud endpoint. See autobot/brain/supervisor.py.
+    supervisor: bool = field(default_factory=lambda: _env_bool("AUTOBOT_SUPERVISOR", False))
+    ai_supervisor_model: str = field(default_factory=lambda: os.environ.get("AUTOBOT_AI_SUPERVISOR_MODEL", ""))
     # Closed-loop motion confirmation: after an AI move, compare camera frames (+ VSLAM pose) to verify the
     # robot actually moved, and react if it's stuck/blocked. Fail-soft; off => classic open-loop moves.
     confirm_motion: bool = field(default_factory=lambda: _env_bool("AUTOBOT_CONFIRM_MOTION", True))
@@ -192,8 +203,9 @@ class Settings:
     # -- user-editable keys from the UI; user-only fields are explicitly listed --
     USER_EDITABLE = {
         "ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_summarizer_model", "ai_vision_model",
+        "ai_supervisor_model",
         "talk_enabled", "allow_think", "allow_motion", "allow_video", "allow_audio_in", "asleep",
-        "confirm_motion", "require_calibration",
+        "overseer", "supervisor", "confirm_motion", "require_calibration",
         "autonomy", "mode", "directive", "max_speed", "tick_seconds", "goal",
         "tts_engine", "voice", "autodock_pct",
         "robot_name", "persona", "owner_name", "require_name", "obey_owner_only",
@@ -226,8 +238,8 @@ class Settings:
                 elif k == "directive":
                     v = str(v)[:400]
                 elif k in ("talk_enabled", "allow_think", "allow_motion", "allow_video", "allow_audio_in",
-                           "asleep", "confirm_motion", "require_calibration", "require_name",
-                           "obey_owner_only", "setup_complete"):
+                           "asleep", "overseer", "supervisor", "confirm_motion", "require_calibration",
+                           "require_name", "obey_owner_only", "setup_complete"):
                     v = bool(v)
                 if getattr(self, k) != v:
                     setattr(self, k, v)
@@ -237,6 +249,23 @@ class Settings:
     def summarizer_model(self) -> str:
         """The heavy model for daily memory work; falls back to the fast model if unset."""
         return self.ai_summarizer_model or self.ai_model
+
+    def brain_mode(self) -> str:
+        """Single source of truth for the brain architecture: 'single' | 'hybrid' | 'vlm' | 'omni'.
+
+        Resolved from `ai_provider` (seeded from AUTOBOT_AI_PROVIDER at startup, then UI-editable) so the UI
+        is authoritative at runtime while env stays a deploy-time default. The URL-presence triggers
+        (AUTOBOT_VLM_URL / AUTOBOT_OMNI_URL) remain env-based back-compat overrides. See docs/MATURITY.md §1.
+        """
+        prov = (self.ai_provider or "").strip().lower()
+        if prov == "hybrid":
+            return "hybrid"
+        # vlm takes precedence over omni when both are present (matches the agent's reason-path order).
+        if prov == "vlm" or (os.environ.get("AUTOBOT_VLM_URL") and prov != "omni"):
+            return "vlm"
+        if prov == "omni" or os.environ.get("AUTOBOT_OMNI_URL"):
+            return "omni"
+        return "single"
 
     def snapshot(self) -> "Settings":
         """A thread-safe shallow copy of the current values (for use during a tick)."""
@@ -257,9 +286,9 @@ class Settings:
 _FIELD_NAMES = [
     "robot_link", "robot_variant", "host", "port",
     "ai_provider", "ai_base_url", "ai_api_key", "ai_model", "ai_summarizer_model", "ai_vision_model",
-    "setup_complete",
+    "ai_supervisor_model", "setup_complete",
     "talk_enabled", "allow_think", "allow_motion", "allow_video", "allow_audio_in", "asleep",
-    "confirm_motion", "require_calibration",
+    "overseer", "supervisor", "confirm_motion", "require_calibration",
     "autonomy", "mode", "directive", "max_speed", "tick_seconds", "goal",
     "tts_engine", "voice", "autodock_pct",
     "robot_name", "persona", "owner_name", "require_name", "obey_owner_only",

@@ -46,7 +46,13 @@ class BehaviorController:
         self._voice_intent: str | None = None   # "stopped"|"explore"|"pursue"|"return"
         self._voice_until = 0.0
         self._voice_detail = ""
-        self.current = Behavior(ADJUST, "observe")
+        # Active explore (default ON): in `explore` mode the idle fallback ROAMS (drives around in short steps)
+        # instead of standing still and observing. Set AUTOBOT_ACTIVE_EXPLORE=0 for the old calm-companion
+        # behavior. Greet/patrol/command/voice overrides still take precedence.
+        self.active_explore = os.environ.get("AUTOBOT_ACTIVE_EXPLORE", "1").strip().lower() in (
+            "1", "true", "yes", "on")
+        self.current = Behavior(ROAM if self.active_explore else ADJUST,
+                                "explore_active" if self.active_explore else "observe")
 
     # --- external signals ---
     def note_activity(self) -> None:
@@ -110,6 +116,9 @@ class BehaviorController:
             self._last_patrol = now
             self._patrol_until = now + self.patrol_duration
             return self._set(ROAM, "patrol")
+        # Default: actively explore (drive around in short steps) unless the user opted into calm-observe.
+        if self.active_explore:
+            return self._set(ROAM, "explore_active")
         return self._set(ADJUST, "observe")
 
     def _set(self, scope: str, intent: str, detail: str = "") -> Behavior:

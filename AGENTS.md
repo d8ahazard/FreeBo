@@ -61,6 +61,10 @@ The only sub-processes are the unavoidable native ones the link manages: the TUT
   `autobot/brain/tools.py`, then a doc line. Mirror it in `MockRobotLink` so dev stays hardware-free.
 - New AI capability/skill → a module in `autobot/brain/skills/` registered in `build_default_skills()`;
   declare each tool's authority (`anyone`/`owner`). New AI loop behavior → `autobot/brain/agent.py`.
+- Movement → the brain emits high-level INTENTS only; the cerebellum (`autobot/brain/locomotion.py`) executes
+  them with camera feedback, then `safety.py` clamps. The physical motion model (deadbands, no IMU/ToF on Air
+  2) is hard-coded in `autobot/brain/motion_model.py`; see [docs/MOTION.md](docs/MOTION.md). Never send raw
+  `ly/rx` from the brain.
 - New UI surface → a component in `webui/src/components/`, wired through `webui/src/api.ts`.
 - New deployment/image change → `deploy/pi-gen/` (pi-gen config + `stage-autobot`); see [docs/DEPLOY.md](docs/DEPLOY.md).
 - The brain uses TWO models: `ai_model` (fast, every tick) + `ai_summarizer_model` (heavy, once-a-day memory

@@ -181,15 +181,17 @@ class Air2NativeLink(RobotLink):
                 "frames_received": 1 if jpeg else 0, "battery": self._battery(), "charge": self._charging()}
 
     async def _maybe_enable_audio(self) -> None:
-        """Tell the robot to stream its mic. Reverse-engineered from the EBO app: it sends RTM 102001
-        {open:1,type:1} ('audio on') when you open the live view — without it the robot publishes only video,
-        so we never hear anything. Re-sent periodically so it survives reconnects. (102003 is the app->robot
-        intercom used for talkback.)"""
+        """Tell the robot to stream its mic. Reverse-engineered from the EBO app: opening the live view sends
+        the FULL two-way audio handshake (RTM 102001 {open:1,type:1} 'audio session on' THEN 102003
+        {open:1,type:1} 'intercom on'). 102001 ALONE is not enough — the robot only streams its mic reliably
+        once 102003 is also sent (verified live: with 102001 only, mic audio is ~zero; after 102003 it flows).
+        Re-sent periodically (102003 keepalive) so it survives reconnects. This is independent of talkback —
+        we need the robot's mic for STT/voice commands even when we're not publishing audio."""
         if self._paused or not self._connected() or time.time() - self._audio_req_ts < 15:
             return
         self._audio_req_ts = time.time()
         try:
-            self.rtm.raw(102001, {"open": 1, "type": 1})
+            await self._open_call_mode()
         except Exception:  # noqa: BLE001
             pass
 

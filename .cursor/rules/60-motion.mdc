@@ -1,0 +1,41 @@
+---
+description: How the robot physically moves — the motion model + nervous-system layers
+alwaysApply: true
+---
+
+# Motion system (hard-coded knowledge)
+
+Full reference: [docs/MOTION.md](mdc:docs/MOTION.md). The robot's movement is non-linear and sensor-poor;
+treat these as invariants.
+
+## The drivetrain
+
+- Joystick frame `{lx, ly, rx, ry}`: `ly` = forward/back, `rx` = **in-place yaw** (pivot), `lx`/`ry` unused.
+  The firmware mixes `ly`+`rx` to the two treads — never command wheels individually.
+
+## Measured reality (EBO Air 2) — why naive driving crashes
+
+- Forward deadband ~`0.25` (motion starts ~`0.30`); turn deadband ~`0.08` (starts ~`0.10`, violent by `0.30`).
+- The axes are MISMATCHED (forward needs a big push, turning needs a tiny one) so a single `speed` scalar
+  cannot serve both. Response is noisy -> open-loop is unreliable.
+- Air 2 has NO IMU and NO ToF in its cloud stream; VSLAM drifts and must not be trusted for the motion verdict.
+- The camera is the reliable motion signal (frame-diff + phase-correlation): see
+  [autobot/brain/visual_motion.py](mdc:autobot/brain/visual_motion.py).
+
+## Source of truth + layers
+
+- Constants per variant live in [autobot/brain/motion_model.py](mdc:autobot/brain/motion_model.py)
+  (`for_variant`, `guidance_text`). The calibration profile
+  ([autobot/brain/motion_profile.py](mdc:autobot/brain/motion_profile.py)) may refine them and seeds from the
+  model when uncalibrated.
+- Closed-loop motor control (the "cerebellum") is [autobot/brain/locomotion.py](mdc:autobot/brain/locomotion.py):
+  it converts intents (`turn_to`, `step`) into deadband-aware pulses + camera feedback.
+
+## Rules
+
+- The brain (every variant: cortex, vlm, omni) emits high-level INTENTS, never raw `ly/rx`. All driving goes
+  through `locomotion`, then `safety.check_drive` (the unchanged mechanical floor — see 30-safety.mdc).
+- Turn in small, re-checkable increments (`STEP_TURN_DEG`); cap any single AI turn (`MAX_TURN_DEG`). Only step
+  forward when the camera shows open floor; one short step at a time.
+- When you change motion behavior, update `motion_model.py` + `docs/MOTION.md` in the same change.
+- Don't reintroduce trust in VSLAM pose for "did I move" — use `visual_motion` frame-diff.

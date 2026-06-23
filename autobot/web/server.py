@@ -27,6 +27,7 @@ from ..brain.providers import catalog_for_ui, get_provider
 from ..config import SETTINGS
 from ..robot.frames import param_set_frame
 from ..robot.link import make_link
+from ..robot.overseer_gate import OverseerGate, ProposalStore
 from . import onboarding as _onboarding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +40,13 @@ app = FastAPI(title="FreeBo")
 LINK = make_link(SETTINGS.snapshot())
 MEMORY = Memory()
 IDENTITY = Identity(emit=lambda ev: emit(ev))
-brain = AgentBrain(SETTINGS, lambda ev: emit(ev), LINK, MEMORY, IDENTITY)
+# Overseer puppet mode: the brain talks to the robot through a gate that, when `settings.overseer` is on,
+# intercepts every robot-affecting call (records it as a proposal, returns a synthetic OK) so the dumb brain
+# is paralyzed while a human/agent overseer drives the real LINK directly via /api/overseer/*. When overseer
+# is off the gate is a transparent passthrough, so normal operation is unchanged. See overseer_gate.py.
+PROPOSALS = ProposalStore()
+BRAIN_LINK = OverseerGate(LINK, SETTINGS, PROPOSALS, lambda ev: emit(ev))
+brain = AgentBrain(SETTINGS, lambda ev: emit(ev), BRAIN_LINK, MEMORY, IDENTITY)
 ONBOARD = _onboarding.Onboarding(LINK, SETTINGS, IDENTITY, brain, lambda ev: emit(ev))
 
 # --- the live media fan-out: the camera feed is decoded once and shared with the UI preview, the VSLAM
@@ -260,6 +267,13 @@ async def api_state():
     return JSONResponse(_state_payload())
 
 
+@app.get("/api/metrics")
+async def api_metrics():
+    """Per-phase brain latency (count/p50/p95/p99/mean/max/last, in ms): perceive, provider, tool, reason,
+    vlm_perceive, caption, vlm_decide, omni, reflex_stop. See docs/MATURITY.md §2."""
+    return JSONResponse(brain.metrics.snapshot())
+
+
 @app.get("/api/telemetry")
 async def api_telemetry():
     """Live robot telemetry (battery/connected/awake/video+audio frame counts/eyes/sensors). The UI gets this
@@ -371,6 +385,154 @@ async def api_sleep(req: Request):
     on = bool(body.get("on", True))
     await _set_dark(on)
     return JSONResponse({"ok": True, "asleep": on})
+
+
+# ------------- overseer puppet mode (the receiver) -------------
+# In overseer mode the AI brain is paralyzed (its robot-affecting calls are intercepted by OverseerGate and
+# recorded as "proposals"), and a human/agent overseer drives the real robot through these endpoints. See
+# autobot/robot/overseer_gate.py + the plan. Toggle the mode itself via POST /api/settings {"overseer": true}.
+@app.get("/api/overseer/state")
+async def api_overseer_state(since: int = 0):
+    """Everything the overseer needs to puppet the robot: live telemetry, a snapshot URL, the brain's status +
+    recent reasoning, and the brain's intercepted intents (proposals) since the given cursor."""
+    import time as _t
+    s = SETTINGS.snapshot()
+    try:
+        tel = await LINK.telemetry()
+    except Exception as e:  # noqa: BLE001
+        tel = {"ok": False, "error": str(e)}
+    proposals, cursor = PROPOSALS.since(int(since or 0))
+    interesting = {"thought", "tool_call", "tool_result", "speech", "observation", "motion", "proposal"}
+    events = [e for e in _event_ring if e.get("type") in interesting][-50:]
+    return JSONResponse({
+        "ok": True,
+        "ts": _t.time(),
+        "overseer": s.overseer,
+        "autonomy": s.autonomy,
+        "asleep": s.asleep,
+        "max_speed": s.max_speed,
+        "max_move_duration": s.max_move_duration,
+        "snapshot_url": "/api/snapshot.jpg",
+        "telemetry": tel,
+        "brain": brain.status_dict(),
+        "proposals": [p.to_dict() for p in proposals],
+        "events": events,
+        "cursor": cursor,
+    })
+
+
+@app.post("/api/overseer/act")
+async def api_overseer_act(req: Request):
+    """Overseer drives the REAL robot directly, bypassing the paralyzed brain. Drive/move are clamped by the
+    safety floor (speed + duration caps) but NOT autonomy-gated (the overseer is the operator, like manual
+    control). Every executed command + its result is emitted as `overseer_act` so the loop is observable."""
+    import time as _t
+    body = await req.json()
+    kind = str(body.get("kind", "")).lower()
+    s = SETTINGS.snapshot()
+    if s.asleep and kind not in ("stop", "connection"):
+        return JSONResponse({"ok": False, "blocked": "asleep (wake first)"})
+    if kind == "stop":
+        res = await LINK.stop()
+    elif kind in ("drive", "move", "turn"):
+        d = brain.safety.check_drive(s, body.get("ly", 0.0), body.get("rx", 0.0),
+                                     body.get("duration", 0.6), source="overseer")
+        if not d.allowed:
+            return JSONResponse({"ok": False, "blocked": d.reason})
+        # 'drive' = single sustained frame (deadman stops it); 'move'/'turn' = timed burst then auto-stop.
+        res = await (LINK.drive(d.ly, d.rx) if kind == "drive" else LINK.move(d.ly, d.rx, d.duration))
+        res = {**res, "clamped": {"ly": d.ly, "rx": d.rx, "duration": d.duration}}
+    elif kind == "action":
+        res = await LINK.action(str(body.get("name", "")))
+    elif kind == "eyes":
+        res = await LINK.action(f"eyes_{str(body.get('animation', 'neutral')).lower()}")
+    elif kind == "connection":
+        res = await LINK.connection(str(body.get("state", "start")))
+    elif kind in ("raw", "move_mode", "move_speed"):
+        # Direct RTM pokes for calibration: set the robot's own movement gear (moveMode/moveSpeed) or send an
+        # arbitrary RTM id+data. Air 2 (native RTM) only; lets us fine-tune the firmware speed instead of just
+        # the command magnitude. RTM_MOVE_MODE=103011 carries both moveMode and moveSpeed in the settings.
+        rtm = getattr(LINK, "rtm", None)
+        raw = getattr(rtm, "raw", None)
+        if not callable(raw):
+            return JSONResponse({"ok": False, "error": "raw RTM not available on this link"})
+        if kind == "move_mode":
+            rid, data = 103011, {"moveMode": int(body.get("mode", 0))}
+        elif kind == "move_speed":
+            rid, data = 103011, {"moveSpeed": int(body.get("speed", 0))}
+        else:
+            rid, data = int(body.get("id", 0)), (body.get("data") or {})
+        ok = await asyncio.to_thread(raw, rid, data)
+        res = {"ok": bool(ok), "sent": {"id": rid, "data": data}}
+    elif kind == "say":
+        if not s.talk_enabled:
+            return JSONResponse({"ok": False, "blocked": "talk disabled (UI toggle off)"})
+        text = str(body.get("text", ""))
+        pub = getattr(LINK, "publish_speech", None)
+        if pub:
+            wav = await asyncio.to_thread(tts.render_wav, text)
+            res = await pub(wav) if wav else {"ok": False, "error": "tts unavailable"}
+        else:
+            g711 = tts.render_mulaw(text)
+            res = await LINK.say_audio(g711) if g711 else await LINK.say_text(text)
+    else:
+        return JSONResponse({"ok": False, "error": f"unknown kind '{kind}'"}, status_code=400)
+    await emit({"type": "overseer_act", "kind": kind,
+                "args": {k: v for k, v in body.items() if k != "kind"}, "result": res, "ts": _t.time()})
+    return JSONResponse(res)
+
+
+@app.post("/api/overseer/probe")
+async def api_overseer_probe(req: Request):
+    """Objective motion measurement for calibration. Grabs a before frame, runs ONE clamped move
+    (source=overseer), waits for it to settle, grabs an after frame, and returns motion metrics computed from
+    the camera (VSLAM is unreliable on this robot, so we measure pixels directly):
+      - diff:    mean abs pixel difference, normalized 0..1 (how much the whole scene changed)
+      - shift_x: horizontal image shift in pixels (phase correlation) — a pure in-place yaw shows up here
+      - est_yaw_deg: rough degrees from shift_x using an assumed horizontal FOV (relative, for consistency)
+      - shift_y: vertical shift (pitch/translation cue)
+    Body: {ly, rx, duration, settle_ms?, fov_h?}. Use ly=rx=0 to measure sensor noise only."""
+    import time as _t
+    body = await req.json()
+    s = SETTINGS.snapshot()
+    settle_ms = int(body.get("settle_ms", 1400))
+    fov_h = float(body.get("fov_h", 130.0))
+    before, _ = await LINK.snapshot()
+    d = brain.safety.check_drive(s, body.get("ly", 0.0), body.get("rx", 0.0),
+                                 body.get("duration", 0.4), source="overseer")
+    moved = {"ly": d.ly, "rx": d.rx, "duration": d.duration, "allowed": d.allowed}
+    if d.allowed and (d.ly or d.rx) and d.duration > 0:
+        await LINK.move(d.ly, d.rx, d.duration)
+    await asyncio.sleep(max(0.0, settle_ms / 1000.0))
+    after, _ = await LINK.snapshot()
+    from ..brain import visual_motion
+    metrics = visual_motion.measure(before, after, fov_h=fov_h)
+    await emit({"type": "overseer_probe", "moved": moved, "metrics": metrics, "ts": _t.time()})
+    return JSONResponse({"ok": metrics.get("ok", False), "moved": moved, "metrics": metrics})
+
+
+@app.post("/api/overseer/turn")
+async def api_overseer_turn(req: Request):
+    """Operator access to the cerebellum's CLOSED-LOOP pivot: turn a (capped) relative number of degrees in
+    small, camera-measured increments. Unlike raw /api/overseer/act drive, this overcomes the deadband and
+    measures the result — the fine control raw driving lacks (used for dock alignment)."""
+    from ..brain import locomotion
+    body = await req.json()
+    s = SETTINGS.snapshot()
+    res = await locomotion.turn(link=LINK, safety=brain.safety, settings=s, profile=brain.motion_profile,
+                                degrees=float(body.get("degrees", 0.0)), source="overseer", emit=emit)
+    return JSONResponse(res)
+
+
+@app.post("/api/overseer/step")
+async def api_overseer_step(req: Request):
+    """Operator access to the cerebellum's confirmed forward STEP (deadband-safe, camera-verified)."""
+    from ..brain import locomotion
+    body = await req.json()
+    s = SETTINGS.snapshot()
+    res = await locomotion.step(link=LINK, safety=brain.safety, settings=s, profile=brain.motion_profile,
+                                strength=float(body.get("strength", 1.0)), source="overseer", emit=emit)
+    return JSONResponse(res)
 
 
 @app.get("/api/calibrate")

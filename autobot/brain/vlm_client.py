@@ -16,23 +16,41 @@ def vlm_base_url() -> str:
     return os.environ.get("AUTOBOT_VLM_URL", "http://127.0.0.1:8360").rstrip("/")
 
 
-def hybrid_enabled() -> bool:
+def _provider(s=None) -> str:
+    """The configured provider key — from Settings when given (UI-authoritative at runtime), else env."""
+    if s is not None:
+        return (getattr(s, "ai_provider", "") or "").strip().lower()
+    return os.environ.get("AUTOBOT_AI_PROVIDER", "").strip().lower()
+
+
+def brain_mode(s=None) -> str:
+    """Resolve the brain architecture: 'single' | 'hybrid' | 'vlm' | 'omni'. Mirrors Settings.brain_mode but
+    also works with no Settings (env fallback) for legacy callers. See docs/MATURITY.md §1."""
+    prov = _provider(s)
+    if prov == "hybrid":
+        return "hybrid"
+    if prov == "vlm" or (os.environ.get("AUTOBOT_VLM_URL") and prov != "omni"):
+        return "vlm"
+    if prov == "omni" or os.environ.get("AUTOBOT_OMNI_URL"):
+        return "omni"
+    return "single"
+
+
+def hybrid_enabled(s=None) -> bool:
     """Reflex+cortex brain: the VLM is the SENSES (it perceives the scene) and a separate tool-calling LLM
     (the cortex) does the thinking/acting. Activated with AUTOBOT_AI_PROVIDER=hybrid. See docs/AI_BRAIN.md."""
-    return os.environ.get("AUTOBOT_AI_PROVIDER", "") == "hybrid"
+    return brain_mode(s) == "hybrid"
 
 
-def vlm_perception_enabled() -> bool:
+def vlm_perception_enabled(s=None) -> bool:
     """True when the VLM should run purely as a perception/caption tier feeding the cortex (hybrid mode)."""
-    return hybrid_enabled() and bool(vlm_base_url())
+    return hybrid_enabled(s) and bool(vlm_base_url())
 
 
-def vlm_enabled() -> bool:
+def vlm_enabled(s=None) -> bool:
     """True when the VLM is the WHOLE brain (it both sees and decides the move). Disabled in hybrid mode,
     where the VLM only perceives and the tool-calling cortex decides."""
-    if hybrid_enabled():
-        return False
-    return bool(os.environ.get("AUTOBOT_VLM_URL")) or os.environ.get("AUTOBOT_AI_PROVIDER", "") == "vlm"
+    return brain_mode(s) == "vlm"
 
 
 class VlmError(RuntimeError):
@@ -43,6 +61,16 @@ class VlmClient:
     def __init__(self, base_url: Optional[str] = None, timeout: float = 30.0) -> None:
         self.base_url = (base_url or vlm_base_url()).rstrip("/")
         self.timeout = timeout
+
+    async def healthy(self) -> bool:
+        """Is the VLM 'eyes' service reachable + ready? Used by the hybrid fail-soft fallback (when it's down
+        the cortex sees the camera directly). Never raises — returns False on any error."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(self.base_url + "/health")
+                return bool(r.json().get("ok"))
+        except Exception:  # noqa: BLE001
+            return False
 
     async def decide(self, *, frames_b64: Optional[list[str]] = None, mode: str = "explore",
                      heard: str = "", language: str = "en", describe: bool = False,

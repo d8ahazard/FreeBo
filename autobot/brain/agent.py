@@ -25,16 +25,19 @@ from typing import Awaitable, Callable
 
 from ..config import Settings
 from ..robot.link import RobotLink
-from . import commands
+from . import commands, locomotion, motion_model, reflex_vision, visual_motion
 from .behavior import BehaviorController
+from .reflex_vision import LoomingDetector
 from .curiosity import Curiosity
 from .identity import Identity
 from .memory import Memory
+from .metrics import Metrics
 from .motion_check import MotionConfirmer
 from .omni_client import OmniClient, OmniError, omni_enabled
 from .perception import Observation, perceive
 from .tasks import TaskStore
-from .vlm_client import VlmClient, VlmError, vlm_enabled, vlm_perception_enabled
+from .vlm_client import (VlmClient, VlmError, brain_mode, hybrid_enabled, vlm_enabled,
+                         vlm_perception_enabled)
 from .providers import OpenAICompatibleClient, ProviderError
 from .safety import SafetyFloor
 from .skills import SkillContext, SkillRegistry, build_default_skills
@@ -139,8 +142,17 @@ class AgentBrain:
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
+        self._looming = LoomingDetector()  # camera looming reflex (substitute for ToF on sensorless robots)
+        self._loom_frame_ts = 0.0
+        self._proprio_jpeg: bytes | None = None   # last frame, for the camera-based "am I moving" proprioception
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_spoken = ""       # last line we said aloud (for the SPEAK_UP "say that again" command)
+        # Per-phase latency metrics (perceive/provider/tool/reason/...). See docs/MATURITY.md §2.
+        self.metrics = Metrics()
+        # Hybrid 'eyes' (VLM service) health: None=unknown, True=reachable, False=down (cortex falls back to
+        # seeing the camera directly). Tracked from perceive outcomes + an explicit cold-start probe.
+        self._vlm_ok: bool | None = None
+        self._vlm_warned = False
 
     # --- hybrid vision ---
     def _hybrid(self, s: Settings) -> bool:
@@ -156,23 +168,58 @@ class AgentBrain:
             {"type": "image_url", "image_url": {"url": url}},
         ]}]
         try:
-            res = await vp.chat(msg, temperature=0.2)
+            with self.metrics.timer("caption"):
+                res = await vp.chat(msg, temperature=0.2)
             return (res.content or "").strip()
         except ProviderError as e:
             return f"(vision unavailable: {e})"
 
     async def _vlm_perceive(self, obs: Observation, s: Settings) -> str:
         """Hybrid brain: ask the VLM service (the robot's eyes) for a concise scene description that the
-        tool-calling cortex reads. The VLM never decides a move here. Fail-soft -> empty string."""
+        tool-calling cortex reads. The VLM never decides a move here. Fail-soft -> empty string. Tracks the
+        service's health so the cortex can fall back to seeing the camera directly when it's down."""
         if not obs.jpeg:
             return ""
         client = VlmClient()
         frames = [base64.b64encode(obs.jpeg).decode()]
         try:
-            res = await client.perceive(frames_b64=frames, robot_name=s.robot_name, persona=s.persona)
+            with self.metrics.timer("vlm_perceive"):
+                res = await client.perceive(frames_b64=frames, robot_name=s.robot_name, persona=s.persona)
+            await self._record_vlm_health(True)
             return (res.get("text") or "").strip()
         except VlmError:
+            await self._record_vlm_health(False)
             return ""
+
+    # --- hybrid 'eyes' health + fail-soft fallback (docs/MATURITY.md §1) ---
+    async def _record_vlm_health(self, ok: bool) -> None:
+        """Update the cached VLM-eyes health and announce transitions once (so the log doesn't spam)."""
+        prev = self._vlm_ok
+        self._vlm_ok = ok
+        if ok and prev is False:
+            self._vlm_warned = False
+            await self.emit({"type": "thought",
+                             "text": "(eyes: VLM service back online — hybrid perception restored)",
+                             "ts": time.time()})
+        elif (not ok) and not self._vlm_warned:
+            self._vlm_warned = True
+            await self.emit({"type": "thought",
+                             "text": "(eyes: VLM service unreachable — cortex is using the camera directly)",
+                             "ts": time.time()})
+
+    async def _vlm_health(self, s: Settings) -> bool:
+        """Explicit /health probe of the hybrid VLM eyes (used at cold start). False when not in hybrid."""
+        if not hybrid_enabled(s):
+            return False
+        ok = await VlmClient().healthy()
+        await self._record_vlm_health(ok)
+        return ok
+
+    def _vlm_perception_active(self, s: Settings) -> bool:
+        """Hybrid eyes are the perception tier AND reachable. When the service is down (_vlm_ok is False) we
+        fall back to single-model perception so the cortex isn't blind. Unknown (None) is treated as active;
+        a cold-start probe / the next perceive corrects it."""
+        return vlm_perception_enabled(s) and self._vlm_ok is not False
 
     # --- event posting / external inputs ---
     def _post(self, kind: str, data: dict | None = None) -> None:
@@ -278,7 +325,7 @@ class AgentBrain:
             return False, "setup not complete — finish the first-run wizard"
         # The modular vision brain (light VLM) or the omni brain replace the OpenAI-compatible LLM, so when
         # either is configured we don't need an ai_model/endpoint.
-        if vlm_enabled() or omni_enabled():
+        if vlm_enabled(s) or omni_enabled(s):
             return True, ""
         if not s.ai_model or not s.ai_base_url:
             return False, "no AI model/endpoint configured — pick a brain in setup"
@@ -302,6 +349,17 @@ class AgentBrain:
                     self.last_observation = obs
                     if obs.has_image:
                         self.buffer.frame_ts = obs.ts
+                        # Proprioception substitute: how much the view changed since the last frame -> a cheap
+                        # "am I moving?" cue (the Air 2 has no IMU/odometry). Advisory; surfaced in telemetry.
+                        if getattr(obs, "jpeg", None):
+                            prev = self._proprio_jpeg
+                            self._proprio_jpeg = obs.jpeg
+                            if prev is not None:
+                                diff = visual_motion.frame_diff(prev, obs.jpeg)
+                                if diff is not None:
+                                    m = motion_model.for_variant(getattr(s, "robot_variant", "AIR2"))
+                                    obs.telemetry["self_motion"] = round(diff, 4)
+                                    obs.telemetry["moving"] = bool(diff >= m.move_diff)
                     t = obs.telemetry
                     state = (bool(t.get("connected")), bool(t.get("awake", True)),
                              bool(t.get("resting")), int(t.get("charge", 0) or 0))
@@ -329,13 +387,16 @@ class AgentBrain:
                 obs = self.buffer.obs
                 fresh = (not s.asleep and obs is not None and obs.has_image and s.allow_video
                          and self.buffer.frame_ts > self.buffer.caption_ts)
-                if vlm_perception_enabled():
+                if hybrid_enabled(s):
                     # Hybrid brain: the VLM is the eyes — perceive the scene for the cortex to reason over.
+                    # If the eyes service is unknown/down, probe it so the cortex's fallback decision is fresh.
+                    if self._vlm_ok is None:
+                        await self._vlm_health(s)
                     if fresh:
                         cap = await self._vlm_perceive(obs, s)
                         if cap:
                             await self._set_caption(cap)
-                elif vlm_enabled() or omni_enabled():
+                elif vlm_enabled(s) or omni_enabled(s):
                     pass  # the vision brain sees the frame itself each cycle — no separate caption model
                 elif self._hybrid(s) and fresh:
                     cap = await self._caption(obs, s)
@@ -386,18 +447,31 @@ class AgentBrain:
         while self._running:
             try:
                 s = self.settings.snapshot()
-                if REFLEX_STOP_CM > 0 and s.allow_motion and not s.asleep:
+                if s.allow_motion and not s.asleep:
                     t = self.buffer.telemetry or {}
+                    resting = bool(t.get("resting"))
                     tof = t.get("tof", t.get("distance"))
-                    close = isinstance(tof, (int, float)) and 0 <= tof < REFLEX_STOP_CM and not t.get("resting")
+                    have_tof = isinstance(tof, (int, float)) and tof >= 0
+                    close = have_tof and REFLEX_STOP_CM > 0 and 0 <= tof < REFLEX_STOP_CM and not resting
+                    reason = f"obstacle {int(tof)}cm ahead" if close else ""
+                    # Camera looming reflex: only when there's no real ToF (e.g. Air 2). Diverging optical flow
+                    # in the center = approaching something head-on; ignores turns (no divergence on a pivot).
+                    if not have_tof and reflex_vision.LOOM_THRESHOLD > 0 and not resting:
+                        obs = self.buffer.obs
+                        if obs is not None and getattr(obs, "jpeg", None) and self.buffer.frame_ts > self._loom_frame_ts:
+                            self._loom_frame_ts = self.buffer.frame_ts
+                            score = self._looming.update(obs.jpeg)
+                            if score >= reflex_vision.LOOM_THRESHOLD:
+                                close = True
+                                reason = "something looming close ahead"
                     if close and not self._reflex_active:
                         self._reflex_active = True
                         self._reflex_blocked = True   # next cortex decision should turn, not drive forward
-                        await self._safe_stop()
+                        with self.metrics.timer("reflex_stop"):
+                            await self._safe_stop()
                         await self._express("surprised")
                         await self.emit({"type": "thought",
-                                         "text": f"(reflex: obstacle {int(tof)}cm ahead — stopping)",
-                                         "ts": time.time()})
+                                         "text": f"(reflex: {reason} — stopping)", "ts": time.time()})
                     elif not close:
                         self._reflex_active = False
             except Exception:  # noqa: BLE001
@@ -496,6 +570,7 @@ class AgentBrain:
             sections.append(cur)
         sections.append(self._mode_prompt(s))
         sections.append(self.behavior.prompt_block(name))
+        sections.append(motion_model.guidance_text(s.robot_variant))
         sections.append(
             "HOW YOU ACT:\n"
             "- You run in real time: you may be triggered by a fresh look, by something you hear, or by a "
@@ -515,9 +590,10 @@ class AgentBrain:
             "`drive`, etc. Do NOT just write what you would do as text; the body only responds to real calls.\n"
             f"- Talk is {talk}\n"
             "- If you have no camera frame, don't drive — `wait` and look instead.\n"
-            "- SENSE YOUR BODY: you have a 6-axis IMU and an infrared distance sensor. If your status says you "
-            "were JUST TOUCHED/BUMPED, react like a pet would — show surprise, turn to look at who did it, and "
-            "greet/respond. If an obstacle is very close ahead, turn instead of pushing forward.\n"
+            "- A low-level motor controller turns your drive intents into safe, confirmed moves — give SIMPLE "
+            "intents (a direction) and re-check your eyes after each; don't micro-manage speed. If your status "
+            "says you were JUST TOUCHED/BUMPED, react like a pet would — show surprise, turn to look at who "
+            "did it, and greet/respond.\n"
             "- BUILD UNDERSTANDING: use `save_place` to map distinct spots and `remember` notable things (and "
             "WHERE you saw them) so you can find them and describe the space later.\n"
             "- POWER: if your status shows you are charging/docked/resting, do NOT try to drive — stay put, "
@@ -531,6 +607,22 @@ class AgentBrain:
     # Motion tools that physically move the robot across the floor (excluded from the toolset when motion is
     # off / resting, so the model can't keep trying to drive and failing).
     _MOTION_TOOLS = {"drive", "dock", "undock"}
+
+    # Battery at/above this while charging/docked => the robot is free to leave the dock and roam. A fully
+    # charged robot shouldn't be pinned in place by a charging/resting flag (the Air 2 also keeps reporting
+    # charge=1 briefly after it rolls off the contacts). See _resting().
+    LEAVE_DOCK_BATTERY = 90
+
+    def _resting(self, telemetry: dict) -> bool:
+        """Whether the robot should be treated as 'parked, don't drive'. True when charging/docked UNLESS the
+        battery is topped up (>LEAVE_DOCK_BATTERY%), in which case it's allowed to head out."""
+        charging = bool(telemetry.get("resting")) or (telemetry.get("charge") == 1)
+        if not charging:
+            return False
+        batt = telemetry.get("battery", -1)
+        if isinstance(batt, (int, float)) and batt > self.LEAVE_DOCK_BATTERY:
+            return False
+        return True
 
     def _motion_allowed(self, s: Settings, resting: bool) -> bool:
         return bool(s.allow_motion) and s.autonomy in ("assist", "auto") and not resting
@@ -607,7 +699,7 @@ class AgentBrain:
 
     def _stuck_forward(self, action: str) -> bool:
         r = self._motion_reaction
-        return (r is not None and getattr(r, "state", "") == "stuck"
+        return (r is not None and getattr(r, "state", "") in ("stuck", "blocked")
                 and action in ("forward", "back", "backward"))
 
     # --- robustness: small local models (e.g. qwen2.5:7b via Ollama) often write tool calls as prose
@@ -823,7 +915,7 @@ class AgentBrain:
             return "surprised"
         if kind == "speech":
             return "happy"
-        if obs is not None and obs.telemetry.get("resting"):
+        if obs is not None and self._resting(obs.telemetry):
             return "sleepy"
         if "person" in cap or "someone" in cap or "people" in cap:
             return "curious"
@@ -844,21 +936,30 @@ class AgentBrain:
         return await self._reason("manual", s)
 
     async def _reason(self, trigger: str, s: Settings) -> dict:
+        """Time one full reason cycle (incl. lock wait) and delegate to the real loop. See docs/MATURITY.md §2."""
+        t0 = time.perf_counter()
+        try:
+            return await self._reason_inner(trigger, s)
+        finally:
+            self.metrics.record("reason", (time.perf_counter() - t0) * 1000.0)
+
+    async def _reason_inner(self, trigger: str, s: Settings) -> dict:
         async with self._reason_lock:
             self.safety.begin_tick()
             self.ctx.flags.clear()
             self.last_tick_ts = time.time()
 
-            obs = self.buffer.obs or await perceive(self.link, want_image=s.allow_video)
-            self.last_observation = obs
-            self._apply_pose(obs)
-            await self.registry.on_observe(obs)
-            await self._confirm_motion(s, obs)
+            with self.metrics.timer("perceive"):
+                obs = self.buffer.obs or await perceive(self.link, want_image=s.allow_video)
+                self.last_observation = obs
+                self._apply_pose(obs)
+                await self.registry.on_observe(obs)
+                await self._confirm_motion(s, obs)
             eye_anims = obs.telemetry.get("eye_animations", [])
             await self.emit({"type": "observation", "summary": obs.text_summary(),
                              "telemetry": obs.telemetry, "ts": obs.ts})
 
-            resting = bool(obs.telemetry.get("resting")) or (obs.telemetry.get("charge") == 1)
+            resting = self._resting(obs.telemetry)
 
             # Decide the movement behavior for this cycle and hand the scope to the safety floor (hard gate).
             beh = self.behavior.decide(s, resting=resting, present_people=self.identity.present_people(),
@@ -885,7 +986,7 @@ class AgentBrain:
 
             # The modular vision brain: a light VLM sees the frame + decides a move; hearing (Whisper) and
             # speech (Piper) are handled here in the app. No monolithic model, no tool-calling LLM.
-            if vlm_enabled():
+            if vlm_enabled(s):
                 try:
                     res = await self._reason_vlm(trigger, s, obs, resting)
                     self.last_error = None
@@ -898,7 +999,7 @@ class AgentBrain:
 
             # The omni brain (MiniCPM-o) path: it sees the frame, (optionally) hears, decides a move, and
             # speaks — all in one model call. No tool-calling LLM.
-            if omni_enabled():
+            if omni_enabled(s):
                 try:
                     res = await self._reason_omni(trigger, s, obs, resting)
                     self.last_error = None
@@ -908,6 +1009,11 @@ class AgentBrain:
                     await self._set_status("error", f"omni: {e}")
                     await self._safe_stop()
                     return {"ok": False, "error": str(e)}
+
+            # Hybrid cortex path: make sure we know whether the VLM 'eyes' are up before deciding whether the
+            # cortex reads a caption (text-only) or falls back to the camera frame directly.
+            if hybrid_enabled(s) and self._vlm_ok is None:
+                await self._vlm_health(s)
 
             provider = OpenAICompatibleClient(s.ai_base_url, s.ai_api_key, s.ai_model)
             tools = self.registry.schemas(eye_anims, exclude=self._tool_exclusions(s, resting))
@@ -919,7 +1025,8 @@ class AgentBrain:
             actions: list[dict] = []
             try:
                 for _round in range(MAX_TOOL_ROUNDS):
-                    result = await provider.chat(messages, tools=tools)
+                    with self.metrics.timer("provider"):
+                        result = await provider.chat(messages, tools=tools)
                     # Recover tool calls from prose if the model didn't emit structured ones (small local
                     # models often do), and speak a plain-chat reply when answering speech.
                     tool_calls = result.tool_calls
@@ -954,7 +1061,8 @@ class AgentBrain:
                         cid = tc["id"] or f"call_{i}"
                         await self.emit({"type": "tool_call", "name": tc["name"],
                                          "args": tc["arguments"], "ts": time.time()})
-                        res = await self.registry.execute(tc["name"], tc["arguments"])
+                        with self.metrics.timer("tool"):
+                            res = await self.registry.execute(tc["name"], tc["arguments"])
                         if tc["name"] == "say" and isinstance(res, dict) and res.get("ok"):
                             self._last_spoken = str(tc["arguments"].get("text", "")) or self._last_spoken
                         actions.append({"name": tc["name"], "args": tc["arguments"], "result": res})
@@ -999,9 +1107,10 @@ class AgentBrain:
         # Describe the scene on every other autonomous cycle (was every 4th) so the robot visibly reasons
         # about what it sees, not just silently drives.
         describe = bool(heard) or trigger in ("speech", "manual", "touch") or (self._vlm_cycle % 2 == 0)
-        decision = await client.decide(frames_b64=frames, mode=getattr(s, "mode", "explore"),
-                                       heard=heard, describe=describe, persona=s.persona,
-                                       robot_name=s.robot_name, directive=s.directive)
+        with self.metrics.timer("vlm_decide"):
+            decision = await client.decide(frames_b64=frames, mode=getattr(s, "mode", "explore"),
+                                           heard=heard, describe=describe, persona=s.persona,
+                                           robot_name=s.robot_name, directive=s.directive)
         spoken = (decision.get("text") or "").strip()
         action = (decision.get("action") or "none").lower()
         eyes = (decision.get("eyes") or "").lower()
@@ -1033,32 +1142,36 @@ class AgentBrain:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Closed-loop reaction: if the last move got us nowhere, don't push the same way again — turn instead.
-        if self._stuck_forward(action):
+        # Closed-loop reaction: if the last move got us nowhere (stuck/blocked) OR a reflex just stopped us for
+        # something close ahead, don't push forward again — turn to find a clear path instead.
+        if self._stuck_forward(action) or (self._reflex_blocked and action in ("forward", "back", "backward")):
+            self._reflex_blocked = False
             action = "right" if (self._vlm_cycle % 2 == 0) else "left"
             self._motion_reaction = None
-            await self.emit({"type": "thought", "text": "(was stuck — turning to find a clear path)",
+            await self.emit({"type": "thought", "text": "(blocked ahead — turning to find a clear path)",
                              "ts": time.time()})
 
         vec = self._calib_drive(action)
         if vec and self._motion_allowed(s, resting):
-            ly, rx, dur = vec
-            d = self.safety.check_drive(s, ly, rx, dur, source="ai")
-            if d.allowed:
-                await self._set_status("acting")
-                await self.emit({"type": "tool_call", "name": "drive",
-                                 "args": {"action": action, "ly": d.ly, "rx": d.rx}, "ts": time.time()})
-                res = await self.link.move(d.ly, d.rx, d.duration)
-                self.motion.record(obs.jpeg, d.ly, d.rx)
-                self.curiosity.note_action(action)
-                actions.append({"name": "drive", "args": {"action": action}, "result": res})
-                await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
+            ly, rx, _dur = vec
+            await self._set_status("acting")
+            await self.emit({"type": "tool_call", "name": "drive",
+                             "args": {"action": action}, "ts": time.time()})
+            # Closed-loop cerebellum owns the magnitudes/durations + camera-confirms the move.
+            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
+                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
+            self.motion.record(obs.jpeg, ly, rx)
+            self.curiosity.note_action(action)
+            actions.append({"name": "drive", "args": {"action": action}, "result": res})
+            await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
         elif action == "stop":
             await self._safe_stop()
 
-        # Speak via Piper (the app's TTS). Robot-speaker playback needs native RTC audio publish; until then we
-        # emit the synthesized WAV so the UI plays FreeBo's voice, and hand text to links that speak directly.
-        if spoken and s.talk_enabled:
+        # Speak ONLY when there's something to say to a person — i.e. a real interaction (someone spoke to us,
+        # a manual chat/tick, or a touch), never narrating observations on autonomous roam cycles. Routed
+        # through the safety floor so the talk toggle + QUIET window are respected.
+        intentional = bool(heard) or trigger in ("speech", "manual", "touch")
+        if spoken and intentional and self.safety.check_say(s).allowed:
             await self._speak(spoken)
 
         return {"ok": True, "actions": actions, "vlm": True, "spoken": spoken, "action": action}
@@ -1105,8 +1218,9 @@ class AgentBrain:
             bits.append(heard)
         if obs.telemetry.get("touched"):
             bits.append("You were just touched/bumped — react with surprise and turn to look.")
-        if resting_note := ("You are charging/docked right now — do NOT drive." if obs.telemetry.get("resting") else ""):
+        if resting_note := ("You are charging/docked right now — do NOT drive." if self._resting(obs.telemetry) else ""):
             bits.append(resting_note)
+        bits.append(motion_model.guidance_text(s.robot_variant))
         bits.append(
             "Reply with ONE short, natural spoken sentence (it will be spoken aloud). Then on a NEW final "
             "line output exactly this control tag and nothing else:\n"
@@ -1134,7 +1248,8 @@ class AgentBrain:
         frames = [base64.b64encode(obs.jpeg).decode()] if obs.jpeg else []
         instruction = self._omni_instruction(s, obs)
         await self._set_status("thinking")
-        reply = await client.respond(frames_b64=frames, instruction=instruction)
+        with self.metrics.timer("omni"):
+            reply = await client.respond(frames_b64=frames, instruction=instruction)
         text = (reply.get("text") or "").strip()
         spoken, action, eyes = self._parse_omni(text)
         actions: list[dict] = []
@@ -1161,22 +1276,22 @@ class AgentBrain:
         # movement (gated by mode/toggles/resting exactly like the tool path)
         vec = self._calib_drive(action)
         if vec and self._motion_allowed(s, resting):
-            ly, rx, dur = vec
-            d = self.safety.check_drive(s, ly, rx, dur, source="ai")
-            if d.allowed:
-                await self._set_status("acting")
-                await self.emit({"type": "tool_call", "name": "drive",
-                                 "args": {"action": action, "ly": d.ly, "rx": d.rx}, "ts": time.time()})
-                res = await self.link.move(d.ly, d.rx, d.duration)
-                self.motion.record(obs.jpeg, d.ly, d.rx)
-                actions.append({"name": "drive", "args": {"action": action}, "result": res})
-                await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
+            ly, rx, _dur = vec
+            await self._set_status("acting")
+            await self.emit({"type": "tool_call", "name": "drive",
+                             "args": {"action": action}, "ts": time.time()})
+            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
+                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
+            self.motion.record(obs.jpeg, ly, rx)
+            actions.append({"name": "drive", "args": {"action": action}, "result": res})
+            await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
         elif action == "stop":
             await self._safe_stop()
 
-        # native speech: MiniCPM-o generated the voice audio itself. Emit it so the UI plays FreeBo's real
-        # voice. (Playing it on the ROBOT'S speaker needs native Agora RTC audio publish — the next step.)
-        if spoken and s.talk_enabled and reply.get("speech_b64"):
+        # native speech: MiniCPM-o generated the voice audio itself. Only play it on a real interaction (heard
+        # /manual/touch), not as narration every roam cycle.
+        intentional = bool(self._heard_line(s)) or trigger in ("speech", "manual", "touch")
+        if spoken and intentional and s.talk_enabled and reply.get("speech_b64"):
             await self.emit({"type": "speech", "text": spoken, "b64": reply["speech_b64"],
                              "sr": reply.get("sr", 24000), "ts": time.time()})
 
@@ -1204,9 +1319,10 @@ class AgentBrain:
         bits.append("Decide your next action. Think briefly, then call tools.")
         text = (prefix + " " if prefix else "") + "\n\n".join(bits)
         content: list[dict] = [{"type": "text", "text": text}]
-        # Text-only to the cortex when the VLM is the eyes (hybrid perception), in classic hybrid caption mode,
-        # or when video is off; otherwise attach the image for a vision-capable decision model.
-        text_only = vlm_perception_enabled() or self._hybrid(s) or not s.allow_video
+        # Text-only to the cortex when the VLM is the eyes (hybrid perception, and reachable), in classic
+        # hybrid caption mode, or when video is off; otherwise attach the image for a vision-capable decision
+        # model. When hybrid eyes are DOWN, _vlm_perception_active is False so we attach the frame (fallback).
+        text_only = self._vlm_perception_active(s) or self._hybrid(s) or not s.allow_video
         url = None if text_only else obs.image_data_url()
         if url:
             content.append({"type": "image_url", "image_url": {"url": url}})
@@ -1311,6 +1427,7 @@ class AgentBrain:
         self.behavior.clear_voice_intent()   # free to move again
 
     def status_dict(self) -> dict:
+        s = self.settings.snapshot()
         return {
             "status": self.status,
             "error": self.last_error,
@@ -1322,4 +1439,8 @@ class AgentBrain:
             "behavior": self.behavior.state(),
             "curiosity": self.curiosity.state(),
             "skills": [sk.name for sk in self.registry.active_skills()],
+            # Brain architecture + hybrid 'eyes' health (docs/MATURITY.md §1) and a compact latency view (§2).
+            "brain_mode": brain_mode(s),
+            "vlm_ok": self._vlm_ok,
+            "metrics": self.metrics.summary(),
         }

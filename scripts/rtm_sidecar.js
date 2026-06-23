@@ -259,15 +259,17 @@ async function handle(c) {
       // frame barely twitches — we SUSTAIN by resending the frame ~every 200ms until duration, then stop.
       const ly = -Math.round((c.ly || 0) * 100), rx = Math.round((c.rx || 0) * 100);
       clearDrive();
-      const frame = { lx: 0, ly, rx, ry: 0, buttons: 0 };
+      // buttons:1 on EVERY frame (incl. the zero/stop frame) — confirmed by sniffing the EBO Home app: it is
+      // the "controller actively engaged" flag and the robot ignores joystick frames sent with buttons:0.
+      const frame = { lx: 0, ly, rx, ry: 0, buttons: 1 };
       await sendRtm(RTM_DRIVE, frame);
       // Match the EBO app: it streams drive at ~10 Hz (every 100ms) while moving. 5 Hz was marginal.
       driveRepeat = setInterval(() => sendRtm(RTM_DRIVE, frame), 100);
       const dur = c.duration > 0 ? c.duration : 1.0; // never run forever without an explicit stop
-      driveStopTimer = setTimeout(() => { clearDrive(); sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 0 }); }, dur * 1000);
+      driveStopTimer = setTimeout(() => { clearDrive(); sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }); }, dur * 1000);
       return;
     }
-    case "stop": { clearDrive(); return sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 0 }); }
+    case "stop": { clearDrive(); return sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }); }
     case "eyes": return sendRtm(RTM_EMOTE, { voiceIds: [], cycleMode: 0, emojiIds: [EYE_IDS[c.state] ?? 0], moveIds: [] });
     case "dock": return sendRtm(RTM_DOCK, null);
     case "avoid": return sendRtm(RTM_AVOID, { avoidobstacle: c.on !== false });

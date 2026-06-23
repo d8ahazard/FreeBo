@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from .. import tts
+from .. import locomotion, tts
 from .base import Skill, SkillContext, ToolDef, fn_schema
 
 # Unit drive vectors. ly>0 forward; rx>0 turns right, rx<0 turns left (matches motor_frame).
@@ -29,15 +29,13 @@ class CoreSkill(Skill):
     def tools(self, ctx: SkillContext) -> list[ToolDef]:
         eyes_enum = sorted(set(ctx.eye_animations) | {"on", "off"})
         return [
-            ToolDef(fn_schema("drive", "Drive the robot, then auto-stop. Only drive when your current behavior allows roaming (see the RIGHT NOW line). You have NO bumper — steer toward open paths and re-check the camera; a reflex stops you if something's too close.", {
+            ToolDef(fn_schema("drive", "Move the robot ONE controlled increment in a direction, then auto-stop. A low-level motor controller picks the exact speed, turns IN SMALL increments, and confirms the move with the camera — so just give a direction and re-check your eyes after. Turning ('left'/'right') pivots in place; 'forward' takes one short step (only when the floor ahead is clearly open). You have NO bumper/distance sensor.", {
                 "type": "object",
                 "properties": {
                     "direction": {"type": "string", "enum": sorted(DIRECTIONS.keys()),
-                                  "description": "Movement direction. Omit if giving ly/rx."},
-                    "ly": {"type": "number", "description": "Forward/back -1..1 (overrides direction)."},
-                    "rx": {"type": "number", "description": "Turn left(-)/right(+) -1..1 (overrides direction)."},
-                    "speed": {"type": "number", "description": "0..1; clamped to the user's max speed.", "default": 0.8},
-                    "duration": {"type": "number", "description": "Seconds to drive (capped). ~1.2-2s for forward exploration, ~0.4-0.8s for turns.", "default": 1.2},
+                                  "description": "Which way to move. 'left'/'right' pivot in place; 'forward' is one short step."},
+                    "ly": {"type": "number", "description": "Optional raw forward/back intent -1..1 (sign only; the controller sets the speed)."},
+                    "rx": {"type": "number", "description": "Optional raw turn intent -1..1 (sign only; the controller sets the speed)."},
                 },
             }), self._drive, authority="owner"),
             ToolDef(fn_schema("stop", "Stop all movement immediately.", {"type": "object", "properties": {}}),
@@ -78,28 +76,22 @@ class CoreSkill(Skill):
     async def _drive(self, a: dict) -> dict:
         ctx = self._c()
         s = ctx.settings.snapshot()
-        # Defaults come from the calibration profile when present, so autonomous bursts are controlled steps
-        # sized to THIS robot/scene instead of fixed long lunges.
         prof = getattr(ctx, "motion_profile", None)
-        def_speed = prof.forward_speed if prof else 0.8
-        def_dur = prof.forward_duration if prof else 1.2
-        speed = float(a.get("speed", def_speed))
-        duration = float(a.get("duration", def_dur))
+        # We only take the INTENT (direction). The cerebellum (locomotion) owns the actual speeds/durations —
+        # this robot's drivetrain has big deadbands + a touchy turn, so raw magnitudes are unreliable (see
+        # docs/MOTION.md). It re-clamps through the safety floor and confirms motion via the camera.
         if a.get("ly") is not None or a.get("rx") is not None:
             ly, rx = float(a.get("ly", 0.0)), float(a.get("rx", 0.0))
         else:
             dx = DIRECTIONS.get(str(a.get("direction", "")).lower())
             if dx is None:
                 return {"ok": False, "error": "need a valid direction or ly/rx"}
-            ly, rx = dx[0] * speed, dx[1] * speed
-        # Cap forward/back (translation-dominant) bursts to the calibrated safe step so it can't blindly lunge.
-        if prof and abs(ly) >= abs(rx):
-            duration = min(duration, prof.forward_duration)
-        d = ctx.safety.check_drive(s, ly, rx, duration, source="ai")
-        if not d.allowed:
-            return {"ok": False, "blocked": d.reason}
-        res = await ctx.link.move(d.ly, d.rx, d.duration)
-        return {"ok": res.get("ok", False), "drove": {"ly": d.ly, "rx": d.rx, "duration": d.duration}}
+            ly, rx = dx
+        res = await locomotion.drive(link=ctx.link, safety=ctx.safety, settings=s, profile=prof,
+                                     ly=ly, rx=rx, source="ai", emit=ctx.emit)
+        if res.get("blocked"):
+            return {"ok": False, "blocked": res["blocked"]}
+        return res
 
     async def _stop(self, a: dict) -> dict:
         res = await self._c().link.stop()

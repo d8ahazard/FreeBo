@@ -7,7 +7,12 @@ import os, sys, shutil, json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "tools")
-HOOK_SRC = os.path.join(HERE, "..", "..", "hooks", "agent.js")
+HOOKS_DIR = os.path.join(HERE, "..", "..", "hooks")
+HOOK_SRC = os.path.join(HOOKS_DIR, "agent.js")
+# Extra hook scripts concatenated into the same libhook.so (each is a self-contained IIFE). agora_rtm.js logs
+# the app's RTM control messages to logcat (AUTOBOT_RTM) for the drive/turn re-sniff; agora_rtc.js logs the
+# talkback publish path (AUTOBOT_RTC). Set AUTOBOT_HOOK_EXTRAS to override the comma-separated list.
+HOOK_EXTRAS = [h.strip() for h in os.environ.get("AUTOBOT_HOOK_EXTRAS", "agora_rtm.js").split(",") if h.strip()]
 PORT = "8400"
 
 GADGET = {
@@ -22,6 +27,14 @@ def main():
 
     hook = open(HOOK_SRC, "r", encoding="utf-8").read()
     hook = hook.replace("__AUTOBOT_HOST__", host).replace("__AUTOBOT_PORT__", PORT)
+    # Append the extra capture hooks (RTM control / RTC talkback) so one libhook.so does creds + sniffing.
+    for extra in HOOK_EXTRAS:
+        p = os.path.join(HOOKS_DIR, extra)
+        if os.path.isfile(p):
+            hook += "\n\n// ---- " + extra + " ----\n" + open(p, "r", encoding="utf-8").read()
+            print(f"appended hook: {extra}")
+        else:
+            print(f"WARNING: extra hook not found: {extra}")
     cfg = json.dumps(
         {"interaction": {"type": "script", "path": "libhook.so", "on_change": "reload"}}, indent=2
     ) + "\n"

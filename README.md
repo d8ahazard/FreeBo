@@ -93,6 +93,7 @@ Everything an agent (human or AI) needs to extend Autobot without re-asking is i
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the full system, data flow, and component contracts.
 - [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md) — the wire protocol and bridge REST API.
 - [docs/AI_BRAIN.md](docs/AI_BRAIN.md) — the agent loop, tool/action contract, and provider config.
+- [docs/MATURITY.md](docs/MATURITY.md) — the maturity roadmap: hybrid golden path, latency/benchmark harness, durable run-state, voice routing, memory, navigation.
 - [docs/SAFETY.md](docs/SAFETY.md) — the safety floor that sits under the AI.
 - [docs/COLLECTOR.md](docs/COLLECTOR.md) — credential collection (phone + PC paths).
 - [docs/REPRO.md](docs/REPRO.md) — reproduce FreeBo on another robot (what's in git vs releases, step by step).

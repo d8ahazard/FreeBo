@@ -16,8 +16,14 @@ def omni_base_url() -> str:
     return os.environ.get("AUTOBOT_OMNI_URL", "http://127.0.0.1:8350").rstrip("/")
 
 
-def omni_enabled() -> bool:
-    return bool(os.environ.get("AUTOBOT_OMNI_URL")) or os.environ.get("AUTOBOT_AI_PROVIDER", "") == "omni"
+def omni_enabled(s=None) -> bool:
+    """True when the omni model (MiniCPM-o) is the whole brain. Resolved from Settings.ai_provider when given
+    (UI-authoritative), else env; AUTOBOT_OMNI_URL stays a back-compat trigger. Skipped under hybrid/vlm."""
+    prov = (getattr(s, "ai_provider", "") if s is not None else os.environ.get("AUTOBOT_AI_PROVIDER", ""))
+    prov = (prov or "").strip().lower()
+    if prov == "omni":
+        return True
+    return bool(os.environ.get("AUTOBOT_OMNI_URL")) and prov not in ("hybrid", "vlm")
 
 
 class OmniError(RuntimeError):

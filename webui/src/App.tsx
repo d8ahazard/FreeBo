@@ -7,6 +7,7 @@ import ConfigPanel from "./components/ConfigPanel";
 import SetupWizard from "./components/SetupWizard";
 import ModeBar from "./components/ModeBar";
 import AbilityToggles from "./components/AbilityToggles";
+import OverseerPanel from "./components/OverseerPanel";
 import HudTelemetry from "./components/HudTelemetry";
 import SlamMap from "./components/SlamMap";
 import SelfTest from "./components/SelfTest";
@@ -19,7 +20,7 @@ import VoiceCommands from "./components/VoiceCommands";
 type Tab = "hud" | "memory" | "settings";
 
 export default function App() {
-  const { settings, telemetry, brain, tts, feed, identity, approvals, connected, save } = useAutobot();
+  const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, save } = useAutobot();
   const [tab, setTab] = useState<Tab>("hud");
   const [chat, setChat] = useState("");
   const [setupDone, setSetupDone] = useState(false);
@@ -111,6 +112,7 @@ export default function App() {
               <div className="flex flex-col gap-3">
                 <ModeBar settings={settings} save={save} />
                 <AbilityToggles settings={settings} save={save} />
+                <OverseerPanel settings={settings} save={save} log={overseerLog} />
                 <HudTelemetry t={telemetry} />
                 <SlamMap />
                 <CalibratePanel />

@@ -66,6 +66,26 @@ if len(dts) >= 2:
     for j in [x for x in rtm if x.get("id") == 101007][:6]:
         print("   drive data:", json.dumps(j.get("data"))[:100])
 
+# Drive (101007) per-axis value ranges — the numbers we calibrate the motion model to.
+drives = [j.get("data") for j in rtm if j.get("id") == 101007 and isinstance(j.get("data"), dict)]
+if drives:
+    print(f"\n=== drive(101007): per-axis ranges over {len(drives)} frames ===")
+    for ax in ("lx", "ly", "rx", "ry"):
+        vals = [d.get(ax) for d in drives if isinstance(d.get(ax), (int, float))]
+        nz = [v for v in vals if v]
+        if vals:
+            print(f"  {ax}: min={min(vals):<5} max={max(vals):<5} "
+                  f"abs_max={max(abs(v) for v in vals):<5} nonzero_frames={len(nz)}")
+    btns = sorted({d.get("buttons") for d in drives if "buttons" in d}, key=lambda x: (x is None, x))
+    print(f"  buttons seen: {btns}")
+    # Distinct nonzero motion vectors (dedup), most→least common, to read off discrete stick steps.
+    from collections import Counter
+    vecs = Counter((d.get("lx", 0), d.get("ly", 0), d.get("rx", 0), d.get("ry", 0))
+                   for d in drives if any(d.get(a) for a in ("lx", "ly", "rx", "ry")))
+    print("  top nonzero (lx,ly,rx,ry) vectors:")
+    for vec, c in vecs.most_common(12):
+        print(f"    {vec}  x{c}")
+
 # HTTP endpoints hit
 print("\n=== HTTP requests (unique URLs) ===")
 seen = set()

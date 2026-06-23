@@ -3,6 +3,11 @@
 The brain is the agent loop that turns a perception of the robot into actions, using any OpenAI-compatible
 vision model. It lives in `autobot/brain/`.
 
+> Movement is a layered "nervous system": the brain emits high-level INTENTS, a closed-loop motor controller
+> (the cerebellum, `autobot/brain/locomotion.py`) executes them against the camera, and a vision reflex +
+> safety floor protect it. The physical motion model (deadbands, no IMU/ToF on Air 2) is documented in
+> [MOTION.md](MOTION.md).
+
 ## Loop
 
 The brain is **event-driven**, not a rigid timer. Background tasks keep a live `PerceptionBuffer` (latest
@@ -18,6 +23,12 @@ Observation (telemetry + JPEG)  ─►  build messages  ─►  POST /chat/compl
 ```
 
 ## Brain architectures (`AUTOBOT_AI_PROVIDER`)
+
+The brain architecture is a single setting (`ai_provider`, resolved by `Settings.brain_mode()` →
+`single|hybrid|vlm|omni`). `AUTOBOT_AI_PROVIDER` seeds it at startup as a deploy-time default, and the UI is
+authoritative at runtime (changing the provider switches the brain without an env edit). The resolved mode and
+the hybrid eyes' health show up in `/api/state` (`brain.brain_mode`, `brain.vlm_ok`). **Hybrid is the
+recommended golden path** — see [MATURITY.md](MATURITY.md) §1.
 
 There are three ways the brain can be wired:
 
@@ -36,6 +47,20 @@ There are three ways the brain can be wired:
   - **Reflex layer (no LLM):** a fast watcher stops the robot the instant the ToF/IR sensor reports an
     obstacle closer than `AUTOBOT_REFLEX_STOP_CM`, then arms a "turn, don't push forward" hint for the next
     cortex decision. Still routed through `safety.py`; complements the native deadman watchdog.
+  - **Fail-soft eyes:** if the VLM service goes unreachable while hybrid is selected, the brain logs once and
+    falls back to single-model perception (the cortex sees the camera frame directly) until the service
+    returns — it never goes blind or stalls.
+
+**One-command bringup (hybrid).** Start the VLM "eyes" service, then point the app at hybrid:
+
+```bash
+# 1) the eyes (separate GPU box or the same machine) — serves /vlm/perceive on :8360
+python scripts/vlm_service.py            # or: scripts/run_vlm.ps1   (VLM_MODEL overrides the model)
+
+# 2) the app, in hybrid mode (cortex = a fast OpenAI-compatible tool model)
+AUTOBOT_AI_PROVIDER=hybrid AUTOBOT_VLM_URL=http://<eyes-host>:8360 \
+AUTOBOT_AI_BASE_URL=http://localhost:11434/v1 AUTOBOT_AI_MODEL=qwen2.5:7b python -m autobot
+```
 
 ```
 camera/mic ─► VLM /vlm/perceive (eyes) ─┐
@@ -184,6 +209,14 @@ The user sets autonomy, goal, `max_speed`, and `talk_enabled` in the UI. The **A
 hub, session kept warm). While dark, all brain loops idle, `feed_speech`/`tick`/`chat` and manual
 drive/say are refused, and STT/captioner/SLAM get no frames. Wake (`/api/sleep {on:false}`) reverses it and
 restores the prior autonomy. See docs/SAFETY.md.
+
+**Overseer puppet mode (`config.overseer`):** orthogonal to autonomy. The brain keeps perceiving/thinking,
+but `OverseerGate` (`autobot/robot/overseer_gate.py`) intercepts every robot-affecting call it makes —
+recording it as a *proposal* and returning a synthetic OK so the brain "thinks" it acted while nothing
+reaches the robot. A human/agent overseer reads the brain's intent + live state via `GET /api/overseer/state`
+and drives the real robot via `POST /api/overseer/act` (clamped, `source="overseer"`). Used to study and
+calibrate movement without the dumb brain crashing the robot. Off = transparent passthrough. See
+docs/SAFETY.md.
 
 ## Hardware-free development
 

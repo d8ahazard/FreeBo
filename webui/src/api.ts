@@ -124,6 +124,14 @@ export const api = {
   calibrate() {
     return jpost("/api/calibrate", {});
   },
+  // --- overseer puppet mode: read the paralyzed brain's intent + live state, and drive the real robot ---
+  async overseerState(since = 0) {
+    const r = await fetch(`/api/overseer/state?since=${since}`);
+    return r.json();
+  },
+  overseerAct(body: Record<string, unknown>) {
+    return jpost("/api/overseer/act", body);
+  },
   async selftest(opts: { move?: boolean; talk?: boolean; only?: string } = {}) {
     const q = new URLSearchParams();
     if (opts.move) q.set("move", "1");

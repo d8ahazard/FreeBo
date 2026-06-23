@@ -116,6 +116,28 @@ the 3 ids above. There is **no raw accel/gyro (6-axis IMU)** in its cloud teleme
 `/api/debug/rtm` dumps rtm connectivity + recent raw decoded payloads + parsed telemetry — use it to map more
 fields (IMU/TOF live on other ids; extend `parsePeer` as they're identified).
 
+## LAN probe — the Air 2 has NO local surface (verified, can't "be the cloud")
+
+Full `nmap` of the robot (`192.168.1.33`, mac `a8:b5:8e:93:b3:29`) on the LAN:
+- **All 65535 TCP ports CLOSED** (RST, not filtered) — the robot listens on **zero** TCP. No RTSP, no HTTP,
+  no ONVIF, no UPnP, no local API.
+- **UDP** top-150: only no-response (`open|filtered`) + ephemeral high ports (its outbound RTC/P2P source
+  ports). No inbound UDP *service* to talk to.
+
+So the Air 2 is a **purely outbound cloud client** with no inbound LAN interface. "Being the cloud server"
+locally is **not feasible** on this model:
+- Control + media ride **Agora's proprietary, encrypted, authenticated RTC/RTM network** (the robot resolves
+  `*.agora.io` + Agora's AP lookup and speaks Agora's closed gateway protocol). We cannot reimplement or
+  impersonate Agora locally; redirecting its DNS just breaks the connection.
+- Enabot's bootstrap is **signed HTTPS REST**; even MITM'd it only yields Agora tokens — which we already
+  capture via the collector, so we mint sessions ourselves.
+- TUTK/Kalay LAN control (the SE's local path) is **closed on the Air 2**: `avClientStartEx` → `-20015`.
+
+What we already do is therefore the only viable path: **join the same Agora channel as a peer** (captured
+creds + a minted session) so we ARE the controller via the cloud relay. True offline/local control is a
+property of the **EBO SE** (LAN MAVLink over TUTK), not the Air 2. The only realistic "less cloud" gain on
+Air 2 is Agora **LAN P2P for the media leg** (signaling still cloud) — a latency/bandwidth win, not offline.
+
 Battery/charge now flow end-to-end (verified: `battery:73, charge:0`). NOT in the cloud REST (`robots/robot`
 has only machine/agora/tutk info). The gateway signaling WS carries only `on_p2p_ok` + stream announcements,
 NOT telemetry.

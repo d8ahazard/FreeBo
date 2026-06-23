@@ -56,6 +56,15 @@ _proc = None
 _load_lock = threading.Lock()
 _last_turn = {"dir": "right"}
 ACTIONS = {"forward", "back", "backward", "left", "right", "stop", "none"}
+# Movement guidance (mirror of autobot/brain/motion_model.guidance_text — kept inline because this service
+# runs in its own venv). The robot's drivetrain is twitchy with deadbands and no distance sensor, so bias the
+# coarse decision toward turning-to-inspect over charging forward; the cerebellum owns the actual speeds.
+NAV_GUIDANCE = (
+    "You roll on treads and can PIVOT IN PLACE. A low-level controller handles speed and confirms each move, "
+    "and it takes only SHORT steps — so you don't need a perfectly empty scene to move. Your DEFAULT is to "
+    "EXPLORE: when there's open floor ahead (even a meter or two, partial clutter to the sides is fine), go "
+    "'forward' to cover ground. Only 'left'/'right' to turn when something is CLOSE directly ahead or you've "
+    "reached a wall/dead end. Don't just spin in place — keep moving into new space.")
 EYES = {"neutral", "happy", "sad", "angry", "surprised", "sleepy", "love", "dizzy",
         "blink", "curious", "excited", "scared", "confused", "wink", "cool"}
 
@@ -133,9 +142,9 @@ def _mode_directive(mode: str, directive: str, robot_name: str, persona: str) ->
     if mode == "command" and directive:
         return (f"Your current goal: {directive}. Pursue it — scan by turning to find the target, then drive "
                 f"toward it. ")
-    return ("Explore: head into open space and through doorways, cover ground. You have NO bumper and obstacle "
-            "avoidance is OFF, so do NOT drive forward if a wall/furniture/object is close ahead — turn toward "
-            "the most open direction instead.")
+    return ("Explore: actively head into open space and through doorways and COVER GROUND — drive forward "
+            "whenever there's open floor ahead (take a short step, then re-check). Only turn when something is "
+            "close directly ahead or you hit a wall/dead end. Keep moving to new areas; don't linger or spin.")
 
 
 def _parse(raw: str):
@@ -187,7 +196,7 @@ def decide(frames_b64, mode: str = "explore", heard: str = "", language: str = "
     if not describe and mode != "command":
         prompt = (
             f"You are {robot_name}, a small two-wheeled robot looking through your camera at the image above.\n"
-            f"{directive_txt}\n\n"
+            f"{directive_txt}\n{NAV_GUIDANCE}\n\n"
             "Decide your single next move. Reply in EXACTLY two lines, nothing else:\n"
             "ACTION: <forward|left|right|back|stop>\n"
             "EYES: <neutral|happy|curious|surprised|excited|confused|sad>")
@@ -206,7 +215,7 @@ def decide(frames_b64, mode: str = "explore", heard: str = "", language: str = "
 
     prompt = (
         f"You are {robot_name}, {persona}. You are a small two-wheeled robot looking through your camera at "
-        f"the image above.\n{directive_txt}\n\n"
+        f"the image above.\n{directive_txt}\n{NAV_GUIDANCE}\n\n"
         "Reason about the scene, then decide your single next move. Reply in EXACTLY this format, one item per "
         "line, nothing else:\n"
         "SEE: <one concrete sentence describing what is actually in front of you>\n"
@@ -227,11 +236,12 @@ def decide(frames_b64, mode: str = "explore", heard: str = "", language: str = "
         action = "none"
 
     person = bool(re.search(r"\b(person|people|man|woman|someone|child|kid|human)\b", see, re.I))
-    # The robot's voice/thought = what it sees (+ reasoning). This is the visible "thinking".
-    text = see if (describe or mode == "command") else ""
-    note = think
-    return {"ok": True, "text": text.strip().strip('"'), "action": action, "eyes": eyes,
-            "person": person, "note": note.strip(), "raw": raw[:400]}
+    # The robot only SPEAKS aloud when addressed (the `heard` branch above returns spoken `text`). On
+    # autonomous cycles we DON'T narrate — the SEE/THINK reasoning still goes to the UI thought feed via
+    # `note`, but `text` stays empty so the robot isn't talking every time it moves.
+    note = ("SEE: " + see.strip() + (" — THINK: " + think.strip() if think.strip() else "")).strip(" -")
+    return {"ok": True, "text": "", "action": action, "eyes": eyes,
+            "person": person, "note": note, "raw": raw[:400]}
 
 
 PERCEIVE_PROMPT = (

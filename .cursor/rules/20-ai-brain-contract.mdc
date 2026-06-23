@@ -7,6 +7,10 @@ globs: autobot/brain/**
 
 Full reference: [docs/AI_BRAIN.md](mdc:docs/AI_BRAIN.md).
 
+> Movement: every brain variant (cortex, `vlm`, `omni`) emits high-level movement INTENTS, never raw
+> `ly/rx`. Driving goes through the cerebellum ([autobot/brain/locomotion.py](mdc:autobot/brain/locomotion.py))
+> then the safety floor. See `.cursor/rules/60-motion.mdc` + [docs/MOTION.md](mdc:docs/MOTION.md).
+
 ## The loop (agent.py)
 
 `perceive -> think -> act -> observe`, but **event-driven** (not a fixed timer). Background tasks keep a

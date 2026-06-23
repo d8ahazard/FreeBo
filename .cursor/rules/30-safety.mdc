@@ -21,11 +21,23 @@ This software drives a real motorized robot. Full reference: [docs/SAFETY.md](md
    through the agent loop.
 7. **Fail safe, not open.** On any error (provider down, bridge unreachable, parse failure), the robot
    stops and stays stopped. Errors never translate into motion.
+8. **Overseer paralysis is a gate, not a bypass.** When `config.overseer` is on, the brain's robot-affecting
+   calls are intercepted by `OverseerGate` (the brain only ever touches the robot through a `RobotLink`).
+   Overseer commands (`source="overseer"`, via `/api/overseer/act`) still pass through `safety.check_drive`
+   and are clamped to `max_speed` + `max_move_duration` — the speed/duration clamp is never skipped.
 
 ## When adding a capability
 
 Add its constraint to `safety.py` in the same change. If a new tool can cause motion, sound, or physical
 state change, it MUST be gated/clamped here. Document the constraint in `docs/SAFETY.md`.
+
+## Motion goes through the cerebellum, then the floor
+
+How the robot physically moves (deadbands, non-linear turn, no IMU/ToF on Air 2) is documented in
+[docs/MOTION.md](mdc:docs/MOTION.md) and `.cursor/rules/60-motion.mdc`. The brain emits high-level INTENTS;
+closed-loop motor control ([autobot/brain/locomotion.py](mdc:autobot/brain/locomotion.py)) turns them into
+pulses; everything still passes through `safety.check_drive`. The safety floor here is unchanged by that
+layering — it remains the final mechanical clamp.
 
 ## Don't
 

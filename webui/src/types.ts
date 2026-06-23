@@ -22,6 +22,9 @@ export interface Settings {
   allow_video: boolean;
   allow_audio_in: boolean;
   asleep: boolean;
+  overseer: boolean;
+  supervisor: boolean;
+  ai_supervisor_model: string;
   autonomy: Autonomy;
   mode: Mode;
   directive: string;
@@ -134,7 +137,19 @@ export type AutobotEvent =
   | { type: "error"; error: string; ts: number }
   | { type: "estop"; ok: boolean }
   | { type: "approval_request"; id: string; tool: string; args: Record<string, unknown>; requester: string; reason: string; ts: number }
-  | { type: "approval_resolved"; id: string; approved: boolean; ts: number };
+  | { type: "approval_resolved"; id: string; approved: boolean; ts: number }
+  | { type: "proposal"; seq: number; verb: string; args: Record<string, unknown>; ts: number }
+  | { type: "overseer_act"; kind: string; args: Record<string, unknown>; result: Record<string, unknown>; ts: number };
+
+export interface OverseerLogItem {
+  id: number;
+  // "proposal" = what the paralyzed brain tried to do; "act" = what the overseer actually sent to the robot.
+  kind: "proposal" | "act";
+  verb: string;
+  args: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  ts: number;
+}
 
 export interface FeedItem {
   id: number;

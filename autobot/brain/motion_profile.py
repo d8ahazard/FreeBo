@@ -41,11 +41,29 @@ class MotionProfile:
     turn_duration: float = 0.6
     baseline: float = 0.006
     move_threshold: float = 0.012
+    # Per-axis response shape (seeded from motion_model.py; the cerebellum/locomotion uses these). Carried in
+    # the profile so a future richer calibration can refine the deadbands/turn-rate per robot.
+    forward_deadband: float = 0.25
+    turn_deadband: float = 0.08
+    turn_min: float = 0.10
+    turn_max: float = 0.20
+    turn_deg_per_s: float = 90.0
     ts: float = field(default_factory=time.time)
     samples: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_model(cls, model) -> "MotionProfile":
+        """A sensible profile seeded entirely from a hard-coded MotionModel (used when uncalibrated)."""
+        return cls(
+            forward_speed=model.forward_unit_speed, forward_duration=model.forward_unit_duration,
+            turn_rx=model.turn_unit_rx, turn_duration=model.turn_unit_duration,
+            baseline=round(model.still_diff, 4), move_threshold=round(model.move_diff, 4),
+            forward_deadband=model.forward_deadband, turn_deadband=model.turn_deadband,
+            turn_min=model.turn_min, turn_max=model.turn_max, turn_deg_per_s=model.turn_deg_per_s,
+        )
 
 
 def load() -> Optional[MotionProfile]:

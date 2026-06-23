@@ -37,9 +37,11 @@ async def test_brain_vlm_tick_drives_and_arms_motion_check(tmp_path, monkeypatch
     from autobot.brain.memory import Memory
     from autobot.config import SETTINGS
 
-    monkeypatch.setenv("AUTOBOT_AI_PROVIDER", "vlm")   # force the modular vision brain
+    monkeypatch.setenv("AUTOBOT_AI_PROVIDER", "vlm")   # force the modular vision brain (legacy env trigger)
+    # Brain mode is now settings-driven (the UI is authoritative at runtime); set it on SETTINGS too so the
+    # agent's snapshot-based resolution picks the VLM path. See docs/MATURITY.md §1.
     SETTINGS.update(setup_complete=True, autonomy="auto", allow_motion=True, allow_think=True,
-                    allow_video=True, talk_enabled=False, confirm_motion=True)
+                    allow_video=True, talk_enabled=False, confirm_motion=True, ai_provider="vlm")
 
     async def fake_decide(self, **kwargs):
         return {"action": "forward", "text": "", "eyes": "curious"}

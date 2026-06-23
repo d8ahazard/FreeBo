@@ -56,6 +56,23 @@ all refused; only estop, wake, and `stop` still work. Wake (`{on:false}`) revers
 re-enable the mic, clear `asleep`, and restore the prior autonomy mode. estop remains the fast panic-halt;
 Sleep is the "cut everything" switch.
 
+## Overseer puppet mode (`config.overseer`)
+
+A diagnostic/calibration mode that **paralyzes the AI brain** without stopping it. When `overseer` is on,
+the brain still perceives, thinks, and emits tool calls, but it reaches the robot only through
+`OverseerGate` (`autobot/robot/overseer_gate.py`), which **intercepts every robot-affecting verb**
+(`drive`/`move`/`stop`/`action`/`say_*`/`publish_speech`): each is recorded as a *proposal* and a synthetic
+`{"ok":true,"intercepted":true}` is returned, so the brain believes it acted while **nothing reaches the
+robot**. A human/agent overseer then drives the real robot directly through `POST /api/overseer/act` and
+watches the brain's intent + live state via `GET /api/overseer/state`. When `overseer` is off the gate is a
+transparent passthrough — normal operation is unchanged.
+
+Overseer commands use `source="overseer"` in `safety.check_drive`: like `manual`, they are **clamped to
+`max_speed` + `max_move_duration`** but are **not** autonomy-gated or rate-limited (the human is the
+operator). The speed/duration clamp is still non-negotiable. `say` via overseer still respects
+`talk_enabled`. The gate is the single chokepoint for the "paralysis" because the brain only ever touches
+the robot through a `RobotLink`.
+
 ## Movement scope (behavior gate)
 
 On top of the speed/duration/calibration clamps, every AI drive is gated by a per-cycle **movement scope**
