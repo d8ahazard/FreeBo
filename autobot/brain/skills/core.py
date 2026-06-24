@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import time
 
-from .. import locomotion, motion_model, tts
+from .. import locomotion, motion_model
 from .base import Skill, SkillContext, ToolDef, fn_schema
 
 # Unit drive vectors. ly>0 forward; rx>0 turns right, rx<0 turns left (matches motor_frame).
@@ -114,7 +114,12 @@ class CoreSkill(Skill):
         return res
 
     async def _stop(self, a: dict) -> dict:
-        res = await self._c().link.stop()
+        ctx = self._c()
+        es = getattr(ctx, "emergency_stop", None)
+        if es is not None:
+            await es("stop tool")   # unified path: preempts any in-flight executor action + stops
+            return {"ok": True, "stopped": True}
+        res = await ctx.link.stop()
         return {"ok": res.get("ok", False), "stopped": True}
 
     async def _look(self, a: dict) -> dict:
@@ -123,41 +128,23 @@ class CoreSkill(Skill):
 
     async def _say(self, a: dict) -> dict:
         ctx = self._c()
-        s = ctx.settings.snapshot()
-        d = ctx.safety.check_say(s)
-        if not d.allowed:
-            return {"ok": False, "blocked": d.reason}
-        # Small cortex models sometimes pack `set_eyes "..."\nsay "..."` into the text — speak only the sentence.
-        from ..speech_clean import clean_spoken
-        text = clean_spoken(str(a.get("text", "")))
-        if not text:
-            return {"ok": False, "error": "empty text"}
-        # Speak via the best path for this link:
-        #  - Air 2 native (RTC): render WAV and publish_speech() onto the robot's speaker (+ emit for the UI).
-        #  - Cloud/browser links: hand them the text (browser fetches TTS and publishes into Agora).
-        #  - Local G.711 links (SE native/x86): render mulaw here and push it to the speaker.
-        pub = getattr(ctx.link, "publish_speech", None)
-        if callable(pub):
-            wav = tts.render_wav(text)
-            if wav:
-                # Echo gate: mute STT for the clip duration (+tail) so the robot doesn't transcribe itself.
-                from .. import audio_state
-                audio_state.mark_speaking(audio_state.wav_duration_s(wav))
-                res = await pub(wav)
-                try:
-                    import base64
-                    await ctx.emit({"type": "speech", "text": text,
-                                    "b64": base64.b64encode(wav).decode(), "sr": 0, "ts": time.time()})
-                except Exception:  # noqa: BLE001
-                    pass
-            else:
-                res = await ctx.link.say_text(text)
-        elif ctx.link.prefers_text_tts():
-            res = await ctx.link.say_text(text)
-        else:
-            g711 = tts.render_mulaw(text)
-            res = await ctx.link.say_audio(g711, codec="mulaw") if g711 else await ctx.link.say_text(text)
-        return {"ok": res.get("ok", False), "said": text[:80], "available": res.get("available")}
+        text = str(a.get("text", ""))
+        # The ONE robot-speaker path: SpeechService sanitizes reserved words, records the outbound text in
+        # AudioState, retains the playback id, and registers an idempotent canceller — so a STOP/QUIET cancels
+        # a clip spoken via this tool exactly like reflex speech. Talk-toggle/quiet gating is applied inside.
+        speech = getattr(ctx, "speech", None)
+        if speech is None:   # no unified service wired (older context) — fall back to a direct talk
+            d = ctx.safety.check_say(ctx.settings.snapshot())
+            if not d.allowed:
+                return {"ok": False, "blocked": d.reason}
+            from ..speech_clean import clean_spoken
+            txt = clean_spoken(text)
+            res = await ctx.link.say_text(txt) if txt else {"ok": False, "error": "empty text"}
+            return {"ok": res.get("ok", False), "said": txt[:80], "available": res.get("available")}
+        res = await speech.speak(text, check_say=True, safety=ctx.safety)
+        if not res.get("ok"):
+            return res
+        return {"ok": True, "said": (speech.last_spoken or "")[:80], "available": res.get("available")}
 
     async def _set_eyes(self, a: dict) -> dict:
         anim = str(a.get("animation", "")).lower()

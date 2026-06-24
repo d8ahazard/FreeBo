@@ -28,21 +28,32 @@ fills the gaps it can't prove. See [docs/TESTING.md](TESTING.md), [docs/AI_BRAIN
 Proves the code, protocol, and brain plumbing before touching the robot.
 
 - [ ] `python scripts/eboproto_check.py` -> `RESULT: PASS` (MAVLink byte-identity).
-- [ ] `python -m pytest -q -p no:recording` -> green. `-p no:recording` is REQUIRED (broken vcr plugin in
-  this env). Phase 0 suites: `test_behavior.py`, `test_audio_sink.py`, `test_bargein.py`, `test_framesample.py`,
-  `test_action_executor.py`, `test_reflex.py` (+ existing `test_metrics.py`, `test_safety.py`). KNOWN
-  pre-existing failures (unrelated to this work; reproduce with our changes stashed): `test_checks.py::test_video_fail_without_frame`,
+- [ ] Phase 0 suites pass, run in groups that exit cleanly (`-p no:recording` is REQUIRED — broken vcr plugin
+  in this env). Verified-green groups (each exits 0):
+  - `pytest -p no:recording tests/test_behavior.py tests/test_audio_sink.py tests/test_bargein.py
+    tests/test_speech.py tests/test_framesample.py tests/test_perception.py tests/test_metrics.py
+    tests/test_safety.py` (52)
+  - `pytest -p no:recording tests/test_action_executor.py tests/test_skills_core.py` (21)
+  - `pytest -p no:recording tests/test_reflex.py` (5) — run ALONE (daemon threads are flaky combined with the
+    asyncio executor suite)
+  - `pytest -p no:recording tests/test_brain.py` (1)
+  KNOWN pre-existing failures (unrelated; reproduce with our changes stashed): `test_checks.py::test_video_fail_without_frame`,
   `test_checks.py::test_autonomy_pass_when_brain_drives_and_robot_moves`, `test_motion.py::test_classify_blocked_partial_change`.
-  NOTE: running `test_checks.py`+`test_motion.py` together can hang (pre-existing teardown issue) — run files
-  individually; and `test_reflex.py` (daemon threads) is flaky when combined with the asyncio executor suite —
-  run it alone.
+  Running `test_checks.py`+`test_motion.py` TOGETHER hangs (pre-existing teardown issue) — run those files
+  individually. Do NOT describe the whole-suite `pytest` as "green": it still includes those 3 failures + the
+  hang. The Phase 0 groups above are what is green.
 - [ ] `python scripts/bench_brain.py --ticks 50` -> per-phase latency table; `reason/perceive/provider/tool`
   rows present with sane p50.
 - [ ] `python scripts/obstacle_course.py` -> all offline checks PASS (executor lifecycle, stale-frame ->
   UNKNOWN, oscillation -> HOLD, HOLD refuses, preempt -> CANCELLED). SIMULATION only — makes no collision claim.
+  `--hardware` is a GUARDED OPERATOR RUNBOOK (always exits non-zero; never reports a hardware pass).
+- [ ] **Phase 0.3 (NOT done offline — HARDWARE):** `python scripts/audio_diag.py --app http://127.0.0.1:8200`
+  against the live robot, then fill `docs/AUDIO_DIAGNOSTIC.md` and set the final adaptive-VAD constants. Until
+  that doc's banner is cleared, Phase 0.3 is NOT complete.
 - [ ] `python scripts/ollama_probe.py` (only if the cortex is Ollama) -> `TOOLS/VISION/VISION+TOOLS: PASS`.
 
-PASS bar: eboproto PASS, pytest green (no NEW failures), bench prints, obstacle_course offline all-PASS.
+PASS bar: eboproto PASS, the Phase 0 test groups green, bench prints, obstacle_course offline all-PASS.
+Phase 0.3 (hardware audio diagnostic) remains OPEN until recorded on the robot.
 
 ### Phase 0 stabilization acceptance gates (listening / movement / safety)
 These are the release bar for the Phase 0 work. Latency gates are measured on the live robot; the structural

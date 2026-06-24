@@ -9,14 +9,15 @@ TWO clearly-separated modes:
     collisions" — there is no physical environment or collision model here. Collision-free results require the
     hardware course below.
 
-  * HARDWARE (`--hardware`) — the physical 50-step obstacle course. It moves a REAL robot, so it is gated:
-    it refuses to run unless BOTH `--hardware` AND `AUTOBOT_COURSE_ENABLE_MOTION=1` are set, and it prints the
-    test contract (speed, layout, lighting, operator stop, collision definition) it expects the operator to
-    follow. Wiring it to a live app is intentionally left to the operator runbook in docs/TEST_PLAN.md.
+  * HARDWARE (`--hardware`) — a GUARDED OPERATOR RUNBOOK, not a completed automated harness. There is no live
+    50-step runner here: the live drive sequence + collision scoring must be performed by a human operator
+    against a running app (see docs/TEST_PLAN.md). This branch only prints the test contract and ALWAYS exits
+    non-zero (it never reports a pass it didn't run), and additionally refuses to claim "enabled" unless BOTH
+    `--hardware` AND `AUTOBOT_COURSE_ENABLE_MOTION=1` are set.
 
     python scripts/obstacle_course.py                 # offline simulation (CI-safe)
     python scripts/obstacle_course.py --steps 50      # more simulated steps
-    AUTOBOT_COURSE_ENABLE_MOTION=1 python scripts/obstacle_course.py --hardware
+    AUTOBOT_COURSE_ENABLE_MOTION=1 python scripts/obstacle_course.py --hardware   # prints the runbook
 """
 from __future__ import annotations
 
@@ -132,21 +133,25 @@ async def _run_offline(steps: int) -> int:
 
 
 def _run_hardware() -> int:
-    if os.environ.get("AUTOBOT_COURSE_ENABLE_MOTION") != "1":
-        print("REFUSED: the physical obstacle course moves a real robot.")
-        print("Set BOTH --hardware AND AUTOBOT_COURSE_ENABLE_MOTION=1 to enable motion.")
-        print()
-        print("Test contract (see docs/TEST_PLAN.md):")
-        print("  - tested speed:      config.max_speed (record the value used)")
-        print("  - course layout:     50 marked steps, obstacles at fixed positions (document the map)")
-        print("  - lighting:          steady, documented lux (the cloud camera is noise-sensitive)")
-        print("  - operator stop:     a human with the UI STOP / physical power within reach at all times")
-        print("  - collision defn:    any contact with an obstacle or wall = a collision")
-        print("  - pass gate:         0 collisions over the 50 steps at the tested speed + environment")
-        return 2
-    print("Hardware course motion enabled. Wire this to your running app per docs/TEST_PLAN.md.")
-    print("(Live-driving wiring is intentionally operator-owned and not auto-run here.)")
-    return 0
+    """Print the physical-course runbook. This is NOT an automated harness — there is no live runner here, so
+    it ALWAYS returns non-zero (a hardware PASS is recorded by the operator in docs/TEST_PLAN.md, never by this
+    script)."""
+    enabled = os.environ.get("AUTOBOT_COURSE_ENABLE_MOTION") == "1"
+    print("GUARDED OPERATOR RUNBOOK — the physical 50-step course moves a REAL robot.")
+    print("This script does NOT drive the robot or score collisions; a human runs it against a live app.")
+    if not enabled:
+        print("Motion-enable flag NOT set (export AUTOBOT_COURSE_ENABLE_MOTION=1 to acknowledge).")
+    print()
+    print("Run contract (record results in docs/TEST_PLAN.md):")
+    print("  - tested speed:      config.max_speed (record the value used)")
+    print("  - course layout:     50 marked steps, obstacles at fixed positions (document the map)")
+    print("  - lighting:          steady, documented lux (the cloud camera is noise-sensitive)")
+    print("  - operator stop:     a human with the UI STOP / physical power within reach at all times")
+    print("  - collision defn:    any contact with an obstacle or wall = a collision")
+    print("  - pass gate:         0 collisions over the 50 steps at the tested speed + environment")
+    print()
+    print("RESULT: NOT RUN (operator runbook). This script never reports a hardware PASS.")
+    return 3
 
 
 def main() -> int:

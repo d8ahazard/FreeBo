@@ -29,12 +29,47 @@ def _auto():
     return settings(autonomy="auto", allow_motion=True, max_speed=0.6, max_move_duration=2.5)
 
 
-async def test_succeeds_with_fresh_frame_and_evidence():
-    ex = _ex(MockRobotLink())
-    a = await ex.run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
-    assert a.state == State.SUCCEEDED
-    assert a.result in ("moved", "stuck", "blocked")     # evidence verdict (policy-free)
+class _MovingLink(MockRobotLink):
+    """A mock whose camera visibly CHANGES each frame, so a real move reads 'moved' -> SUCCEEDED."""
+    def __init__(self):
+        super().__init__()
+        self._lvl = 0
+
+    async def snapshot_sample(self):
+        import time as _t
+
+        import cv2
+        import numpy as np
+        from autobot.robot.media_hub import FrameSample
+        if not self._freeze_seq:
+            self._seq += 1
+            self._lvl += 80
+        ok, buf = cv2.imencode(".jpg", np.full((48, 64, 3), self._lvl % 256, dtype=np.uint8))
+        return FrameSample(jpeg=buf.tobytes() if ok else b"x", seq=self._seq,
+                           wall_ts=_t.monotonic(), age=0.0, valid=True)
+
+
+async def test_moved_is_succeeded():
+    pytest.importorskip("cv2"); pytest.importorskip("numpy")
+    a = await _ex(_MovingLink()).run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
+    assert a.state == State.SUCCEEDED and a.result == "moved"
     assert a.after_seq is not None and a.before_seq is not None and a.after_seq > a.before_seq
+
+
+async def test_stuck_is_failed_not_succeeded():
+    # MockRobotLink (solid JPEG) -> identical frames -> 'stuck' -> FAILED (P0.4), NOT SUCCEEDED.
+    a = await _ex(MockRobotLink()).run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
+    assert a.state == State.FAILED and a.result == "stuck"
+
+
+async def test_execution_timeout_is_failed():
+    class _HangLink(MockRobotLink):
+        async def move(self, ly, rx, duration):
+            await asyncio.sleep(10.0)            # hung move coroutine
+            return {"ok": True}
+    ex = _ex(_HangLink(), execution_grace=0.1)   # deadline = duration + 0.1s
+    a = await ex.run_drive(0.5, 0.0, 0.2, settings=_auto(), source="ai")
+    assert a.state == State.FAILED and "execution timeout" in a.reason
 
 
 async def test_stale_stream_is_unknown_never_stuck():

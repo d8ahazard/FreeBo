@@ -11,6 +11,7 @@ import pytest
 
 import autobot.brain.audio_sink as asink
 from autobot.brain.audio_sink import AudioSink, _is_hallucination
+from autobot.robot.media_hub import MediaHub
 
 
 class _Clock:
@@ -85,6 +86,26 @@ def test_quiet_audio_never_enters_speech(clock):
         clock.t += 0.05
     d = s.debug()
     assert d["vad_starts"] == 0 and len(s._jobs) == 0
+
+
+def test_audio_sink_start_stop_restart_no_leaks():
+    hub = MediaHub()
+    base = hub.stats()["audio_subs"]
+    # with a barge-in worker too, both threads must be joined on stop
+    s = AudioSink(on_critical=lambda i: None)
+    s.attach(hub)
+    assert hub.stats()["audio_subs"] == base + 1
+    assert s._worker is not None and s._worker.is_alive()
+    assert s._bi_thread is not None and s._bi_thread.is_alive()
+    s.stop()
+    assert hub.stats()["audio_subs"] == base
+    assert s._worker is None and s._bi_thread is None
+    # restart -> exactly one subscriber again, no leaked threads
+    s2 = AudioSink(on_critical=lambda i: None)
+    s2.attach(hub)
+    assert hub.stats()["audio_subs"] == base + 1
+    s2.stop()
+    assert hub.stats()["audio_subs"] == base
 
 
 def test_hallucination_filter():

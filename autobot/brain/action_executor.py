@@ -12,6 +12,12 @@ authorized action with a `parent_id`. Key guarantees (see docs/SAFETY.md + the P
   * every motion goes through `SafetyFloor.check_drive` (the final mechanical clamp) — never bypassed;
   * after a pulse we WAIT for a frame whose sequence is newer than the 'before' frame. No fresh frame by the
     evidence deadline => UNKNOWN, **never** STUCK (a stale cached frame must not read as "didn't move");
+  * **outcome mapping** (the evidence verdict drives the lifecycle): `moved` -> SUCCEEDED; `unknown` or
+    unavailable evidence -> UNKNOWN; `stuck`/`blocked` -> FAILED (the physical move achieved no progress, so
+    callers must NOT see ok=true). The evidence verdict itself is kept on `Action.result`;
+  * `link.move()` is bounded by an EXECUTION deadline (a hung move coroutine -> stop + FAILED), and
+    `link.stop()` is bounded too (shutdown can't hang); the evidence timeout is separate and does not protect
+    against a hung move;
   * `stop()` always runs in `finally` (deadman);
   * a link rejection is FAILED immediately;
   * terminal state is set exactly once and a CANCELLED action is protected from late evidence/completion;
@@ -98,7 +104,8 @@ class ActionExecutor:
 
     def __init__(self, link, safety, *, emit: EmitFn = None, metrics=None,
                  evidence_timeout: float = 1.5, settle: float = 0.3, poll: float = 0.05,
-                 video_max_age: float = 2.0, hold_threshold: int = 2) -> None:
+                 video_max_age: float = 2.0, hold_threshold: int = 2,
+                 execution_grace: float = 3.0, stop_timeout: float = 2.0) -> None:
         self.link = link
         self.safety = safety
         self.emit = emit
@@ -108,6 +115,10 @@ class ActionExecutor:
         self.poll = poll
         self.video_max_age = video_max_age      # refuse motion when the 'before' frame is older than this (s)
         self.hold_threshold = hold_threshold    # consecutive non-progress attempts before HOLD
+        # Execution deadline = the pulse duration + this grace. A move coroutine that doesn't return by then is
+        # treated as HUNG (stop + FAILED). `stop_timeout` bounds link.stop() so shutdown can't hang forever.
+        self.execution_grace = execution_grace
+        self.stop_timeout = stop_timeout
         self._active: Optional[Action] = None
         self._lock = asyncio.Lock()
         self._ids = itertools.count(1)
@@ -131,17 +142,18 @@ class ActionExecutor:
         self._nonprogress = 0
 
     def _note_outcome(self, a: Action) -> None:
-        """Fold a terminal action into the circuit breaker. Progress (a confirmed 'moved') resets it; a
-        cancelled action is intentional and ignored; the breaker-refusal action does not re-count itself."""
+        """Fold a terminal action into the circuit breaker. Progress (SUCCEEDED == a confirmed 'moved') resets
+        it; a cancelled action is intentional and ignored; the breaker-refusal action does not re-count itself.
+        FAILED (incl. stuck/blocked/link-reject/timeout) and UNKNOWN are non-progress -> HOLD at the threshold."""
         if a.state == State.CANCELLED:
             return
         if a.state == State.FAILED and a.reason.startswith("circuit breaker"):
             return
-        if a.state == State.SUCCEEDED and a.result == "moved":
+        if a.state == State.SUCCEEDED:        # only a confirmed 'moved' reaches SUCCEEDED now
             self._nonprogress = 0
             self._hold = False
             return
-        if a.state in (State.FAILED, State.UNKNOWN) or a.result in ("stuck", "blocked"):
+        if a.state in (State.FAILED, State.UNKNOWN):
             self._nonprogress += 1
             if self._nonprogress >= self.hold_threshold:
                 self._hold = True
@@ -174,9 +186,10 @@ class ActionExecutor:
             return None
 
     async def _stop(self) -> None:
+        # Bounded so a wedged link.stop() can't hang the deadman / shutdown.
         try:
-            await self.link.stop()
-        except Exception:  # noqa: BLE001
+            await asyncio.wait_for(self.link.stop(), timeout=self.stop_timeout)
+        except Exception:  # noqa: BLE001 (incl. asyncio.TimeoutError) - never hang on stop
             pass
 
     async def preempt(self, reason: str = "preempted") -> None:
@@ -249,9 +262,16 @@ class ActionExecutor:
                     await self._set_state(a, State.CANCELLED, "cancelled before execution")
                     return a
 
-                # execute
+                # execute — bounded by an EXECUTION deadline so a HUNG move coroutine can't wedge the loop.
                 await self._set_state(a, State.EXECUTING)
-                res = await self.link.move(d.ly, d.rx, d.duration)
+                move_deadline = float(d.duration) + self.execution_grace
+                try:
+                    res = await asyncio.wait_for(self.link.move(d.ly, d.rx, d.duration), timeout=move_deadline)
+                except asyncio.TimeoutError:
+                    await self._stop()
+                    await self._set_state(a, State.FAILED,
+                                          f"execution timeout (move exceeded {move_deadline:.1f}s)")
+                    return a
                 if isinstance(res, dict) and res.get("ok") is False:
                     await self._set_state(a, State.FAILED, f"link rejected: {res.get('error') or 'move failed'}")
                     return a
@@ -270,8 +290,15 @@ class ActionExecutor:
                 a.after_seq = after.seq
                 fd = frame_diff(before_jpeg, after.jpeg) if (before_jpeg and after.jpeg) else None
                 mr = classify_motion(fd, expected="translate" if abs(ly) >= abs(rx) else "rotate")
-                a.result = mr.state                      # moved | stuck | blocked | unknown (evidence verdict)
-                await self._set_state(a, State.SUCCEEDED, mr.detail)
+                a.result = mr.state                      # evidence verdict: moved | stuck | blocked | unknown
+                # Outcome mapping (P0.4): only a confirmed 'moved' is SUCCEEDED; stuck/blocked are physical
+                # FAILUREs (no progress) so callers don't read ok=true; inconclusive evidence is UNKNOWN.
+                if mr.state == "moved":
+                    await self._set_state(a, State.SUCCEEDED, mr.detail)
+                elif mr.state == "unknown":
+                    await self._set_state(a, State.UNKNOWN, mr.detail or "evidence inconclusive")
+                else:
+                    await self._set_state(a, State.FAILED, mr.detail)
                 return a
             except Exception as e:  # noqa: BLE001 - any failure stops the robot and is FAILED, never motion
                 await self._set_state(a, State.FAILED, f"{type(e).__name__}: {e}")

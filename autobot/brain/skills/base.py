@@ -55,6 +55,12 @@ class SkillContext:
     # the single ActionExecutor (set by the agent): the ONLY physical-motion path. When present, the `drive`
     # tool routes through it (sequence-aware evidence); when None, it falls back to locomotion directly.
     executor: Any = None
+    # the unified emergency-stop coroutine (set by the agent): cancels TTS/preempts the executor/stops. The
+    # `stop` tool routes through it so a cortex-issued stop also preempts an in-flight action.
+    emergency_stop: Callable[..., Awaitable[None]] | None = None
+    # the unified SpeechService (set by the agent): the ONLY robot-speaker path (sanitize + playback id +
+    # canceller). The `say` tool routes through it so tool speech is cancellable exactly like reflex speech.
+    speech: Any = None
 
 
 class Skill:

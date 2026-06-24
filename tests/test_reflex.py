@@ -27,8 +27,8 @@ def test_visual_reflex_fires_via_worker():
     got = {}
     done = threading.Event()
 
-    def on_loom(score):
-        got["score"] = score
+    def on_loom(stages):
+        got["stages"] = stages
         done.set()
 
     rf = VisualReflex(on_loom=on_loom, threshold=0.1)
@@ -37,7 +37,9 @@ def test_visual_reflex_fires_via_worker():
     try:
         hub.publish_video(_frame())
         assert done.wait(2.0)
-        assert got["score"] == 0.5 and rf.fires == 1 and rf.last_latency_ms >= 0.0
+        st = got["stages"]
+        assert st["score"] == 0.5 and "arrival" in st and "detection" in st
+        assert rf.fires == 1 and rf.last_latency_ms >= 0.0
     finally:
         rf.stop()
 
@@ -58,6 +60,21 @@ def test_visual_reflex_drops_superseded_frames():
     rf._on_frame(types.SimpleNamespace(wall_ts=2.0, seq=2, gray=lambda: "B"))
     frame, _arrival = rf._pending
     assert frame.seq == 2          # newest only; the older frame was superseded
+
+
+def test_visual_reflex_start_stop_restart_no_leaks():
+    hub = MediaHub()
+    rf = VisualReflex(on_loom=lambda s: None, threshold=0.1)
+    base = hub.stats()["video_subs"]
+    rf.attach(hub)
+    assert hub.stats()["video_subs"] == base + 1 and rf._thread is not None and rf._thread.is_alive()
+    rf.stop()
+    assert hub.stats()["video_subs"] == base and rf._thread is None
+    # restart -> exactly one subscriber again, fresh worker, no leak
+    rf.attach(hub)
+    assert hub.stats()["video_subs"] == base + 1
+    rf.stop()
+    assert hub.stats()["video_subs"] == base
 
 
 def test_looming_still_when_no_motion():

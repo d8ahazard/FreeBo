@@ -168,6 +168,13 @@ async def _startup():
 
 @app.on_event("shutdown")
 async def _shutdown():
+    with contextlib.suppress(Exception):
+        await brain.emergency_stop("shutdown")   # preempt + stop before tearing down the loop
+    # Tear down media workers (unsubscribe + join) so a restart leaves no duplicate subscribers / leaked threads.
+    for worker in (AUDIO_SINK, VISUAL_REFLEX):
+        if worker is not None and hasattr(worker, "stop"):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(worker.stop)
     await brain.stop_loop()
     with contextlib.suppress(Exception):
         await asyncio.to_thread(LINK.close)
@@ -365,8 +372,10 @@ async def api_settings(req: Request):
 
 @app.post("/api/estop")
 async def api_estop():
-    """Emergency stop: stop the robot directly and drop to manual so the AI won't re-drive."""
+    """Emergency stop: preempt any active action, stop the robot, and drop to manual so the AI won't re-drive."""
     SETTINGS.update(autonomy="manual")
+    with contextlib.suppress(Exception):
+        await brain.emergency_stop("estop", cancel_tts=True)
     res = await LINK.stop()
     await emit({"type": "estop", "ok": res.get("ok", False)})
     await emit({"type": "settings", "changed": ["autonomy"], "settings": SETTINGS.public_dict()})
@@ -942,9 +951,9 @@ async def api_control(req: Request):
     kind = body.get("kind")
     s = SETTINGS.snapshot()
     if kind == "stop":
-        # Manual takeover: cancel any in-flight AI action first, then stop.
+        # Manual takeover: unified emergency stop (cancels TTS + preempts the active action + stops).
         with contextlib.suppress(Exception):
-            await brain.executor.preempt("manual stop")
+            await brain.emergency_stop("manual stop", cancel_tts=True)
         return JSONResponse(await LINK.stop())
     # When dark, refuse anything that talks to the robot except stop/connection (Wake re-enables I/O).
     if s.asleep and kind in ("drive", "move", "say", "action"):

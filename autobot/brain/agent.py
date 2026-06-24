@@ -148,7 +148,6 @@ class AgentBrain:
         self._proprio_jpeg: bytes | None = None   # last frame, for the camera-based "am I moving" proprioception
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_spoken = ""       # last line we said aloud (for the SPEAK_UP "say that again" command)
-        self._active_playback_id = None   # current TTS clip id on the link (for barge-in cancellation)
         # Per-phase latency metrics (perceive/provider/tool/reason/...). See docs/MATURITY.md §2.
         self.metrics = Metrics()
         # Single authoritative motion path: every AI drive goes through the ActionExecutor, which authorizes
@@ -157,6 +156,12 @@ class AgentBrain:
         # MotionConfirmer next-cycle). See autobot/brain/action_executor.py.
         self.executor = ActionExecutor(link, self.safety, emit=emit, metrics=self.metrics)
         self.ctx.executor = self.executor
+        self.ctx.emergency_stop = self.emergency_stop   # the STOP tool routes through the unified stop path
+        # Unified speech/playback path (sanitize + AudioState text + playback id + idempotent canceller),
+        # shared by reflex speech (_speak) and the cortex `say` tool (CoreSkill._say). See speech.py.
+        from .speech import SpeechService
+        self.speech = SpeechService(link, settings, emit)
+        self.ctx.speech = self.speech
         # Hybrid 'eyes' (VLM service) health: None=unknown, True=reachable, False=down (cortex falls back to
         # seeing the camera directly). Tracked from perceive outcomes + an explicit cold-start probe.
         self._vlm_ok: bool | None = None
@@ -299,7 +304,8 @@ class AgentBrain:
             if allowed:
                 if intent == "STOP" and self._loop is not None:   # instant halt, even mid-think
                     try:
-                        asyncio.run_coroutine_threadsafe(self._safe_stop(), self._loop)
+                        asyncio.run_coroutine_threadsafe(
+                            self.emergency_stop("voice STOP", cancel_tts=True, behavior_stop=True), self._loop)
                     except Exception:  # noqa: BLE001
                         pass
                 self._post("command", {"intent": intent, "text": text})
@@ -321,39 +327,52 @@ class AgentBrain:
     async def _handle_critical_async(self, intent: str) -> None:
         """Apply a barge-in command immediately: cancel our own TTS, preempt + stop the robot, then run the
         command. The clock for this started at the detected keyword (in the worker), not at utterance endpoint."""
-        from . import audio_state
-        audio_state.cancel()          # stop the in-flight TTS now (resets the echo gate + flushes the clip)
-        await self.executor.preempt("barge-in critical command")   # cancel any in-flight AI move + stop
+        await self.emergency_stop(f"barge-in {intent}", cancel_tts=True)   # cancel TTS + preempt + stop NOW
         try:
             s = self.settings.snapshot()
             await self._apply_command(intent, "", s)   # STOP -> hold position; QUIET -> hush window
         except Exception:  # noqa: BLE001
             pass
 
-    def on_visual_loom(self, score: float) -> None:
+    def on_visual_loom(self, stages: dict) -> None:
         """Called from the VisualReflex WORKER thread when the camera shows something looming. Thread-safe
-        handoff to the loop — never touch the robot directly from the media/reflex thread."""
+        handoff to the loop — never touch the robot directly from the media/reflex thread. Records the
+        loop-handoff timestamp so the end-to-end latency (frame arrival -> stop dispatch) is measurable."""
         loop = self._loop
         if loop is None:
             return
+        stages = dict(stages or {})
+        stages["handoff"] = time.monotonic()
         try:
-            asyncio.run_coroutine_threadsafe(self._handle_loom(score), loop)
+            asyncio.run_coroutine_threadsafe(self._handle_loom(stages), loop)
         except Exception:  # noqa: BLE001
             pass
 
-    async def _handle_loom(self, score: float) -> None:
-        """Stop NOW for a looming obstacle and arm 'turn, don't push forward' for the next decision. Preempts
-        any in-flight AI move through the single executor. Fastest available visual reflex (not hard real-time
-        — it rides the cloud video stream)."""
+    async def _handle_loom(self, stages: dict) -> None:
+        """Stop NOW for a looming obstacle and arm 'turn, don't push forward' for the next decision. Routes
+        through the unified emergency_stop (preempts the active action). Latency is measured from FRAME ARRIVAL
+        to STOP-COMMAND DISPATCH (P0.8), with per-stage timestamps. Fastest available visual reflex — not hard
+        real-time, since it rides the cloud video stream."""
         s = self.settings.snapshot()
         if s.asleep or not s.allow_motion:
             return
-        with self.metrics.timer("reflex_stop"):
-            await self.executor.preempt("visual looming reflex")
+        preempt_ts = time.monotonic()
+        await self.emergency_stop("visual looming reflex")   # cancels the active action + dispatches the stop
+        stop_dispatch = time.monotonic()
         self._reflex_blocked = True
+        arrival = stages.get("arrival", preempt_ts)
+        total_ms = (stop_dispatch - arrival) * 1000.0
+        try:
+            self.metrics.record("reflex_stop", total_ms)   # acceptance value: arrival -> stop dispatch
+        except Exception:  # noqa: BLE001
+            pass
         await self._express("surprised")
-        await self.emit({"type": "thought", "text": f"(visual reflex: looming {score:.3f} — stopping)",
+        await self.emit({"type": "thought",
+                         "text": f"(visual reflex: looming {stages.get('score', 0):.3f} — stopping)",
                          "ts": time.time()})
+        await self.emit({"type": "reflex_latency", "ms": round(total_ms, 1),
+                         "stages": {k: round(v, 4) for k, v in stages.items() if isinstance(v, (int, float))},
+                         "stop_dispatch": round(stop_dispatch, 4), "ts": time.time()})
 
     # --- lifecycle ---
     def start(self):
@@ -525,7 +544,7 @@ class AgentBrain:
                         self._reflex_active = True
                         self._reflex_blocked = True   # next cortex decision should turn, not drive forward
                         with self.metrics.timer("reflex_stop"):
-                            await self._safe_stop()
+                            await self.emergency_stop(f"ToF reflex: {reason}")
                         await self._express("surprised")
                         await self.emit({"type": "thought",
                                          "text": f"(reflex: {reason} — stopping)", "ts": time.time()})
@@ -1284,39 +1303,11 @@ class AgentBrain:
         return {"ok": True, "actions": actions, "vlm": True, "spoken": spoken, "action": action}
 
     async def _speak(self, text: str) -> None:
-        from . import audio_state, critical_words, tts
-        from .speech_clean import clean_spoken
-        text = clean_spoken(text)
-        # Never let the robot UTTER a barge-in trigger word (stop/quiet/...) — it would self-trigger the
-        # interrupt detector (no hardware AEC on this path). Sanitize before rendering. See critical_words.
-        text = critical_words.strip_reserved(text)
-        if not text:
-            return
-        self._last_spoken = text
-        try:
-            wav = tts.render_wav(text)
-            dur = audio_state.wav_duration_s(wav) if wav else 0.0
-            if wav:
-                audio_state.mark_speaking(dur, text=text)   # echo gate ON immediately (canceller added below)
-            # Robot speaker: native links that can publish audio into the call take the rendered WAV directly
-            # (keeps TTS out of the robot layer). Others get the text (browser/cloud TTS path).
-            pub = getattr(self.link, "publish_speech", None)
-            if pub and wav:
-                res = await pub(wav)
-                pid = res.get("playback_id") if isinstance(res, dict) else None
-                self._active_playback_id = pid
-                cancel = getattr(self.link, "cancel_playback", None)
-                if cancel is not None:
-                    # cancel_playback is sync + thread-safe; safe to call from the barge-in worker directly.
-                    audio_state.mark_speaking(dur, text=text,
-                                              canceller=lambda pid=pid, cancel=cancel: cancel(pid))
-            elif self.link.prefers_text_tts():
-                await self.link.say_text(text)
-            if wav:
-                await self.emit({"type": "speech", "text": text, "b64": base64.b64encode(wav).decode(),
-                                 "sr": 0, "ts": time.time()})
-        except Exception:  # noqa: BLE001
-            pass
+        # Reflex/automatic speech routes through the SAME unified SpeechService as the cortex `say` tool, so
+        # every utterance is sanitized + cancellable (playback id + canceller). Talk-toggle gating for this
+        # path is applied by the callers (e.g. _reason_vlm checks safety.check_say before calling).
+        await self.speech.speak(text)
+        self._last_spoken = self.speech.last_spoken or self._last_spoken
 
     # --- omni brain (MiniCPM-o: vision + audio + native speech, one model) ---
     # Coarse action magnitudes/durations come from `_calib_drive` (calibration profile or motion-model seeds);
@@ -1462,18 +1453,35 @@ class AgentBrain:
         await self.emit({"type": "status", "status": status, "error": self.last_error, "ts": time.time()})
 
     async def _safe_stop(self):
+        # Every stop preempts the executor: a raw link.stop() is insufficient while an action is still alive
+        # (it would resume its next pulse). preempt() cancels the active action AND issues a bounded stop.
         try:
-            await self.link.stop()
+            await self.executor.preempt("safe stop")
         except Exception:  # noqa: BLE001
             pass
+
+    async def emergency_stop(self, reason: str, *, cancel_tts: bool = False,
+                             behavior_stop: bool = False) -> None:
+        """The ONE stop path used by every STOP source (recognized STOP, barge-in, STOP tool, ToF + visual
+        reflex, manual takeover, shutdown/error). It (1) optionally cancels in-flight TTS, (2) preempts the
+        active ActionExecutor action, (3) issues an idempotent bounded robot stop, (4) updates behavior/HOLD
+        as appropriate. Safe to call when nothing is active (it just stops)."""
+        if cancel_tts:
+            from . import audio_state
+            audio_state.cancel()
+        try:
+            await self.executor.preempt(reason)
+        except Exception:  # noqa: BLE001
+            pass
+        if behavior_stop:
+            self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
 
     # --- always-respected voice commands ---
     async def _apply_command(self, intent: str, text: str, s: Settings) -> None:
         """Apply a matched voice order (preempts normal reasoning). Side effects first, then for the
         non-terminal ones let the cortex acknowledge + act under the new behavior."""
         if intent == "STOP":
-            await self._safe_stop()
-            self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
+            await self.emergency_stop("STOP command", cancel_tts=True, behavior_stop=True)
             await self.emit({"type": "thought", "text": "(stopping — holding position)", "ts": time.time()})
             await self._set_status("idle", "stopped (you told me to)")
             return
@@ -1525,16 +1533,20 @@ class AgentBrain:
         await self._set_status("asleep", "going dark (voice)")
 
     async def _back_up(self, s: Settings) -> None:
-        """A short reverse + turn to un-stick. Explicit command -> source='manual' (bypasses scope/autonomy,
-        still speed/duration-clamped)."""
+        """A short reverse + turn to un-stick, routed through the single ActionExecutor (NOT a direct
+        link.move). Explicit command -> source='manual' (bypasses scope/autonomy/HOLD, still speed/duration
+        clamped + bounded). The turn is a CHILD of the reverse; if a STOP preempts the reverse, we do NOT
+        continue into the turn (the old direct-move version could)."""
         await self.emit({"type": "thought", "text": "(backing up to get unstuck)", "ts": time.time()})
-        for ly, rx, dur in ((-0.5, 0.0, 0.6), (0.0, 0.6, 0.5)):
-            d = self.safety.check_drive(self.settings.snapshot(), ly, rx, dur, source="manual")
-            if d.allowed:
-                with contextlib.suppress(Exception):
-                    await self.link.move(d.ly, d.rx, d.duration)
-                await asyncio.sleep(dur + 0.2)
-        await self._safe_stop()
+        rev = self._calib_drive("back")
+        trn = self._calib_drive("right")
+        if rev:
+            ar = await self.executor.run_drive(rev[0], rev[1], rev[2], settings=s, source="manual")
+            if ar.state == State.CANCELLED:
+                return   # STOP interrupted the reverse — abort before the (child) turn
+            if trn:
+                await self.executor.run_drive(trn[0], trn[1], trn[2], settings=s, source="manual",
+                                              parent_id=ar.id)
         self._motion_reaction = None
         self._reflex_blocked = False
         self.behavior.clear_voice_intent()   # free to move again

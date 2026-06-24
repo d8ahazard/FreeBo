@@ -80,7 +80,11 @@ class AudioSink:
         self._cv = threading.Condition()
         self._running = False
         self._worker: Optional[threading.Thread] = None
+        self._unsub_audio = None          # MediaHub unsubscribe handle (so stop() removes our subscriber)
         self._whisper = None
+        # Normal STT and barge-in STT share ONE Faster-Whisper model; serialize access so they never run it
+        # concurrently (CTranslate2 models are not safe to call from two threads at once).
+        self._whisper_lock = threading.Lock()
         self.utterances = 0
         self.last_error: Optional[str] = None
         self._nchunks = 0
@@ -175,13 +179,26 @@ class AudioSink:
         if self.on_critical and self._bargein:
             self._bi_thread = threading.Thread(target=self._bargein_loop, name="audio-bargein", daemon=True)
             self._bi_thread.start()
-        hub.subscribe_audio(self._on_chunk)
+        self._unsub_audio = hub.subscribe_audio(self._on_chunk)
 
     def stop(self) -> None:
+        """Unsubscribe from the hub and tear the worker threads down cleanly (wake + join) so a server
+        restart leaves no duplicate subscribers or leaked threads."""
         self._running = False
+        if self._unsub_audio is not None:   # remove our hub subscriber FIRST so no new chunks arrive
+            try:
+                self._unsub_audio()
+            except Exception:  # noqa: BLE001
+                pass
+            self._unsub_audio = None
         with self._cv:
             self._cv.notify_all()
         self._bi_event.set()   # wake the barge-in worker so it can exit
+        for t in (self._worker, self._bi_thread):
+            if t is not None and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=2.0)
+        self._worker = None
+        self._bi_thread = None
 
     def _on_chunk(self, chunk) -> None:
         self._recv += 1
@@ -319,9 +336,12 @@ class AudioSink:
         audio = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
         # vad_filter=False on purpose: we already segment with our own energy VAD above, and faster-whisper's
         # internal silero VAD pulls in onnxruntime, which crashes under numpy 2 in some envs.
-        segments, _info = model.transcribe(audio, language="en", vad_filter=False,
-                                           no_speech_threshold=0.6, log_prob_threshold=-1.0,
-                                           condition_on_previous_text=False)
+        # Shared lock: normal STT and barge-in STT must never hit the one Whisper model concurrently.
+        with self._whisper_lock:
+            segments, _info = model.transcribe(audio, language="en", vad_filter=False,
+                                               no_speech_threshold=0.6, log_prob_threshold=-1.0,
+                                               condition_on_previous_text=False)
+            segments = list(segments)   # force the generator to run inside the lock (lazy decode otherwise)
         # Drop low-confidence / non-speech segments (where Whisper invents phantom phrases on noise).
         kept = []
         for s in segments:

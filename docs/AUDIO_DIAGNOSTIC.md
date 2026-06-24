@@ -1,9 +1,16 @@
 # Phase 0.3 — Air 2 listening diagnostic (findings of record)
 
+> **STATUS: NOT COMPLETE — pending a real Air 2 hardware run.** Phase 0.3 is a hardware-in-the-loop task and
+> cannot be satisfied on a dev box without the robot. The adaptive-VAD constants in
+> [`autobot/brain/audio_sink.py`](../autobot/brain/audio_sink.py) remain **provisional** until the tables below
+> are filled from a live capture. Do not mark Phase 0.3 done while this banner stands.
+>
+> Operator: run `python scripts/audio_diag.py --app http://127.0.0.1:8200 --idle 10 --speech 15` against the
+> live app (speak during the SPEECH window), then transfer the numbers into the tables here and set the final
+> constants from the observed idle-vs-speech RMS.
+
 This is the **traceability artifact** for the Phase 0.4 adaptive-VAD thresholds. The adaptive noise-floor
-clamps and enter/exit constants must be derived from the measurements recorded here, not tuned by feel. Until
-a hardware run fills the tables, the Phase 0.4 defaults are **provisional** and marked as such in
-[`autobot/brain/audio_sink.py`](../autobot/brain/audio_sink.py).
+clamps and enter/exit constants must be derived from the measurements recorded here, not tuned by feel.
 
 The listening pipeline under test is the native path:
 robot mic → Agora RTC → `AgoraNativeReceiver` (16 kHz PCM) → `MediaHub` → `AudioSink` → `brain.feed_speech`.

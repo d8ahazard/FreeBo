@@ -110,7 +110,9 @@ class VisualReflex:
     (which must schedule the actual robot stop/preempt onto the asyncio loop). Superseded frames are dropped —
     we never process a backlog. Latency is measured from frame arrival to the on_loom dispatch."""
 
-    def __init__(self, on_loom: Callable[[float], None], *, threshold: Optional[float] = None) -> None:
+    def __init__(self, on_loom: Callable[[dict], None], *, threshold: Optional[float] = None) -> None:
+        # on_loom receives a stage dict {"arrival", "detection", "score"} (monotonic times) so the consumer can
+        # measure end-to-end latency through to the stop-command dispatch (the worker can't see that step).
         self.on_loom = on_loom
         self.threshold = LOOM_THRESHOLD if threshold is None else threshold
         self._det = LoomingDetector()
@@ -119,6 +121,7 @@ class VisualReflex:
         self._event = threading.Event()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._unsub = None                # MediaHub unsubscribe handle
         self.fires = 0
         self.last_score = 0.0
         self.last_latency_ms = 0.0
@@ -129,11 +132,22 @@ class VisualReflex:
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="visual-reflex", daemon=True)
         self._thread.start()
-        hub.subscribe_video(self._on_frame)
+        self._unsub = hub.subscribe_video(self._on_frame)
 
     def stop(self) -> None:
+        """Unsubscribe + wake + join the worker so a restart leaves no duplicate subscribers / leaked threads."""
         self._running = False
+        if self._unsub is not None:
+            try:
+                self._unsub()
+            except Exception:  # noqa: BLE001
+                pass
+            self._unsub = None
         self._event.set()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._thread = None
 
     def debug(self) -> dict:
         return {"threshold": self.threshold, "fires": self.fires,
@@ -166,9 +180,10 @@ class VisualReflex:
             score = self._det.update_gray(gray)
             self.last_score = score
             if score >= self.threshold:
+                detection = time.monotonic()
                 self.fires += 1
-                self.last_latency_ms = (time.monotonic() - arrival) * 1000.0
+                self.last_latency_ms = (detection - arrival) * 1000.0   # arrival->detection (worker partial)
                 try:
-                    self.on_loom(score)
+                    self.on_loom({"arrival": arrival, "detection": detection, "score": score})
                 except Exception:  # noqa: BLE001
                     pass
