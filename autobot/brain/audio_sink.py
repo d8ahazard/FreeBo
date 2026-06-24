@@ -70,12 +70,18 @@ class AudioSink:
         self._nchunks = 0
         self._max_rms = 0
         self._last_text = ""
+        # Drop diagnostics (why a delivered chunk didn't reach the VAD) — to debug "not listening".
+        self._recv = 0
+        self._drop_empty = 0
+        self._drop_speaking = 0
+        self._drop_rms = 0
 
     def debug(self) -> dict:
-        return {"chunks": self._nchunks, "max_rms": self._max_rms, "rms_threshold": self.rms_threshold,
-                "in_speech": self._in_speech, "queued": len(self._jobs), "utterances": self.utterances,
-                "last_text": self._last_text, "last_error": self.last_error,
-                "whisper_loaded": self._whisper is not None}
+        return {"chunks": self._nchunks, "recv": self._recv, "max_rms": self._max_rms,
+                "rms_threshold": self.rms_threshold, "in_speech": self._in_speech, "queued": len(self._jobs),
+                "utterances": self.utterances, "last_text": self._last_text, "last_error": self.last_error,
+                "drop_empty": self._drop_empty, "drop_speaking": self._drop_speaking,
+                "drop_rms": self._drop_rms, "whisper_loaded": self._whisper is not None}
 
     def attach(self, hub) -> None:
         self._running = True
@@ -89,20 +95,25 @@ class AudioSink:
             self._cv.notify_all()
 
     def _on_chunk(self, chunk) -> None:
+        self._recv += 1
         pcm = chunk.pcm
         if not pcm:
+            self._drop_empty += 1
             return
         # Echo gate: while the robot is speaking its own TTS, drop mic audio (and abandon any in-progress
         # utterance) so we don't transcribe ourselves. Saves CPU too — no STT on our own voice.
         from . import audio_state
         if audio_state.is_speaking():
+            self._drop_speaking += 1
             with self._lock:
                 self._in_speech = False
                 self._buf = bytearray()
             return
         try:
             rms = audioop.rms(pcm, 2)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            self._drop_rms += 1
+            self.last_error = f"rms: {type(e).__name__}: {e}"
             return
         now = time.monotonic()
         self._nchunks += 1

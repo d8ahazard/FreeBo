@@ -16,11 +16,17 @@ _speaking_until = 0.0
 TAIL_S = 0.6
 
 
+# Hard cap on a single gate window. A bad/garbled TTS clip duration (or a miscomputed WAV rate) must never be
+# able to wedge the echo gate open for minutes and deafen the robot. No real TTS clip is longer than this.
+MAX_GATE_S = 20.0
+
+
 def mark_speaking(seconds: float) -> None:
     """Mark that the robot is speaking for ~`seconds` (clip duration); STT is muted until then + a tail."""
     global _speaking_until
+    seconds = min(max(0.0, seconds), MAX_GATE_S)
     with _lock:
-        _speaking_until = max(_speaking_until, time.time() + max(0.0, seconds) + TAIL_S)
+        _speaking_until = max(_speaking_until, time.time() + seconds + TAIL_S)
 
 
 def is_speaking() -> bool:

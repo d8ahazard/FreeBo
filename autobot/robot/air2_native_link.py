@@ -55,6 +55,7 @@ class Air2NativeLink(RobotLink):
         self._audio_req_ts = 0.0
         self._tx_audio = 0
         self._call_open = False   # have we run the 102001->102003 call-mode handshake this session?
+        self._last_audio_seen = 0   # last observed hub audio_count — re-open the mic when it stops growing
         self._paused = False      # go-dark: stop all robot I/O (drive/audio/media) but keep the session warm
 
     # --- shared session provider (used by BOTH the RTM sidecar and the RTC receiver) ---
@@ -188,11 +189,30 @@ class Air2NativeLink(RobotLink):
         once 102003 is also sent (verified live: with 102001 only, mic audio is ~zero; after 102003 it flows).
         Re-sent periodically (102003 keepalive) so it survives reconnects. This is independent of talkback —
         we need the robot's mic for STT/voice commands even when we're not publishing audio."""
-        if self._paused or not self._connected() or time.time() - self._audio_req_ts < 15:
+        if self._paused or not self._connected():
+            return
+        # Poll every 8s. The robot drops its mic stream after a while (and RTM sendMessageToPeer is flaky, so a
+        # one-shot 102001 can silently fail), so we detect liveness by whether NEW audio packets arrived since
+        # last check (recency — NOT cumulative count, which never resets). If audio stalled, re-fire the FULL
+        # 102001->102003 handshake to re-open the mic; while it's flowing, just keepalive 102003 (re-handshaking
+        # mid-stream clicks/cuts). Drive survives the same RTM flakiness because it's spammed at 10 Hz.
+        # Re-open fast when the mic has stalled (the robot drops it between handshakes, especially with outbound
+        # talk off), back off once it's flowing so we don't thrash a healthy stream.
+        cnt = self.hub.stats().get("audio_count", 0)
+        audio_live = cnt > self._last_audio_seen
+        interval = 12 if audio_live else 3
+        if time.time() - self._audio_req_ts < interval:
             return
         self._audio_req_ts = time.time()
+        self._last_audio_seen = cnt
         try:
-            await self._open_call_mode()
+            await self._open_call_mode(force=not audio_live)
+            # The robot only SUSTAINS its mic during an active TWO-WAY call: it needs to see continuous
+            # outbound audio from us (like the app does in live view), otherwise it sends one short burst after
+            # the handshake and stops. Start our G.711 publish loop (silence keepalive + any queued TTS) so the
+            # call stays open and the robot keeps streaming its mic. Idempotent (no-op once running).
+            if self._native_talk and hasattr(self.receiver, "ensure_publishing"):
+                self.receiver.ensure_publishing()
         except Exception:  # noqa: BLE001
             pass
 
@@ -295,15 +315,16 @@ class Air2NativeLink(RobotLink):
     def prefers_text_tts(self) -> bool:
         return True
 
-    async def _open_call_mode(self) -> None:
+    async def _open_call_mode(self, force: bool = False) -> None:
         """Replay the EBO app's exact CALL-MODE enable handshake so the robot actually opens its two-way audio
         path (and routes published RTP to its speaker). Sniffed from the phone:
             102001 {open:1,type:1}   # open the audio session (robot starts/accepts audio)
             ~1.5s later
             102003 {open:1,type:1}   # intercom direction app->robot ON
-        Sending 102003 alone (what we did before) does nothing — the call session was never opened. We hold it
-        open after the first call so repeated speech doesn't re-handshake (which clicks/cuts)."""
-        if self._call_open:
+        Sending 102003 alone does nothing — the call session was never opened. `force` re-sends the FULL
+        sequence (used by the retry loop while the mic hasn't started); otherwise once open we just keepalive
+        102003 (re-handshaking while audio flows clicks/cuts)."""
+        if self._call_open and not force:
             self.rtm.raw(102003, {"open": 1, "type": 1})   # keepalive — cheap, survives robot-side timeouts
             return
         self.rtm.raw(102001, {"open": 1, "type": 1})       # open audio/call session
