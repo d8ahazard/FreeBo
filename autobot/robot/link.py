@@ -70,6 +70,15 @@ class RobotLink(abc.ABC):
     @abc.abstractmethod
     async def stop(self) -> dict[str, Any]: ...
 
+    async def estop(self) -> dict[str, Any]:
+        """Hard emergency stop at the link layer. Default = a normal stop; links with a sustained-drive
+        sidecar (Air 2 native) override this to LATCH + slam a zero-frame burst so no in-flight drive resumes."""
+        return await self.stop()
+
+    async def estop_reset(self) -> dict[str, Any]:
+        """Clear a link-level E-STOP latch (permits motion again). Default no-op."""
+        return {"ok": True}
+
     @abc.abstractmethod
     async def action(self, name: str) -> dict[str, Any]: ...
 

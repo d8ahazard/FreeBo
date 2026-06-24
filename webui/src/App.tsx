@@ -3,6 +3,8 @@ import { api } from "./api";
 import { useAutobot } from "./hooks/useAutobot";
 import ControlPanel from "./components/ControlPanel";
 import NativeControlPanel from "./components/NativeControlPanel";
+import MotionReadiness from "./components/MotionReadiness";
+import MicIndicator from "./components/MicIndicator";
 import ConfigPanel from "./components/ConfigPanel";
 import SetupWizard from "./components/SetupWizard";
 import ModeBar from "./components/ModeBar";
@@ -21,11 +23,22 @@ import VoiceCommands from "./components/VoiceCommands";
 type Tab = "hud" | "memory" | "settings" | "calibrate";
 
 export default function App() {
-  const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, save } = useAutobot();
+  const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, save } = useAutobot();
   const [tab, setTab] = useState<Tab>("hud");
   const [chat, setChat] = useState("");
   const [setupDone, setSetupDone] = useState(false);
   const [logOpen, setLogOpen] = useState(true);
+  const [stopping, setStopping] = useState(false);
+  const [estopErr, setEstopErr] = useState(false);
+
+  const triggerEstop = () => {
+    setStopping(true);
+    setEstopErr(false);
+    api.estop()
+      .then((r) => { if (!(r && (r.ok || r.latched))) setEstopErr(true); })
+      .catch(() => setEstopErr(true))
+      .finally(() => setStopping(false));
+  };
 
   const sendChat = () => {
     const t = chat.trim();
@@ -62,12 +75,30 @@ export default function App() {
           <span className="ml-auto text-[11px] hud-mono text-mut hidden sm:inline">
             {settings ? `${settings.mode} · ${settings.autonomy}${brain?.behavior?.intent ? ` · ${brain.behavior.intent}` : ""} · ${brainLabel}` : ""}
           </span>
-          <button
-            onClick={() => api.estop()}
-            className="bg-bad text-white font-bold rounded-lg px-4 py-2 text-sm active:scale-95 shadow-lg shadow-bad/30 border border-bad/60"
-          >
-            ■ STOP
-          </button>
+          <MicIndicator audio={audioStatus} allowAudioIn={settings?.allow_audio_in ?? false} />
+          {estopLatched ? (
+            <div className="flex items-center gap-2">
+              <span className="bg-bad/20 text-bad font-bold rounded-lg px-3 py-2 text-sm border border-bad animate-pulse">
+                ■ E-STOP LATCHED
+              </span>
+              <button
+                onClick={() => api.estopReset()}
+                className="bg-card2 border border-line text-fg rounded-lg px-3 py-2 text-sm active:scale-95 hover:border-accent/50"
+                title="Clear the latch (does NOT enable autonomy)"
+              >
+                Reset
+              </button>
+            </div>
+          ) : (
+            <button
+              onPointerDown={triggerEstop}
+              className={`font-bold rounded-lg px-4 py-2 text-sm active:scale-95 shadow-lg border ${
+                estopErr ? "bg-bad/30 text-bad border-bad animate-pulse" : "bg-bad text-white shadow-bad/30 border-bad/60"
+              }`}
+            >
+              {stopping ? "STOPPING…" : estopErr ? "STOP FAILED — retry" : "■ STOP"}
+            </button>
+          )}
         </div>
       </header>
 
@@ -107,15 +138,16 @@ export default function App() {
                   air2 browser-bridge link uses the in-browser Agora ControlPanel. */}
               <div className="hud-panel p-3 min-w-0">
                 {settings.robot_link === "air2_native" ? (
-                  <NativeControlPanel settings={settings} t={telemetry} save={save} feed={feed} />
+                  <NativeControlPanel settings={settings} t={telemetry} save={save} feed={feed} motionLocked={estopLatched} />
                 ) : (
-                  <ControlPanel settings={settings} t={telemetry} save={save} feed={feed} />
+                  <ControlPanel settings={settings} t={telemetry} save={save} feed={feed} motionLocked={estopLatched} />
                 )}
               </div>
 
               {/* right: mode, abilities, telemetry, map */}
               <div className="flex flex-col gap-3">
                 <ModeBar settings={settings} save={save} />
+                <MotionReadiness brain={brain} settings={settings} t={telemetry} estopLatched={estopLatched} />
                 <AbilityToggles settings={settings} save={save} />
                 <OverseerPanel settings={settings} save={save} log={overseerLog} />
                 <HudTelemetry t={telemetry} />

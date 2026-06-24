@@ -15,12 +15,14 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 Autonomy = Literal["manual", "assist", "auto"]
-# Behavior mode (what the AI does with its autonomy):
-#   explore        — roam + map + look around (the default "be alive" behavior)
+# Behavior mode (what the AI does with its autonomy). The mode is the SINGLE source of truth for roaming —
+# there is no hidden override (see autobot/brain/behavior.py):
+#   observe        — stay put; rotate only to look around and comment (calm companion default; never roams)
+#   explore        — actively ROAM: greet people, idle-patrol, otherwise cover new ground ("Explore / Roam")
 #   command        — pursue a single user directive (e.g. "find and follow my cat", "come with me")
 #   conversational — stay put and only ROTATE to keep the person it's talking to in view (no roaming)
-Mode = Literal["explore", "command", "conversational"]
-MODES = ("explore", "command", "conversational")
+Mode = Literal["observe", "explore", "command", "conversational"]
+MODES = ("observe", "explore", "command", "conversational")
 RobotLinkMode = Literal["native", "mock", "native_x86", "air2", "air2_native"]
 RobotVariant = Literal["GENERIC", "SE", "AIR", "AIR2", "PRO"]
 VARIANTS = ("GENERIC", "SE", "AIR", "AIR2", "PRO")

@@ -37,11 +37,12 @@ const EYE_IDS: Record<string, number> = {
 };
 const EYE_PICKS = ["happy", "love", "curious", "surprised", "angry", "sad", "sleepy", "cool"];
 
-export default function ControlPanel({ settings, t, save, feed }: {
+export default function ControlPanel({ settings, t, feed, motionLocked = false }: {
   settings: Settings;
   t: Telemetry;
   save: (c: Partial<Settings>) => void;
   feed: FeedItem[];
+  motionLocked?: boolean;
 }) {
   const [status, setStatus] = useState("idle");
   const [connected, setConnected] = useState(false);
@@ -470,7 +471,8 @@ export default function ControlPanel({ settings, t, save, feed }: {
       <div className="grid grid-cols-[auto_1fr] gap-4 items-start">
         <div className="flex flex-col items-center gap-2">
           <div className="text-[10px] uppercase tracking-[0.2em] text-accent text-glow self-start">Manual</div>
-          <Joystick maxSpeed={settings.max_speed} onDrive={(ly, rx) => drive(ly, rx)} onStop={stop} disabled={!connected} />
+          <Joystick maxSpeed={settings.max_speed} onDrive={(ly, rx) => drive(ly, rx)} onStop={stop} disabled={!connected || motionLocked} />
+          {motionLocked && <div className="text-[10px] text-bad hud-mono mt-1">E-STOP latched · reset to drive</div>}
         </div>
         <div className="flex flex-col gap-2">
           <div className="text-[10px] uppercase tracking-[0.2em] text-accent text-glow">Eyes</div>
@@ -483,7 +485,7 @@ export default function ControlPanel({ settings, t, save, feed }: {
             ))}
           </div>
           <div className="flex flex-wrap gap-1.5 mt-1">
-            <button onClick={() => sendRtm(RTM_DOCK, null)} disabled={!connected} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⊟ Dock</button>
+            <button onClick={() => sendRtm(RTM_DOCK, null)} disabled={!connected || motionLocked} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⊟ Dock</button>
             <button onClick={() => sendRtm(RTM_AVOID, { avoidobstacle: true })} disabled={!connected} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⛨ Avoid</button>
             <button onClick={() => speakViaAgora("__test__")} disabled={!connected} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">🔊 Test</button>
           </div>

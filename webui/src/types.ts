@@ -1,6 +1,6 @@
 export type Autonomy = "manual" | "assist" | "auto";
 
-export type Mode = "explore" | "command" | "conversational";
+export type Mode = "observe" | "explore" | "command" | "conversational";
 
 export type RobotVariant = "GENERIC" | "SE" | "AIR" | "AIR2" | "PRO";
 
@@ -39,6 +39,8 @@ export interface Settings {
   owner_name: string;
   require_name: boolean;
   obey_owner_only: boolean;
+  video_max_age_s?: number;
+  telemetry_max_age_s?: number;
 }
 
 export interface TtsState {
@@ -122,10 +124,41 @@ export interface BrainStatus {
   running: boolean;
   behavior?: { scope: string; intent: string; detail?: string; voice_intent?: string | null; idle_s?: number };
   calibrated?: boolean;
+  motion_state?: string | null;
+  brain_mode?: string;
+  vlm_ok?: boolean | null;
+  // motion readiness (P0-R3.2/R3.3)
+  estop_latched?: boolean;
+  control_generation?: number;
+  hold?: boolean;
+  active_action?: { id: string; kind: string; state: string; result?: string | null } | null;
+  video_age?: number | null;
+  telemetry_age?: number | null;
+  motion_block_reason?: string;
+  motion_ready?: boolean;
+}
+
+export interface AudioStatus {
+  enabled: boolean;
+  stream_live: boolean;
+  last_audio_age_ms: number | null;
+  state: string;
+  current_rms: number;
+  noise_floor: number;
+  enter_threshold: number;
+  exit_threshold: number;
+  vad_active: boolean;
+  stt_active: boolean;
+  stt_queue_depth: number;
+  speaking: boolean;
+  bargein_ready: boolean;
+  last_transcript: string;
+  last_transcript_ts: number | null;
+  error: string | null;
 }
 
 export type AutobotEvent =
-  | { type: "hello"; settings: Settings; brain: BrainStatus; tts: TtsState; identity?: Identity }
+  | { type: "hello"; settings: Settings; brain: BrainStatus; tts: TtsState; identity?: Identity; audio?: AudioStatus }
   | { type: "settings"; changed: string[]; settings: Settings }
   | { type: "telemetry"; telemetry: Telemetry }
   | { type: "thought"; text: string; ts: number }
@@ -135,7 +168,9 @@ export type AutobotEvent =
   | { type: "status"; status: string; error: string | null; ts: number }
   | { type: "speech"; text: string; b64: string; sr: number; ts: number }
   | { type: "error"; error: string; ts: number }
-  | { type: "estop"; ok: boolean }
+  | { type: "estop"; ok: boolean; latched?: boolean; generation?: number }
+  | { type: "estop_reset"; ok: boolean; latched?: boolean }
+  | { type: "audio_status"; audio: AudioStatus; ts: number }
   | { type: "approval_request"; id: string; tool: string; args: Record<string, unknown>; requester: string; reason: string; ts: number }
   | { type: "approval_resolved"; id: string; approved: boolean; ts: number }
   | { type: "proposal"; seq: number; verb: string; args: Record<string, unknown>; ts: number }

@@ -241,7 +241,49 @@ need a torch/triton pair where `torch.compile` works. The global Python had a br
   fresh frame => UNKNOWN, never a false STUCK; circuit-breaker HOLD after 2 non-progress attempts. See
   docs/MOTION.md (Phase 0 changes).
 
+## Live-control regression fix (P0-R3)
+
+- **Acknowledged commands (no false `ok=true`)**: `rtm_sidecar.js` emits a correlated `command_result`
+  (`command_id`, `sent_to_agora`, `error`, dispatch/completion ts) for each drive/stop/eyes/dock initial send;
+  `RtmNode.send_acked()` writes the command + a monotonic `command_id` and blocks (bounded) for the matching
+  result. `Air2NativeLink.drive/move/stop/action(eyes)` return REAL Agora delivery (`ok == sent_to_agora`),
+  never stdin-write success. `/api/debug/rtm.command_delivery` exposes last ok/fail send, last id, pending
+  count, ack latency, consecutive send failures.
+- **Latched E-STOP** (`SafetyFloor.estop_latched` + `control_generation`): `/api/estop` sets the latch FIRST
+  (sync, before any await), bumps the generation, cancels TTS, preempts the executor, sends the sidecar
+  `estop` (refuse further drive frames + zero-frame burst at 0/50/100/200 ms, drop stale-generation repeats),
+  and drops to manual. `check_drive()` returns `estop_latched` for EVERY source (ai/recovery/manual/overseer)
+  until `/api/estop/reset`. Reset permits motion again but does NOT re-enable autonomy.
+- **Mode contract**: roaming is decided PURELY by the user-visible mode (no hidden `AUTOBOT_ACTIVE_EXPLORE`):
+  `observe` (rotate-only, never roams), `explore` (actively roams: greet/patrol/cover ground), `command`,
+  `conversational`. The UI `MotionReadiness` panel shows the single exact block/ready/moving reason from
+  `brain.status_dict()` (`estop_latched`, `hold`, `active_action`, `video_age`, `telemetry_age`,
+  `motion_block_reason`).
+- **Listening indicator**: `AudioSink.audio_status()` derives an explicit state (OFF / NO MIC STREAM /
+  LISTENING / HEARING SPEECH / TRANSCRIBING / HEARD / SPEAKING-ECHO-GATED / ERROR); the server emits
+  `audio_status` over the WS at ~8 Hz while active (state-change immediate, ~1 Hz idle heartbeat), included in
+  `hello`/`/api/state`. Header `MicIndicator` shows it with a live input meter + the last transcript.
+
+## Frontend build (the server serves `webui/dist`, not the TS source)
+
+After ANY UI change you MUST rebuild and test the PRODUCTION build (the running app serves `webui/dist` via
+`StaticFiles`, mounting `dist/assets` and `dist/index.html` — Vite dev mode is NOT what ships):
+
+```
+cd webui && npm run build      # -> webui/dist with fresh hashed assets
+```
+
+Then hard-refresh (or restart the app) and confirm the served `dist/index.html` references the new
+`assets/index-<hash>.js`. `npm run dev` (Vite) is for local iteration only.
+
 ## DO NOT REGRESS
+- A `drive`/`move`/`stop` API result of `ok=true` MUST mean Agora accepted the send (`sent_to_agora`), not
+  that the sidecar stdin accepted JSON. Keep `send_acked` + `command_result` correlation.
+- E-STOP is a LATCH, not a one-shot: set it before awaiting, enforce it in `check_drive` for every source and
+  in the sidecar (refuse drives + zero-burst + drop stale generation), and require an explicit reset.
+- Do NOT reintroduce a hidden env switch that makes a selected UI mode behave differently — mode is the single
+  source of truth for roaming.
+- Rebuild `webui/dist` after UI changes (see above) — editing the TS source alone does not change what ships.
 - Keep the `101005` 2 s keepalive and sustained drive.
 - Keep the frame-stall watchdog and the keyframe-gate / seq-gap drop.
 - Telemetry comes as COMPRESSED RAW RTM peer messages — read `m.rawMessage` + inflate, parse NESTED

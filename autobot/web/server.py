@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections import deque
 from pathlib import Path
 
@@ -163,6 +164,7 @@ async def _startup():
     except Exception:  # noqa: BLE001
         pass
     asyncio.create_task(_telemetry_poller())
+    asyncio.create_task(_audio_status_poller())
     asyncio.create_task(_daily_memory_task())
 
 
@@ -241,6 +243,28 @@ async def _telemetry_poller():
         await asyncio.sleep(1.5)
 
 
+async def _audio_status_poller():
+    """Push the live mic status to the UI for the permanent listening indicator. Rate-limited: emits the
+    moment the explicit state changes, ~8 Hz while active (VAD/STT/speaking, so the level meter moves), and a
+    ~1 Hz heartbeat when idle — never one event per PCM packet."""
+    last_state = None
+    last_emit = 0.0
+    while True:
+        await asyncio.sleep(0.125)   # ~8 Hz tick
+        if AUDIO_SINK is None or not _ws_clients or not hasattr(AUDIO_SINK, "audio_status"):
+            continue
+        try:
+            a = AUDIO_SINK.audio_status()
+        except Exception:  # noqa: BLE001
+            continue
+        now = time.monotonic()
+        active = a["vad_active"] or a["stt_active"] or a["speaking"]
+        if a["state"] != last_state or active or (now - last_emit) >= 1.0:
+            await emit({"type": "audio_status", "audio": a, "ts": time.time()})
+            last_state = a["state"]
+            last_emit = now
+
+
 async def _daily_memory_task():
     """Run the heavy-model memory cleanup ~once a day. First pass ~24h after boot."""
     import time as _t
@@ -274,6 +298,7 @@ def _state_payload() -> dict:
             "pending": IDENTITY.pending(),
         },
         "setup": {"complete": s.setup_complete},
+        "audio": (AUDIO_SINK.audio_status() if (AUDIO_SINK and hasattr(AUDIO_SINK, "audio_status")) else None),
     }
 
 
@@ -418,14 +443,29 @@ async def api_settings(req: Request):
 
 @app.post("/api/estop")
 async def api_estop():
-    """Emergency stop: preempt any active action, stop the robot, and drop to manual so the AI won't re-drive."""
+    """LATCHED emergency stop. The latch is set FIRST (synchronously, before any await) so every motion path
+    is blocked immediately; then we cancel TTS, preempt the executor, slam a link-level zero-frame burst, and
+    drop to manual. Motion stays blocked until /api/estop/reset."""
+    gen = brain.safety.estop_latch()        # set the gate NOW, before awaiting anything
     SETTINGS.update(autonomy="manual")
     with contextlib.suppress(Exception):
-        await brain.emergency_stop("estop", cancel_tts=True)
-    res = await LINK.stop()
-    await emit({"type": "estop", "ok": res.get("ok", False)})
+        await brain.emergency_stop("estop", cancel_tts=True, latch=True)
+    with contextlib.suppress(Exception):
+        await LINK.stop()
+    await emit({"type": "estop", "ok": True, "latched": True, "generation": gen})
     await emit({"type": "settings", "changed": ["autonomy"], "settings": SETTINGS.public_dict()})
-    return JSONResponse({"ok": res.get("ok", False)})
+    return JSONResponse({"ok": True, "latched": True, "generation": gen})
+
+
+@app.post("/api/estop/reset")
+async def api_estop_reset():
+    """Clear the E-STOP latch so motion is PERMITTED again. Does NOT enable autonomous movement (autonomy
+    stays manual); the operator re-enables Auto/Move deliberately."""
+    brain.safety.estop_reset()
+    with contextlib.suppress(Exception):
+        await LINK.estop_reset()
+    await emit({"type": "estop_reset", "ok": True, "latched": False})
+    return JSONResponse({"ok": True, "latched": False})
 
 
 # Remembers the autonomy mode in force before going dark, so Wake restores it (not just "auto").
@@ -624,6 +664,8 @@ async def api_calibrate():
     how much the camera view changes, and saves a motion profile. Always e-stops afterward."""
     from ..brain import motion_profile as mp
     s = SETTINGS.snapshot()
+    if brain.safety.is_latched():
+        return JSONResponse({"ok": False, "blocked": "estop_latched"})
     if s.asleep:
         return JSONResponse({"ok": False, "error": "asleep (wake first)"})
     if not s.allow_motion:
@@ -797,6 +839,9 @@ async def api_debug_rtm():
     return JSONResponse({
         "rtm_connected": getattr(rtm, "connected", None),
         "rtm_status": getattr(rtm, "status", {}),
+        # Command-delivery instrumentation (P0-R3.1): last ok/failed send, last command id + ack latency,
+        # pending acks, consecutive send failures, RTM state.
+        "command_delivery": rtm.debug() if (rtm and hasattr(rtm, "debug")) else {},
         "rtm_logs": rtm.recent_logs()[-30:] if rtm else [],
         "receiver_telemetry": getattr(recv, "telemetry", {}),
         "ws_types": list(getattr(recv, "_seen_types", []) or []),

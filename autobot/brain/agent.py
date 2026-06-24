@@ -745,13 +745,18 @@ class AgentBrain:
                     "enforces this).\n"
                     "- Focus on listening and replying naturally. Use your eyes and (if enabled) voice to be "
                     "engaging. Track the speaker with small turns; otherwise hold still.")
-        return ("YOUR CURRENT MODE: COMPANION (home).\n"
-                "- You are a calm, curious companion living in the home. MOST of the time you stay put and "
-                "watch, turning in place to look around and commenting on what's new or interesting. You do "
-                "NOT roam constantly.\n"
-                "- The 'RIGHT NOW' line below tells you exactly what to do this moment (observe, go greet "
-                "someone, patrol, etc.). Follow it. When it says observe, do not drive across the room.\n"
-                "- When you DO move, steer using WHAT YOUR EYES SEE: aim for the open paths it reports and turn "
+        if mode == "observe":
+            return ("YOUR CURRENT MODE: OBSERVE.\n"
+                    "- Stay where you are. You may ONLY rotate in place to look around — do NOT drive across "
+                    "the room (the system enforces this).\n"
+                    "- Watch your surroundings and call out anything new or noteworthy (a person or pet, an "
+                    "open door/window, a spill or mess, anything unusual); `remember` it and `send_alert` if "
+                    "it matters. Be a calm, attentive presence.")
+        # explore (and any unknown mode) -> active home companion that roams with a reason
+        return ("YOUR CURRENT MODE: EXPLORE (home companion).\n"
+                "- You actively roam the home: greet people, take short idle patrols, and otherwise cover new "
+                "ground. The 'RIGHT NOW' line below tells you exactly what to do this moment — follow it.\n"
+                "- When you move, steer using WHAT YOUR EYES SEE: aim for the open paths it reports and turn "
                 "away from anything close ahead. You have NO physical bumper — if a reflex stops you, turn to a "
                 "clear direction instead of pushing forward. Name and remember notable things/places.")
 
@@ -1476,11 +1481,14 @@ class AgentBrain:
             pass
 
     async def emergency_stop(self, reason: str, *, cancel_tts: bool = False,
-                             behavior_stop: bool = False) -> None:
+                             behavior_stop: bool = False, latch: bool = False) -> None:
         """The ONE stop path used by every STOP source (recognized STOP, barge-in, STOP tool, ToF + visual
-        reflex, manual takeover, shutdown/error). It (1) optionally cancels in-flight TTS, (2) preempts the
-        active ActionExecutor action, (3) issues an idempotent bounded robot stop, (4) updates behavior/HOLD
-        as appropriate. Safe to call when nothing is active (it just stops)."""
+        reflex, manual takeover, shutdown/error). It (1) optionally LATCHES the global E-STOP, (2) cancels
+        in-flight TTS, (3) preempts the active ActionExecutor action, (4) issues an idempotent bounded robot
+        stop (and a latched hard-stop burst at the link layer when latching), (5) updates behavior/HOLD.
+        Safe to call when nothing is active (it just stops)."""
+        if latch:
+            self.safety.estop_latch()   # sync; sets the gate immediately (server also latches before await)
         if cancel_tts:
             from . import audio_state
             audio_state.cancel()
@@ -1488,6 +1496,13 @@ class AgentBrain:
             await self.executor.preempt(reason)
         except Exception:  # noqa: BLE001
             pass
+        if latch:
+            est = getattr(self.link, "estop", None)
+            if est is not None:
+                try:
+                    await est()   # link-level latched hard stop (Air 2: refuse drives + zero-frame burst)
+                except Exception:  # noqa: BLE001
+                    pass
         if behavior_stop:
             self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
 
@@ -1563,8 +1578,40 @@ class AgentBrain:
         self._reflex_blocked = False
         self.behavior.clear_voice_intent()   # free to move again
 
+    def _video_age(self) -> float | None:
+        """Seconds since the last camera frame reached the perception buffer (None if none yet)."""
+        return (time.time() - self.buffer.frame_ts) if self.buffer.frame_ts else None
+
+    def _motion_block_reason(self, s: Settings) -> str:
+        """The SINGLE exact reason AI motion is blocked right now, or '' when ready. Mirrors the gates the
+        executor/safety floor actually enforce, in priority order, so the UI can show one clear verdict."""
+        if self.safety.is_latched():
+            return "E-STOP latched"
+        if getattr(s, "asleep", False):
+            return "asleep"
+        if not s.allow_motion:
+            return "Move ability off"
+        if s.autonomy == "manual":
+            return "autonomy is manual"
+        t = self.buffer.telemetry or {}
+        if self._resting(t):
+            return "robot resting/docked"
+        if getattr(s, "require_calibration", True) and self.motion_profile is None:
+            return "not calibrated"
+        if self.executor.in_hold():
+            return "circuit-breaker HOLD"
+        age = t.get("telemetry_age")
+        if isinstance(age, (int, float)) and age > getattr(s, "telemetry_max_age_s", 5.0):
+            return "stale telemetry"
+        v = self._video_age()
+        if v is not None and v > getattr(s, "video_max_age_s", 2.0):
+            return "stale video"
+        return ""
+
     def status_dict(self) -> dict:
         s = self.settings.snapshot()
+        act = self.executor.active()
+        block = self._motion_block_reason(s)
         return {
             "status": self.status,
             "error": self.last_error,
@@ -1580,4 +1627,13 @@ class AgentBrain:
             "brain_mode": brain_mode(s),
             "vlm_ok": self._vlm_ok,
             "metrics": self.metrics.summary(),
+            # Motion readiness (P0-R3.2/R3.3): one place the UI reads to know whether/why the robot can move.
+            "estop_latched": self.safety.is_latched(),
+            "control_generation": self.safety.control_generation(),
+            "hold": self.executor.in_hold(),
+            "active_action": (act.to_dict() if act else None),
+            "video_age": (round(self._video_age(), 2) if self._video_age() is not None else None),
+            "telemetry_age": (self.buffer.telemetry or {}).get("telemetry_age"),
+            "motion_block_reason": block,
+            "motion_ready": (block == ""),
         }

@@ -23,10 +23,10 @@ class BehaviorSkill(Skill):
 
     def tools(self, ctx: SkillContext) -> list[ToolDef]:
         return [
-            ToolDef(fn_schema("set_mode", "Change what you're doing: explore (roam the home), conversational (stay put and chat), or command (pursue a directive). Use when asked to go explore / settle down / follow an order.", {
+            ToolDef(fn_schema("set_mode", "Change what you're doing: observe (stay put and watch), explore (roam the home), conversational (stay put and chat), or command (pursue a directive). Use when asked to go explore / settle down / just watch / follow an order.", {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "enum": ["explore", "conversational", "command"]},
+                    "mode": {"type": "string", "enum": ["observe", "explore", "conversational", "command"]},
                     "directive": {"type": "string", "description": "For command mode: what to pursue."},
                 },
                 "required": ["mode"],
@@ -43,8 +43,8 @@ class BehaviorSkill(Skill):
     def _make_set_mode(self, ctx: SkillContext):
         async def h(a: dict) -> dict:
             mode = str(a.get("mode", "")).strip()
-            if mode not in ("explore", "conversational", "command"):
-                return {"ok": False, "error": "mode must be explore|conversational|command"}
+            if mode not in ("observe", "explore", "conversational", "command"):
+                return {"ok": False, "error": "mode must be observe|explore|conversational|command"}
             changes = {"mode": mode}
             if mode in ("explore", "command"):
                 changes["autonomy"] = "auto"   # actually act on it (per the spoken-owner policy)

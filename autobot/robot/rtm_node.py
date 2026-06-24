@@ -11,6 +11,7 @@ thread parses stdout events; stderr (SDK logs) is drained separately so the pipe
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import shutil
@@ -45,6 +46,16 @@ class RtmNode:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._logs: deque[str] = deque(maxlen=300)
+        # --- command acknowledgment (P0-R3.1): correlate each acked command to the sidecar's real Agora send
+        #     result, so callers learn ACTUAL delivery instead of stdin-write success. ---
+        self._cmd_ids = itertools.count(1)
+        self._pending: dict[int, dict] = {}      # command_id -> {event, result}
+        self._pending_lock = threading.Lock()
+        self.last_ok_send: Optional[dict] = None
+        self.last_fail_send: Optional[dict] = None
+        self.last_command_id: Optional[int] = None
+        self.last_ack_ms: Optional[float] = None
+        self.consecutive_send_failures = 0
 
     # --- lifecycle ---
     def start(self) -> None:
@@ -172,6 +183,16 @@ class RtmNode:
                 self.status[k] = v
             self.status["connected"] = True
             self._status_ts = time.monotonic()   # genuine source-update time (NOT a request time)
+        elif t == "command_result":
+            cid = ev.get("command_id")
+            if cid is not None:
+                with self._pending_lock:
+                    slot = self._pending.get(cid)
+                if slot is not None:
+                    slot["result"] = ev
+                    slot["event"].set()
+        elif t == "stat":
+            self.consecutive_send_failures = int(ev.get("consecutive_send_failures", 0) or 0)
         elif t == "log":
             self._logs.append(f"[{ev.get('level')}] {ev.get('msg')}")
         if self.on_event:
@@ -225,6 +246,57 @@ class RtmNode:
 
     def raw(self, msg_id: int, data: dict | None = None) -> bool:
         return self._send({"cmd": "raw", "id": msg_id, "data": data or {}})
+
+    # --- acknowledged commands (real Agora delivery, not pipe-write) ---
+    def send_acked(self, cmd: dict, timeout: float = 1.5) -> dict:
+        """Send a command and BLOCK (bounded) for the sidecar's correlated command_result, returning ACTUAL
+        Agora delivery. Call off the event loop (asyncio.to_thread). Returns:
+        {ok, queued_to_sidecar, sent_to_agora, command_id, ack_ms, rtm_connected, error}."""
+        cid = next(self._cmd_ids)
+        out = {"ok": False, "queued_to_sidecar": False, "sent_to_agora": False, "command_id": cid,
+               "ack_ms": None, "rtm_connected": self.connected, "error": None}
+        evt = threading.Event()
+        with self._pending_lock:
+            self._pending[cid] = {"event": evt, "result": None}
+        t0 = time.monotonic()
+        if not self._send({**cmd, "command_id": cid}):
+            with self._pending_lock:
+                self._pending.pop(cid, None)
+            out["error"] = "sidecar stdin unavailable"
+            self.last_fail_send = out
+            return out
+        out["queued_to_sidecar"] = True
+        got = evt.wait(timeout)
+        with self._pending_lock:
+            slot = self._pending.pop(cid, None)
+        res = (slot or {}).get("result")
+        out["ack_ms"] = round((time.monotonic() - t0) * 1000.0, 1)
+        out["rtm_connected"] = self.connected
+        self.last_command_id = cid
+        self.last_ack_ms = out["ack_ms"]
+        if not got or res is None:
+            out["error"] = "ack timeout"
+            self.last_fail_send = {**out, "cmd": cmd.get("cmd")}
+            return out
+        out["sent_to_agora"] = bool(res.get("sent_to_agora"))
+        out["ok"] = out["sent_to_agora"]
+        out["error"] = res.get("error")
+        rec = {**out, "cmd": cmd.get("cmd")}
+        if out["ok"]:
+            self.last_ok_send = rec
+        else:
+            self.last_fail_send = rec
+        return out
+
+    def debug(self) -> dict:
+        with self._pending_lock:
+            pending = len(self._pending)
+        return {"rtm_connected": self.connected, "last_error": self.last_error,
+                "last_command_id": self.last_command_id, "last_ack_ms": self.last_ack_ms,
+                "pending": pending, "consecutive_send_failures": self.consecutive_send_failures,
+                "last_ok_send": self.last_ok_send, "last_fail_send": self.last_fail_send,
+                "status_age_s": round(self.status_age(), 2) if self._status_ts else None,
+                "recent_logs": list(self._logs)[-20:]}
 
     def recent_logs(self) -> list[str]:
         return list(self._logs)

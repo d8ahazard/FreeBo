@@ -260,15 +260,25 @@ class Air2NativeLink(RobotLink):
 
     # --- control (native RTM) ---
     async def drive(self, ly: float, rx: float) -> dict[str, Any]:
-        ok = self.rtm.drive(ly, rx, 0.0)
-        return {"ok": ok, "ly": ly, "rx": rx}
+        # ACKNOWLEDGED: ok reflects real Agora delivery (command_result), not a sidecar stdin write.
+        res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0})
+        return {**res, "ly": ly, "rx": rx}
 
     async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
-        ok = self.rtm.drive(ly, rx, duration)
-        return {"ok": ok, "ly": ly, "rx": rx, "duration": duration}
+        res = await asyncio.to_thread(self.rtm.send_acked,
+                                      {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration})
+        return {**res, "ly": ly, "rx": rx, "duration": duration}
 
     async def stop(self) -> dict[str, Any]:
-        return {"ok": self.rtm.stop()}
+        return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "stop"})
+
+    async def estop(self) -> dict[str, Any]:
+        """Latched hard stop: the sidecar refuses all further drive frames + slams a zero-frame burst, so an
+        in-flight sustained drive cannot resume. Short ack timeout (the burst is fire-and-forget regardless)."""
+        return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "estop"}, 0.8)
+
+    async def estop_reset(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "estop_reset"}, 0.8)
 
     async def action(self, name: str) -> dict[str, Any]:
         n = (name or "").lower()
@@ -276,10 +286,12 @@ class Air2NativeLink(RobotLink):
             state = n[len("eyes_"):]
             if state in _EYE_STATES:
                 self.rtm.status["eyes"] = state
-                return {"ok": self.rtm.eyes(state), "eyes": state}
+                res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "eyes", "state": state})
+                return {**res, "eyes": state}
             return {"ok": False, "error": f"unknown eye state {state}"}
         if n == "dock":
-            return {"ok": self.rtm.dock(), "docking": True}
+            res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "dock"})
+            return {**res, "docking": True}
         if n.startswith("avoid"):
             return {"ok": self.rtm.avoid(n != "avoid_off")}
         if n.startswith("laser"):

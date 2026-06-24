@@ -7,14 +7,17 @@ SCOPE that the safety floor hard-enforces, plus an INTENT that shapes the prompt
   * adjust — may only rotate in place to look/track (observe / converse). No translation.
   * hold   — no motion at all (stopped / resting / asleep).
 
-Default is OBSERVE (adjust): the robot mostly watches and comments. Roaming only unlocks for a reason:
-  - it sees a person -> GREET (approach + say hi),
-  - it's been idle a while -> PATROL (a short look around the house for anything noteworthy),
-  - it's in command/conversational mode, or
-  - a voice order set an override (go explore / come here / go home / stop).
+Behavior is now decided PURELY by the user-visible `mode` (no hidden env switch — the UI label must match
+what the robot does):
 
-`mode == explore` is the "alive at home" companion mode and runs this whole state machine; it does NOT mean
-"drive constantly". Voice "go explore" sets a stronger, time-boxed ACTIVE-explore override that does roam.
+  * observe       — stay put; rotate only to look around and comment. Never roams. (Calm companion default.)
+  * explore       — the "alive at home" companion state machine that ACTIVELY roams: greet new people,
+                    idle-patrol, otherwise cover new ground. (Roaming still passes the safety floor, which
+                    requires autonomy=auto + Move enabled + calibration + freshness + no E-STOP latch.)
+  * command       — pursue the current directive.
+  * conversational — stay put and track the speaker.
+
+A spoken order can set a time-boxed override on top of any mode (go explore / come here / go home / stop).
 """
 from __future__ import annotations
 
@@ -46,15 +49,8 @@ class BehaviorController:
         self._voice_intent: str | None = None   # "stopped"|"explore"|"pursue"|"return"
         self._voice_until = 0.0
         self._voice_detail = ""
-        # Active explore (default OFF — Phase 0): in `explore` mode the idle fallback can ROAM (drive around in
-        # short steps) instead of standing still and observing. Default-off makes the calm companion the
-        # baseline; set AUTOBOT_ACTIVE_EXPLORE=1 to opt back into continuous roaming. Re-enabling by default is
-        # gated on the Phase 0 motion acceptance suite passing (see docs/MOTION.md). Greet/patrol/command/voice
-        # overrides still take precedence either way.
-        self.active_explore = os.environ.get("AUTOBOT_ACTIVE_EXPLORE", "0").strip().lower() in (
-            "1", "true", "yes", "on")
-        self.current = Behavior(ROAM if self.active_explore else ADJUST,
-                                "explore_active" if self.active_explore else "observe")
+        # Start calm (observe). decide() recomputes the scope/intent from the active mode every reason cycle.
+        self.current = Behavior(ADJUST, "observe")
 
     # --- external signals ---
     def note_activity(self) -> None:
@@ -96,13 +92,18 @@ class BehaviorController:
         if voice == "return":
             return self._set(ROAM, "return")
 
-        mode = getattr(s, "mode", "explore")
+        mode = getattr(s, "mode", "observe")
+        # OBSERVE: explicit calm mode — stay put (rotate only), never roam/greet-approach/patrol.
+        if mode == "observe":
+            return self._set(ADJUST, "observe")
+        # COMMAND: pursue the directive.
         if mode == "command" and (getattr(s, "directive", "") or "").strip():
             return self._set(ROAM, "pursue", s.directive.strip())
+        # CONVERSE: stay put, track the speaker.
         if mode == "conversational":
             return self._set(ADJUST, "converse")
 
-        # --- explore = companion behavior (observe by default; roam only for a reason) ---
+        # --- explore = companion behavior: greet/patrol, otherwise ACTIVELY roam (Explore means Roam) ---
         if now < self._patrol_until:
             return self._set(ROAM, "patrol")
         if present_people:
@@ -118,10 +119,9 @@ class BehaviorController:
             self._last_patrol = now
             self._patrol_until = now + self.patrol_duration
             return self._set(ROAM, "patrol")
-        # Default: actively explore (drive around in short steps) unless the user opted into calm-observe.
-        if self.active_explore:
-            return self._set(ROAM, "explore_active")
-        return self._set(ADJUST, "observe")
+        # Default in explore: actively roam to cover new ground. The safety floor still gates actual motion on
+        # autonomy=auto + Move + calibration + freshness + no E-STOP latch.
+        return self._set(ROAM, "explore_active")
 
     def _set(self, scope: str, intent: str, detail: str = "") -> Behavior:
         self.current = Behavior(scope, intent, detail)

@@ -25,12 +25,11 @@ async def test_brain_vlm_tick_drives_through_executor(tmp_path, monkeypatch):
     from autobot.config import SETTINGS
 
     monkeypatch.setenv("AUTOBOT_AI_PROVIDER", "vlm")   # force the modular vision brain (legacy env trigger)
-    # Phase 0 default is calm-observe (scope=adjust, rotate-only). This test verifies the VLM "forward"
-    # decision actually drives, so opt into active roaming explicitly (must be set BEFORE the brain — and its
-    # BehaviorController — is constructed). See docs/MOTION.md (Phase 0 acceptance gate).
-    monkeypatch.setenv("AUTOBOT_ACTIVE_EXPLORE", "1")
+    # This test verifies the VLM "forward" decision actually drives, so run in EXPLORE mode (which actively
+    # roams under the P0-R3.3 mode contract — no hidden env switch anymore). 'observe' would correctly hold.
     SETTINGS.update(setup_complete=True, autonomy="auto", allow_motion=True, allow_think=True,
-                    allow_video=True, talk_enabled=False, confirm_motion=True, ai_provider="vlm")
+                    allow_video=True, talk_enabled=False, confirm_motion=True, ai_provider="vlm",
+                    mode="explore")
 
     async def fake_decide(self, **kwargs):
         return {"action": "forward", "text": "", "eyes": "curious"}

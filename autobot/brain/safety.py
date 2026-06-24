@@ -30,6 +30,11 @@ class SafetyFloor:
         self._actions_this_tick = 0
         self._scope = "roam"   # movement scope for this cycle: roam | adjust (rotate only) | hold (no motion)
         self._quiet_until = 0.0  # 'shut up' window: drop `say` until this time
+        # Latched emergency stop (P0-R3.2): a STATE, not a one-shot. While latched, EVERY motion source is
+        # rejected (ai/recovery/manual/overseer) until an explicit reset. Bumping the control generation on
+        # latch lets the sidecar drop any in-flight/stale drive frames from before the stop.
+        self._estop_latched = False
+        self._control_generation = 0
 
     def begin_tick(self):
         self._tick_start = time.monotonic()
@@ -53,6 +58,10 @@ class SafetyFloor:
         puppeting the robot in overseer mode) are only speed/duration-clamped — the human is in control, so
         they bypass the AI motion/autonomy/rate gates but still cannot exceed the speed/duration caps (the
         speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
+        # Latched E-STOP is the hardest gate — it blocks EVERY source (manual/overseer included). Nothing
+        # moves until /api/estop/reset clears the latch.
+        if self._estop_latched:
+            return Decision(False, "estop_latched")
         ai = source in ("ai", "recovery")
         if ai and not getattr(s, "allow_motion", True):
             return Decision(False, "motion disabled by the user (Control toggle)")
@@ -74,6 +83,24 @@ class SafetyFloor:
         ly, rx = _clamp_vector(ly, rx, s.max_speed)
         duration = max(0.0, min(float(duration or 0.0), s.max_move_duration))
         return Decision(True, "", ly=ly, rx=rx, duration=duration)
+
+    # --- latched emergency stop ---
+    def estop_latch(self) -> int:
+        """Latch the emergency stop (blocks all motion) and bump the control generation. Returns the new
+        generation so the caller can invalidate older in-flight drive commands. Idempotent."""
+        self._estop_latched = True
+        self._control_generation += 1
+        return self._control_generation
+
+    def estop_reset(self) -> None:
+        """Clear the latch so motion is PERMITTED again (does NOT, by itself, enable autonomous movement)."""
+        self._estop_latched = False
+
+    def is_latched(self) -> bool:
+        return self._estop_latched
+
+    def control_generation(self) -> int:
+        return self._control_generation
 
     def set_quiet(self, seconds: float) -> None:
         """'Shut up' — drop `say` for this many seconds (a temporary hush, distinct from the talk toggle)."""

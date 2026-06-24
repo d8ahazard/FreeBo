@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, connectWs } from "../api";
-import type { AutobotEvent, BrainStatus, FeedItem, Identity, OverseerLogItem, PendingApproval, Settings, Telemetry, TtsState } from "../types";
+import type { AudioStatus, AutobotEvent, BrainStatus, FeedItem, Identity, OverseerLogItem, PendingApproval, Settings, Telemetry, TtsState } from "../types";
 
 let _feedId = 0;
 let _overseerId = 0;
@@ -15,6 +15,8 @@ export function useAutobot() {
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [overseerLog, setOverseerLog] = useState<OverseerLogItem[]>([]);
   const [connected, setConnected] = useState(false);
+  const [estopLatched, setEstopLatched] = useState(false);
+  const [audioStatus, setAudioStatus] = useState<AudioStatus | null>(null);
 
   const pushFeed = useCallback((item: Omit<FeedItem, "id">) => {
     setFeed((f) => {
@@ -38,6 +40,8 @@ export function useAutobot() {
           setSettings(e.settings);
           setBrain(e.brain);
           setTts(e.tts);
+          if (typeof e.brain?.estop_latched === "boolean") setEstopLatched(e.brain.estop_latched);
+          if (e.audio) setAudioStatus(e.audio);
           if (e.identity) {
             setIdentity(e.identity);
             setApprovals(e.identity.pending ?? []);
@@ -75,7 +79,15 @@ export function useAutobot() {
           pushFeed({ kind: "error", text: e.error, ts: e.ts });
           break;
         case "estop":
-          pushFeed({ kind: "estop", text: "Emergency stop — autonomy set to manual", ts: Date.now() / 1000 });
+          setEstopLatched(true);
+          pushFeed({ kind: "estop", text: "E-STOP LATCHED — motion blocked until reset", ts: Date.now() / 1000 });
+          break;
+        case "estop_reset":
+          setEstopLatched(false);
+          pushFeed({ kind: "estop", text: "E-STOP reset — motion permitted (still manual)", ts: Date.now() / 1000 });
+          break;
+        case "audio_status":
+          setAudioStatus(e.audio);
           break;
         case "approval_request":
           setApprovals((a) => [...a.filter((p) => p.id !== e.id), { id: e.id, tool: e.tool, args: e.args, requester: e.requester, reason: e.reason, ts: e.ts }]);
@@ -101,6 +113,8 @@ export function useAutobot() {
       setSettings(s.settings);
       setBrain(s.brain);
       setTts(s.tts);
+      if (typeof s.brain?.estop_latched === "boolean") setEstopLatched(s.brain.estop_latched);
+      if (s.audio) setAudioStatus(s.audio);
       if (s.identity) {
         setIdentity(s.identity);
         setApprovals(s.identity.pending ?? []);
@@ -116,5 +130,5 @@ export function useAutobot() {
     return res;
   }, []);
 
-  return { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, save, pushFeed };
+  return { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, save, pushFeed };
 }

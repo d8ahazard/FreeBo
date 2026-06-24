@@ -96,6 +96,12 @@ class AudioSink:
         self._drop_empty = 0
         self._drop_speaking = 0
         self._drop_rms = 0
+        # --- live operational status (P0-R3.4): what the mic is doing RIGHT NOW, for the header indicator ---
+        self._last_chunk_ts = 0.0     # wall time of the last audio chunk (stream liveness)
+        self._last_rms = 0            # most recent chunk RMS (live input meter)
+        self._last_text_ts = 0.0      # wall time of the last produced transcript
+        self._stt_busy = False        # a transcription is in flight
+        self._err_ts = 0.0            # wall time of the last error (for a transient ERROR state)
         # --- per-stage diagnostics (Phase 0.2; instrumentation only — does NOT alter VAD behavior) ---
         # Stage counters + last-timing values let the diagnostics run (GET /api/diag/audio) attribute a
         # listening failure to a specific stage (no audio / VAD never fires / STT slow / hallucination drop).
@@ -238,6 +244,56 @@ class AudioSink:
                 "bargein": self._bargein, "bargein_fires": self.bargein_fires,
                 "recent": list(self._events)}
 
+    def audio_status(self) -> dict:
+        """Operational mic status for the permanent UI indicator (distinct from the calibration diagnostics).
+        Derives one explicit `state` from stream liveness + VAD + STT activity + recent transcript + whether
+        the robot is speaking (echo-gated). Cheap; safe to poll several times a second."""
+        from . import audio_state
+        now = time.time()
+        age = (now - self._last_chunk_ts) if self._last_chunk_ts else None
+        stream_live = age is not None and age <= 1.5
+        speaking = audio_state.is_speaking()
+        stt_active = self._stt_busy or bool(self._jobs)
+        recent_transcript = self._last_text_ts and (now - self._last_text_ts) < 2.0
+        recent_error = self._err_ts and (now - self._err_ts) < 3.0
+        enter_thr, exit_thr = self._thresholds()
+
+        if not self._running:
+            state = "OFF"
+        elif not stream_live:
+            state = "ERROR" if recent_error else "NO MIC STREAM"
+        elif speaking:
+            state = "SPEAKING-ECHO-GATED"
+        elif stt_active:
+            state = "TRANSCRIBING"
+        elif self._in_speech:
+            state = "HEARING SPEECH"
+        elif recent_transcript:
+            state = "HEARD"
+        elif recent_error:
+            state = "ERROR"
+        else:
+            state = "LISTENING"
+
+        return {
+            "enabled": self._running,
+            "stream_live": stream_live,
+            "last_audio_age_ms": (round(age * 1000.0) if age is not None else None),
+            "state": state,
+            "current_rms": int(self._last_rms),
+            "noise_floor": round(self._floor, 1),
+            "enter_threshold": round(enter_thr, 1),
+            "exit_threshold": round(exit_thr, 1),
+            "vad_active": self._in_speech,
+            "stt_active": stt_active,
+            "stt_queue_depth": len(self._jobs),
+            "speaking": speaking,
+            "bargein_ready": bool(self.on_critical and self._bargein and speaking),
+            "last_transcript": self._last_text,
+            "last_transcript_ts": (self._last_text_ts or None),
+            "error": self.last_error,
+        }
+
     def attach(self, hub) -> None:
         self._running = True
         self._worker = threading.Thread(target=self._stt_loop, name="audio-stt", daemon=True)
@@ -268,6 +324,7 @@ class AudioSink:
 
     def _on_chunk(self, chunk) -> None:
         self._recv += 1
+        self._last_chunk_ts = time.time()   # stream liveness (set even if the chunk is later dropped)
         pcm = chunk.pcm
         if not pcm:
             self._drop_empty += 1
@@ -294,9 +351,11 @@ class AudioSink:
         except Exception as e:  # noqa: BLE001
             self._drop_rms += 1
             self.last_error = f"rms: {type(e).__name__}: {e}"
+            self._err_ts = time.time()
             return
         now = time.monotonic()
         self._nchunks += 1
+        self._last_rms = rms
         if rms > self._max_rms:
             self._max_rms = rms
         self._rms_samples.append(rms)   # window-scoped RMS distribution (diag)
@@ -375,6 +434,7 @@ class AudioSink:
             self._ev("stt_warmed", device=self._stt_device_loaded)
         except Exception as e:  # noqa: BLE001
             self.last_error = f"stt warm: {type(e).__name__}: {e}"
+            self._err_ts = time.time()
             self._ev("stt_warm_failed", error=self.last_error)
 
     def _stt_loop(self) -> None:
@@ -389,6 +449,7 @@ class AudioSink:
             self._last_queue_wait_ms = (time.monotonic() - enq_ts) * 1000.0
             self._queue_samples.append(self._last_queue_wait_ms)
             self._stt_runs += 1
+            self._stt_busy = True
             self._ev("stt_started", queue_wait_ms=round(self._last_queue_wait_ms, 1))
             t0 = time.monotonic()
             try:
@@ -396,13 +457,17 @@ class AudioSink:
             except Exception as e:  # noqa: BLE001
                 self._stt_fail += 1
                 self.last_error = f"{type(e).__name__}: {e}"
+                self._err_ts = time.time()
                 self._ev("stt_failed", error=self.last_error)
+                self._stt_busy = False
                 continue
+            self._stt_busy = False
             self._last_stt_ms = (time.monotonic() - t0) * 1000.0
             self._stt_samples.append(self._last_stt_ms)
             self._ev("transcript_produced", text=(text or "")[:60], ms=round(self._last_stt_ms, 1))
             self._last_text = text or self._last_text
             if text:
+                self._last_text_ts = time.time()
                 self._diag_transcripts.append(text)
             if text and self.on_utterance:
                 self.utterances += 1

@@ -20,6 +20,9 @@ export const api = {
   estop() {
     return jpost("/api/estop", {});
   },
+  estopReset() {
+    return jpost("/api/estop/reset", {});
+  },
   sleep(on: boolean) {
     return jpost("/api/sleep", { on });
   },

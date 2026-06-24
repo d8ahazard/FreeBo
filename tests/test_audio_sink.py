@@ -124,6 +124,41 @@ def test_diag_window_is_session_scoped(clock):
     assert w["stt_ms"]["count"] == 0          # no STT ran in this window
 
 
+# --- P0-R3.4: operational listening status / state machine ---
+
+def test_audio_status_off_when_not_running():
+    s = _sink()
+    a = s.audio_status()
+    assert a["enabled"] is False and a["state"] == "OFF"
+
+
+def test_audio_status_no_mic_stream_when_stale(clock):
+    s = _sink()
+    s._running = True
+    a = s.audio_status()
+    assert a["state"] == "NO MIC STREAM" and a["stream_live"] is False
+
+
+def test_audio_status_listening_then_hearing(clock):
+    s = _sink()
+    s._running = True
+    s._on_chunk(_chunk(100, 0.05))            # quiet, fresh chunk -> listening
+    a = s.audio_status()
+    assert a["stream_live"] is True and a["state"] == "LISTENING"
+    s._on_chunk(_chunk(5000, 0.05))           # loud -> enters speech
+    a = s.audio_status()
+    assert a["vad_active"] is True and a["state"] == "HEARING SPEECH"
+
+
+def test_audio_status_speaking_is_echo_gated(monkeypatch, clock):
+    monkeypatch.setattr("autobot.brain.audio_state.is_speaking", lambda: True)
+    s = _sink()
+    s._running = True
+    s._on_chunk(_chunk(5000, 0.05))           # dropped by echo gate, but stream is fresh
+    a = s.audio_status()
+    assert a["speaking"] is True and a["state"] == "SPEAKING-ECHO-GATED"
+
+
 def test_hallucination_filter():
     assert _is_hallucination("you") is True
     assert _is_hallucination("thank you.") is True

@@ -57,3 +57,27 @@ def test_talk_gate():
     sf = SafetyFloor()
     assert not sf.check_say(settings(talk_enabled=False)).allowed
     assert sf.check_say(settings(talk_enabled=True)).allowed
+
+
+def test_estop_latch_blocks_every_source():
+    sf = _sf()
+    sf.estop_latch()
+    s = settings(autonomy="auto", allow_motion=True, max_speed=1.0)
+    for src in ("ai", "recovery", "manual", "overseer"):
+        d = sf.check_drive(s, 0.5, 0.0, 1.0, source=src)
+        assert not d.allowed and d.reason == "estop_latched"
+
+
+def test_estop_reset_permits_motion_again():
+    sf = _sf()
+    sf.estop_latch()
+    sf.estop_reset()
+    d = sf.check_drive(settings(autonomy="auto", allow_motion=True, max_speed=0.6), 0.5, 0.0, 1.0, source="manual")
+    assert d.allowed
+
+
+def test_estop_latch_bumps_control_generation():
+    sf = _sf()
+    g1 = sf.estop_latch()
+    g2 = sf.estop_latch()
+    assert g2 > g1 and sf.control_generation() == g2

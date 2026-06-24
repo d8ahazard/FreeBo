@@ -7,7 +7,8 @@ import type { Mode, Settings } from "../types";
  * Autonomy (manual/auto) is the master gate: in manual the AI never drives, even in a roaming mode.
  */
 const MODES: { key: Mode; label: string; icon: string; blurb: string }[] = [
-  { key: "explore", label: "Explore", icon: "🧭", blurb: "Roam freely & map the space" },
+  { key: "observe", label: "Observe", icon: "👁", blurb: "Stay put, rotate to look & comment (never roams)" },
+  { key: "explore", label: "Explore / Roam", icon: "🧭", blurb: "Actively roam: greet, patrol, cover new ground" },
   { key: "command", label: "Command", icon: "🎯", blurb: "Pursue one directive" },
   { key: "conversational", label: "Converse", icon: "💬", blurb: "Hold still, track who's talking" },
 ];
@@ -41,7 +42,7 @@ export default function ModeBar({ settings, save }: { settings: Settings; save: 
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-2 gap-2">
         {MODES.map((m) => {
           const on = settings.mode === m.key;
           return (

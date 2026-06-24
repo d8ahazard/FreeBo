@@ -86,6 +86,10 @@ let inst = null;        // RTM instance
 let sess = null;        // current session
 let timers = [];        // keepalive / controller refresh
 let connected = false;
+let latched = false;    // E-STOP latch: while true, ALL drive frames are refused (zero-stop still allowed)
+let generation = 0;     // control generation; bumped on E-STOP so stale in-flight drives are dropped
+
+function zeroFrame() { return { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }; }
 
 function clearTimers() { for (const t of timers) clearInterval(t); timers = []; }
 
@@ -96,18 +100,31 @@ function _needSession(why) {
   if (Date.now() - _lastNeed > 12000) { _lastNeed = Date.now(); out({ ev: "need_session" }); log("warn", "re-provision: " + why); }
 }
 async function sendRtm(id, data) {
-  if (!inst || !sess) return false;
+  // Returns {ok, error}: ok is the REAL Agora sendMessageToPeer result, not a pipe write. Callers that
+  // don't care (keepalive/cadence) ignore it; the acked() path forwards it as a command_result.
+  if (!inst || !sess) return { ok: false, error: "not_connected" };
   const msg = JSON.stringify({ id, sid: sess.sid, data: data || {}, type: 0, timestamp: Date.now() });
   try {
     await inst.sendMessageToPeer({ text: msg }, String(sess.rtm.robot_uid));
-    _sendFails = 0; out({ ev: "sent", id }); return true;
+    _sendFails = 0; out({ ev: "sent", id }); return { ok: true, error: null };
   } catch (e) {
     // Only re-login after SUSTAINED failures (token genuinely expired) — not on a single transient 102,
     // which would otherwise thrash the session. Keepalive (~every 2s) drives this counter.
     _sendFails++;
     if (_sendFails >= 6) _needSession("sustained send failures (" + _sendFails + ")");
-    return false;
+    return { ok: false, error: String((e && (e.message || e.code || e)) || "send_failed").slice(0, 200) };
   }
+}
+
+// Send one RTM message and report a correlated command_result back to Python, so Air2NativeLink can return
+// ACTUAL Agora delivery (not stdin-write success). Used for the operator/AI-visible commands.
+async function acked(c, id, data) {
+  const dispatch_ts = Date.now();
+  const r = await sendRtm(id, data);
+  out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: c && c.cmd,
+        rtm_id: id, sent_to_agora: r.ok, error: r.error, dispatch_ts, completion_ts: Date.now(),
+        rtm_connected: connected });
+  return r.ok;
 }
 
 // The robot pushes telemetry as COMPRESSED RAW (binary) RTM messages, not text — so m.text is empty. Pull
@@ -236,6 +253,8 @@ function startControlCadence() {
     if (sess && sess.ebo_id) sendRtm(RTM_LOGIN, { userId: sess.ebo_id });
     sendRtm(RTM_AVOID, { avoidobstacle: false });   // keep avoidance off so it never re-blocks motion
   }, 30000));
+  // Periodic health stat for /api/debug/rtm (consecutive send failures + connection state).
+  timers.push(setInterval(() => out({ ev: "stat", consecutive_send_failures: _sendFails, rtm_connected: connected }), 2000));
 }
 
 async function teardown() {
@@ -254,25 +273,56 @@ async function handle(c) {
     case "connect": return connect(c.session);
     case "logout": return teardown();
     case "ping": return out({ ev: "pong" });
+    case "estop": {
+      // Latched emergency stop: refuse all future drive frames, kill repeat/timeout timers, and slam a burst
+      // of zero-motion frames (now + 50/100/200ms) so a stop lands even through transient send loss.
+      latched = true; generation++;
+      clearDrive();
+      const z = zeroFrame();
+      sendRtm(RTM_DRIVE, z);
+      for (const d of [50, 100, 200]) setTimeout(() => sendRtm(RTM_DRIVE, z), d);
+      out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "estop",
+            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
+      log("warn", "E-STOP LATCHED (gen " + generation + ")");
+      return;
+    }
+    case "estop_reset": {
+      latched = false;
+      out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "estop_reset",
+            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
+      log("info", "E-STOP reset — motion permitted again");
+      return;
+    }
     case "drive": {
+      // REFUSE motion while the E-STOP is latched (still report a correlated result so the caller learns it).
+      if (latched) {
+        out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
+              sent_to_agora: false, error: "estop_latched", dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
+        return;
+      }
       // robot frame: forward = negative ly; scale to -100..100. The robot has a drive deadman, so a single
       // frame barely twitches — we SUSTAIN by resending the frame ~every 200ms until duration, then stop.
+      const myGen = generation;
       const ly = -Math.round((c.ly || 0) * 100), rx = Math.round((c.rx || 0) * 100);
       clearDrive();
       // buttons:1 on EVERY frame (incl. the zero/stop frame) — confirmed by sniffing the EBO Home app: it is
       // the "controller actively engaged" flag and the robot ignores joystick frames sent with buttons:0.
       const frame = { lx: 0, ly, rx, ry: 0, buttons: 1 };
-      await sendRtm(RTM_DRIVE, frame);
-      // Match the EBO app: it streams drive at ~10 Hz (every 100ms) while moving. 5 Hz was marginal.
-      driveRepeat = setInterval(() => sendRtm(RTM_DRIVE, frame), 100);
+      await acked(c, RTM_DRIVE, frame);   // ack the INITIAL frame (real Agora delivery)
+      // Match the EBO app: it streams drive at ~10 Hz (every 100ms) while moving. 5 Hz was marginal. Each
+      // repeat re-checks the latch + generation, so an E-STOP or a newer command kills this stale stream.
+      driveRepeat = setInterval(() => {
+        if (latched || myGen !== generation) { clearDrive(); return; }
+        sendRtm(RTM_DRIVE, frame);
+      }, 100);
       const dur = c.duration > 0 ? c.duration : 1.0; // never run forever without an explicit stop
-      driveStopTimer = setTimeout(() => { clearDrive(); sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }); }, dur * 1000);
+      driveStopTimer = setTimeout(() => { clearDrive(); sendRtm(RTM_DRIVE, zeroFrame()); }, dur * 1000);
       return;
     }
-    case "stop": { clearDrive(); return sendRtm(RTM_DRIVE, { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }); }
-    case "eyes": return sendRtm(RTM_EMOTE, { voiceIds: [], cycleMode: 0, emojiIds: [EYE_IDS[c.state] ?? 0], moveIds: [] });
-    case "dock": return sendRtm(RTM_DOCK, null);
-    case "avoid": return sendRtm(RTM_AVOID, { avoidobstacle: c.on !== false });
+    case "stop": { clearDrive(); return acked(c, RTM_DRIVE, zeroFrame()); }
+    case "eyes": return acked(c, RTM_EMOTE, { voiceIds: [], cycleMode: 0, emojiIds: [EYE_IDS[c.state] ?? 0], moveIds: [] });
+    case "dock": return acked(c, RTM_DOCK, null);
+    case "avoid": return acked(c, RTM_AVOID, { avoidobstacle: c.on !== false });
     case "release": {
       // Stop our controller heartbeat so the robot reverts to its OWN autonomy (e.g. low-battery return
       // home). We stay logged into RTM (still receive telemetry) but no longer claim active control.
@@ -286,7 +336,7 @@ async function handle(c) {
       log("info", "dock + control released");
       return;
     }
-    case "raw": return sendRtm(c.id, c.data || {});
+    case "raw": return c.command_id != null ? acked(c, c.id, c.data || {}) : sendRtm(c.id, c.data || {});
     default: return log("warn", "unknown cmd " + c.cmd);
   }
 }

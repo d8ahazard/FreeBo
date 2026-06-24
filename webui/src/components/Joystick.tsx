@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 
 /**
  * Analog joystick: direction = 360°, distance = speed (scaled by maxSpeed). Sends a continuous /drive
@@ -69,6 +69,12 @@ export default function Joystick({
     setKnob(0, 0);
     onStop();
   };
+
+  // If the stick gets disabled mid-drag (e.g. E-STOP latched), abort the active drive immediately.
+  useEffect(() => {
+    if (disabled && active.current) end();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [disabled]);
 
   return (
     <div

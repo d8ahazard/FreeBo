@@ -10,16 +10,18 @@ import { TerminatorFeed } from "./ThoughtFeed";
  * clash uids with the server). Video is the server's MJPEG; manual drive/eyes/dock go through /api/control.
  */
 const EYE_PICKS = ["happy", "love", "curious", "surprised", "angry", "sad", "sleepy", "cool"];
-const MODE_ICON: Record<string, string> = { explore: "🧭", command: "🎯", conversational: "💬" };
+const MODE_ICON: Record<string, string> = { observe: "👁", explore: "🧭", command: "🎯", conversational: "💬" };
 
-export default function NativeControlPanel({ settings, t, save, feed }: {
+export default function NativeControlPanel({ settings, t, feed, motionLocked = false }: {
   settings: Settings;
   t: Telemetry;
   save: (c: Partial<Settings>) => void;
   feed: FeedItem[];
+  motionLocked?: boolean;
 }) {
   const [imgErr, setImgErr] = useState(false);
   const connected = !!t.connected;
+  const moveDisabled = !connected || motionLocked;   // E-STOP latch disables all manual motion
   const batt = typeof t.battery === "number" && t.battery >= 0 ? `${t.battery}%${t.charge === 1 ? " ⚡" : ""}` : "—";
 
   return (
@@ -83,8 +85,9 @@ export default function NativeControlPanel({ settings, t, save, feed }: {
             maxSpeed={settings.max_speed}
             onDrive={(ly, rx) => api.drive(ly, rx)}
             onStop={() => api.stop()}
-            disabled={!connected}
+            disabled={moveDisabled}
           />
+          {motionLocked && <div className="text-[10px] text-bad hud-mono">E-STOP latched · reset to drive</div>}
         </div>
         <div className="flex flex-col gap-2">
           <div className="text-[10px] uppercase tracking-[0.2em] text-accent text-glow">Eyes</div>
@@ -97,7 +100,7 @@ export default function NativeControlPanel({ settings, t, save, feed }: {
             ))}
           </div>
           <div className="flex flex-wrap gap-1.5 mt-1">
-            <button onClick={() => api.action("dock")} disabled={!connected} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⊟ Dock</button>
+            <button onClick={() => api.action("dock")} disabled={moveDisabled} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⊟ Dock</button>
             <button onClick={() => api.action("avoid_on")} disabled={!connected} className="bg-card2/60 border border-line rounded-lg py-1.5 px-2.5 text-xs active:scale-95 disabled:opacity-40 hover:border-accent/50">⛨ Avoid</button>
             <button
               onClick={() => api.action(t.laser ? "laser_off" : "laser_on")}
