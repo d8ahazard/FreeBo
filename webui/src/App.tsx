@@ -15,9 +15,10 @@ import ThoughtFeed from "./components/ThoughtFeed";
 import MemoryPanel from "./components/MemoryPanel";
 import TasksPanel from "./components/TasksPanel";
 import CalibratePanel from "./components/CalibratePanel";
+import AudioCalibratePanel from "./components/AudioCalibratePanel";
 import VoiceCommands from "./components/VoiceCommands";
 
-type Tab = "hud" | "memory" | "settings";
+type Tab = "hud" | "memory" | "settings" | "calibrate";
 
 export default function App() {
   const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, save } = useAutobot();
@@ -74,8 +75,8 @@ export default function App() {
         <div className="max-w-[1320px] mx-auto px-4 py-16 text-mut hud-mono">▸ booting HUD…</div>
       ) : (
         <main className="max-w-[1320px] mx-auto px-4 py-4 relative z-[1]">
-          <div className="flex gap-2 mb-4 max-w-[540px]">
-            {(["hud", "memory", "settings"] as Tab[]).map((tb) => (
+          <div className="flex gap-2 mb-4 max-w-[720px]">
+            {(["hud", "memory", "settings", "calibrate"] as Tab[]).map((tb) => (
               <button
                 key={tb}
                 onClick={() => setTab(tb)}
@@ -83,12 +84,16 @@ export default function App() {
                   tab === tb ? "border-accent text-accent bg-accent/10 hud-glow" : "border-line bg-card2/50 text-mut"
                 }`}
               >
-                {tb === "hud" ? "◎ HUD" : tb === "memory" ? "✦ Memory" : "⚙ Settings"}
+                {tb === "hud" ? "◎ HUD" : tb === "memory" ? "✦ Memory" : tb === "settings" ? "⚙ Settings" : "◈ Calibrate"}
               </button>
             ))}
           </div>
 
-          {tab === "settings" ? (
+          {tab === "calibrate" ? (
+            <section className="max-w-[720px]">
+              <AudioCalibratePanel />
+            </section>
+          ) : tab === "settings" ? (
             <section className="hud-panel p-4 max-w-[560px]">
               <ConfigPanel settings={settings} tts={tts} onSave={save} />
             </section>

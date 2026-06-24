@@ -99,6 +99,19 @@ def _coarse_kind(ly: float, rx: float) -> str:
     return "stop"
 
 
+async def back_up_sequence(executor: "ActionExecutor", *, settings, reverse, turn, source: str = "manual"):
+    """A reverse pulse, then a turn ONLY IF the reverse actually moved. Any non-success reverse outcome
+    (FAILED incl. stuck/blocked/link-reject/timeout, UNKNOWN, or CANCELLED) aborts the sequence — the
+    sequence-level evidence requirement is NOT bypassed by source='manual'. The turn is a CHILD of the
+    reverse. Returns (reverse_action, turn_action_or_None)."""
+    ar = await executor.run_drive(reverse[0], reverse[1], reverse[2], settings=settings, source=source)
+    if ar.state == State.SUCCEEDED and ar.result == "moved" and turn is not None:
+        at = await executor.run_drive(turn[0], turn[1], turn[2], settings=settings, source=source,
+                                      parent_id=ar.id)
+        return ar, at
+    return ar, None
+
+
 class ActionExecutor:
     """One executor instance per brain. `run_drive` is the only thing that issues AI motion + evidence."""
 
@@ -126,6 +139,10 @@ class ActionExecutor:
         # oscillating recoveries), enter HOLD — refuse further motion until a manual reset / fresh authorization.
         self._hold = False
         self._nonprogress = 0
+        # Stop-dispatch instrumentation (P0.8/Correction 3): the monotonic time IMMEDIATELY BEFORE link.stop()
+        # is invoked (the acceptance reference) and when it returns (completion, a separate metric).
+        self.last_stop_dispatch_ts = 0.0
+        self.last_stop_complete_ts = 0.0
 
     # --- introspection / breaker ---
     def active(self) -> Optional[Action]:
@@ -186,11 +203,14 @@ class ActionExecutor:
             return None
 
     async def _stop(self) -> None:
-        # Bounded so a wedged link.stop() can't hang the deadman / shutdown.
+        # Bounded so a wedged link.stop() can't hang the deadman / shutdown. Record the dispatch timestamp
+        # IMMEDIATELY before invoking link.stop() (the acceptance reference) and the completion timestamp after.
+        self.last_stop_dispatch_ts = time.monotonic()
         try:
             await asyncio.wait_for(self.link.stop(), timeout=self.stop_timeout)
         except Exception:  # noqa: BLE001 (incl. asyncio.TimeoutError) - never hang on stop
             pass
+        self.last_stop_complete_ts = time.monotonic()
 
     async def preempt(self, reason: str = "preempted") -> None:
         """Cancel the in-flight action (barge-in / manual takeover / reflex) and stop. The running `run_drive`

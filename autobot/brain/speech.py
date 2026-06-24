@@ -28,6 +28,8 @@ class SpeechService:
         self.emit = emit
         self.last_spoken = ""
         self.active_playback_id = None
+        self._gen = 0                      # AudioState generation of our current clip
+        self._play_lock = asyncio.Lock()   # exactly ONE active robot utterance at a time
 
     async def _emit(self, ev: dict) -> None:
         if self.emit:
@@ -36,9 +38,9 @@ class SpeechService:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _schedule_clear(self, pid, dur: float) -> None:
-        """Clear the retained playback id once the clip should have finished (completion), unless a newer clip
-        replaced it. The AudioState echo gate auto-expires on its own timer; this just drops the stale id."""
+    def _schedule_clear(self, gen: int, pid, dur: float) -> None:
+        """Clear THIS clip's speaking state once it should have finished (completion). Generation-scoped, so a
+        stale completion from an older clip can't clear a newer clip's gate."""
         from . import audio_state
 
         async def _clr():
@@ -48,14 +50,29 @@ class SpeechService:
                 return
             if self.active_playback_id == pid:
                 self.active_playback_id = None
+            audio_state.clear(gen)   # no-op if a newer clip is already active
         try:
             asyncio.create_task(_clr())
         except RuntimeError:
             pass   # no running loop (non-async caller) — the gate timer still clears the speaking state
 
+    async def _cancel_active(self) -> None:
+        """Stop any currently-active clip BEFORE publishing a new one (enforces one audible utterance)."""
+        from . import audio_state
+        pid = self.active_playback_id
+        if pid is not None:
+            cancel = getattr(self.link, "cancel_playback", None)
+            if cancel is not None:
+                try:
+                    cancel(pid)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.active_playback_id = None
+        audio_state.cancel(self._gen)   # clear the prior generation's gate/canceller (no-op if already gone)
+
     async def speak(self, text: str, *, check_say: bool = False, safety=None) -> dict:
-        """Render + speak `text` on the robot speaker through the unified path. `check_say` gates on the talk
-        toggle / quiet window via `safety` (used by the cortex `say` tool)."""
+        """Render + speak `text` on the robot speaker through the unified, SERIALIZED path (one active utterance
+        at a time). `check_say` gates on the talk toggle / quiet window via `safety` (cortex `say` tool)."""
         from . import audio_state, critical_words, tts
         from .speech_clean import clean_spoken
 
@@ -69,37 +86,53 @@ class SpeechService:
         text = critical_words.strip_reserved(text)
         if not text:
             return {"ok": False, "error": "empty text"}
-        self.last_spoken = text
-        try:
-            pub = getattr(self.link, "publish_speech", None)
-            if callable(pub):
-                wav = tts.render_wav(text)
-                if not wav:
+
+        async with self._play_lock:
+            self.last_spoken = text
+            await self._cancel_active()   # one audible utterance: cancel the previous before publishing
+            try:
+                pub = getattr(self.link, "publish_speech", None)
+                if callable(pub):
+                    wav = tts.render_wav(text)
+                    if not wav:
+                        return self._as_dict(await self.link.say_text(text))
+                    dur = audio_state.wav_duration_s(wav)
+                    cancellable = getattr(self.link, "cancel_playback", None) is not None
+                    gen = audio_state.begin_playback(text, dur)   # gate ON + new generation
+                    self._gen = gen
+                    res = await pub(wav)
+                    pid = res.get("playback_id") if isinstance(res, dict) else None
+                    ok = (not isinstance(res, dict)) or (res.get("ok") is not False)
+                    # Non-exception failure: ok=false, OR a cancellable native link gave no playback id (we
+                    # could never cancel it). Clear the gate IMMEDIATELY — don't deafen the robot for `dur`.
+                    if (not ok) or (cancellable and pid is None):
+                        audio_state.clear(gen)
+                        self.active_playback_id = None
+                        why = "publish ok=false" if not ok else "cancellable link returned no playback_id"
+                        return {"ok": False, "error": why}
+                    self.active_playback_id = pid
+                    if cancellable:
+                        cancel = getattr(self.link, "cancel_playback")
+                        audio_state.set_canceller(gen, lambda pid=pid, cancel=cancel: cancel(pid))
+                    await self._emit({"type": "speech", "text": text, "b64": base64.b64encode(wav).decode(),
+                                      "sr": 0, "ts": time.time()})
+                    self._schedule_clear(gen, pid, dur)
+                    return self._as_dict(res)
+                if self.link.prefers_text_tts():
                     return self._as_dict(await self.link.say_text(text))
-                dur = audio_state.wav_duration_s(wav)
-                audio_state.mark_speaking(dur, text=text)   # echo gate ON + record the outbound text
-                res = await pub(wav)
-                pid = res.get("playback_id") if isinstance(res, dict) else None
-                self.active_playback_id = pid
-                cancel = getattr(self.link, "cancel_playback", None)
-                if cancel is not None:
-                    # cancel_playback is sync + thread-safe; register it so AudioState.cancel() flushes the clip.
-                    audio_state.mark_speaking(dur, text=text,
-                                              canceller=lambda pid=pid, cancel=cancel: cancel(pid))
-                await self._emit({"type": "speech", "text": text, "b64": base64.b64encode(wav).decode(),
-                                  "sr": 0, "ts": time.time()})
-                self._schedule_clear(pid, dur)
+                g711 = tts.render_mulaw(text)
+                if not g711:
+                    return self._as_dict(await self.link.say_text(text))
+                self._gen = audio_state.begin_playback(text, len(g711) / 8000.0)   # G.711 @ 8 kHz
+                res = await self.link.say_audio(g711, codec="mulaw")
+                if isinstance(res, dict) and res.get("ok") is False:
+                    audio_state.clear(self._gen)
+                    return {"ok": False, "error": "say_audio ok=false"}
                 return self._as_dict(res)
-            if self.link.prefers_text_tts():
-                return self._as_dict(await self.link.say_text(text))
-            g711 = tts.render_mulaw(text)
-            if not g711:
-                return self._as_dict(await self.link.say_text(text))
-            audio_state.mark_speaking(len(g711) / 8000.0, text=text)   # G.711 @ 8 kHz, 1 byte/sample
-            return self._as_dict(await self.link.say_audio(g711, codec="mulaw"))
-        except Exception as e:  # noqa: BLE001
-            audio_state.cancel()   # clear the speaking state on failure
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            except Exception as e:  # noqa: BLE001
+                audio_state.clear(self._gen)   # clear THIS clip's speaking state on failure
+                self.active_playback_id = None
+                return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     @staticmethod
     def _as_dict(res) -> dict:

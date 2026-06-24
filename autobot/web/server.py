@@ -362,6 +362,52 @@ async def api_diag_audio():
         return JSONResponse({"ok": False, "error": str(e), "audio_sink": {}})
 
 
+@app.post("/api/diag/audio/reset")
+async def api_diag_audio_reset():
+    """Start a fresh AudioSink measurement epoch (Correction 4) — call before each idle/speech window."""
+    if AUDIO_SINK is None or not hasattr(AUDIO_SINK, "diag_reset"):
+        return JSONResponse({"ok": False, "error": "no audio sink"})
+    AUDIO_SINK.diag_reset()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/diag/audio/window")
+async def api_diag_audio_window():
+    """Window-scoped AudioSink stats since the last reset: RMS distribution (count/min/mean/p50/p90/p95/p99/
+    max), thresholds/floor, VAD + segment counts, STT + queue-wait distributions, transcripts."""
+    if AUDIO_SINK is None or not hasattr(AUDIO_SINK, "diag_window"):
+        return JSONResponse({"ok": False, "error": "no audio sink", "window": {}})
+    return JSONResponse({"ok": True, "window": AUDIO_SINK.diag_window()})
+
+
+@app.post("/api/diag/audio/capture")
+async def api_diag_audio_capture(req: Request):
+    """Capture the current window under a label AND append it to the calibration evidence file
+    (data/test-evidence/audio_calibration.json) — the Calibrate tab's 'Stop' button. Returns the window."""
+    import json as _json
+    import os as _os
+    import time as _t
+    if AUDIO_SINK is None or not hasattr(AUDIO_SINK, "diag_window"):
+        return JSONResponse({"ok": False, "error": "no audio sink", "window": {}})
+    body = {}
+    with contextlib.suppress(Exception):
+        body = await req.json()
+    label = str(body.get("label", "window"))
+    win = AUDIO_SINK.diag_window()
+    rec = {"label": label, "ts": _t.time(), "window": win}
+    path = _os.path.join("data", "test-evidence", "audio_calibration.json")
+    with contextlib.suppress(Exception):
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        data = []
+        if _os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+        data.append(rec)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+    return JSONResponse({"ok": True, "label": label, "window": win, "saved": path})
+
+
 @app.post("/api/settings")
 async def api_settings(req: Request):
     body = await req.json()
@@ -977,20 +1023,11 @@ async def api_control(req: Request):
     if kind == "connection":
         return JSONResponse(await LINK.connection(str(body.get("state", "start"))))
     if kind == "say":
-        if not s.talk_enabled:
-            return JSONResponse({"ok": False, "blocked": "talk disabled"})
         text = str(body.get("text", ""))
-        # Links that publish audio into a call (native Air 2) take a rendered WAV; others take G.711/text.
-        pub = getattr(LINK, "publish_speech", None)
-        if pub:
-            wav = await asyncio.to_thread(tts.render_wav, text)
-            if not wav:
-                return JSONResponse({"ok": False, "error": "tts unavailable"})
-            return JSONResponse(await pub(wav))
-        g711 = tts.render_mulaw(text)
-        if g711:
-            return JSONResponse(await LINK.say_audio(g711))
-        return JSONResponse(await LINK.say_text(text))
+        # Route through the unified SpeechService so this path ALSO arms the echo gate, sanitizes reserved
+        # words, and retains a cancellable playback id (so barge-in/STOP can cancel a manually-triggered clip
+        # exactly like the brain's own speech). check_say enforces the talk toggle / quiet window.
+        return JSONResponse(await brain.speech.speak(text, check_say=True, safety=brain.safety))
     return JSONResponse({"ok": False, "error": f"unknown control kind '{kind}'"}, status_code=400)
 
 

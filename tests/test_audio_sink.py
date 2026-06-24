@@ -108,6 +108,22 @@ def test_audio_sink_start_stop_restart_no_leaks():
     assert hub.stats()["audio_subs"] == base
 
 
+def test_diag_window_is_session_scoped(clock):
+    s = _sink()
+    for _ in range(10):                       # pre-reset chunks must NOT count in the window
+        s._on_chunk(_chunk(100, 0.05)); clock.t += 0.05
+    s.diag_reset()
+    for _ in range(20):                        # the measured window
+        s._on_chunk(_chunk(200, 0.05)); clock.t += 0.05
+    w = s.diag_window()
+    assert w["rms"]["count"] == 20            # only post-reset samples
+    assert w["rms"]["min"] == 200 and w["rms"]["max"] == 200
+    for k in ("p50", "p90", "p95", "p99", "mean"):
+        assert k in w["rms"]
+    assert "noise_floor" in w and "enter_thr" in w and "exit_thr" in w
+    assert w["stt_ms"]["count"] == 0          # no STT ran in this window
+
+
 def test_hallucination_filter():
     assert _is_hallucination("you") is True
     assert _is_hallucination("thank you.") is True

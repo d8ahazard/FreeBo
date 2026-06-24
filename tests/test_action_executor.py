@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from conftest import settings
 
-from autobot.brain.action_executor import TERMINAL, Action, ActionExecutor, State
+from autobot.brain.action_executor import TERMINAL, Action, ActionExecutor, State, back_up_sequence
 from autobot.brain.safety import SafetyFloor
 from autobot.robot.mock_link import MockRobotLink
 
@@ -121,6 +121,14 @@ async def test_terminal_state_is_exactly_once():
     assert a.state is first
 
 
+async def test_stop_dispatch_timestamps_recorded():
+    ex = _ex(MockRobotLink())
+    await ex.run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
+    # dispatch is recorded immediately before link.stop(); completion strictly after.
+    assert ex.last_stop_dispatch_ts > 0.0
+    assert ex.last_stop_complete_ts >= ex.last_stop_dispatch_ts
+
+
 async def test_active_is_none_after_completion():
     ex = _ex(MockRobotLink())
     await ex.run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
@@ -159,6 +167,44 @@ def test_moved_result_resets_breaker():
     ex._note_outcome(Action(id="x", kind="step", params={}, source="ai",
                             state=State.SUCCEEDED, result="moved"))
     assert ex._nonprogress == 0 and ex.in_hold() is False
+
+
+# --- Correction 2: BACK_UP only turns after a confirmed 'moved' reverse ---
+
+class _ScriptedExec:
+    """A fake executor that returns scripted Action outcomes and records every run_drive call."""
+    def __init__(self, outcomes):
+        self.calls = []
+        self._outcomes = outcomes
+        self._i = 0
+
+    async def run_drive(self, ly, rx, duration, *, settings, source="ai", parent_id=None):
+        self.calls.append({"ly": ly, "rx": rx, "source": source, "parent_id": parent_id})
+        a = self._outcomes[self._i]
+        self._i += 1
+        return a
+
+
+def _act(state, result=None):
+    return Action(id="rev", kind="reverse", params={}, source="manual", state=state, result=result)
+
+
+async def test_back_up_turns_only_after_moved():
+    ex = _ScriptedExec([_act(State.SUCCEEDED, "moved"),               # reverse moved
+                        _act(State.SUCCEEDED, "moved")])              # the child turn
+    rev, turn = await back_up_sequence(ex, settings=_auto(), reverse=(-0.4, 0, 0.4), turn=(0, 0.4, 0.4))
+    assert len(ex.calls) == 2 and ex.calls[1]["parent_id"] == "rev"   # reverse + child turn
+    assert turn is not None
+
+
+async def test_back_up_aborts_on_each_non_success():
+    for state, result in [(State.FAILED, "stuck"), (State.FAILED, "blocked"), (State.FAILED, "link rejected"),
+                          (State.FAILED, "execution timeout"), (State.UNKNOWN, "unknown"),
+                          (State.CANCELLED, None)]:
+        ex = _ScriptedExec([_act(state, result)])
+        rev, turn = await back_up_sequence(ex, settings=_auto(), reverse=(-0.4, 0, 0.4), turn=(0, 0.4, 0.4))
+        assert len(ex.calls) == 1, f"a turn was issued after reverse {state}/{result}"
+        assert turn is None
 
 
 async def test_stale_video_refuses_motion():

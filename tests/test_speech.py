@@ -37,8 +37,74 @@ class _SpeakLink(RobotLink):
         return {"ok": True}
 
 
+class _FailLink(_SpeakLink):
+    async def publish_speech(self, wav):
+        return {"ok": False, "error": "channel not ready"}
+
+
+class _NoPidLink(_SpeakLink):
+    async def publish_speech(self, wav):   # cancellable link but no playback id -> uncancellable -> failure
+        return {"ok": True}
+
+
 async def _noop(_ev):
     return None
+
+
+def _svc(monkeypatch, link, talk=True):
+    monkeypatch.setattr("autobot.brain.tts.render_wav", lambda text, **k: b"RIFFfakewav")
+    settings = Settings(); settings.update(talk_enabled=talk)
+    return SpeechService(link, settings, emit=_noop)
+
+
+async def test_publish_ok_false_clears_gate_immediately(monkeypatch):
+    ast.cancel()
+    svc = _svc(monkeypatch, _FailLink())
+    res = await svc.speak("hello there")
+    assert res["ok"] is False
+    assert svc.active_playback_id is None
+    assert not ast.is_speaking()       # gate NOT left open for the computed clip duration
+
+
+async def test_cancellable_link_without_playback_id_is_failure(monkeypatch):
+    ast.cancel()
+    svc = _svc(monkeypatch, _NoPidLink())
+    res = await svc.speak("hello there")
+    assert res["ok"] is False and not ast.is_speaking() and svc.active_playback_id is None
+
+
+async def test_two_rapid_says_cancel_the_first(monkeypatch):
+    ast.cancel()
+    link = _SpeakLink()
+    svc = _svc(monkeypatch, link)
+    await svc.speak("first clip")
+    await svc.speak("second clip")
+    assert link.queued == [1, 2]
+    assert 1 in link.cancelled          # the first clip was cancelled before the second published
+    assert svc.active_playback_id == 2
+
+
+async def test_stop_while_first_clip_audible(monkeypatch):
+    ast.cancel()
+    link = _SpeakLink()
+    svc = _svc(monkeypatch, link)
+    await svc.speak("a long clip that is playing")
+    assert ast.is_speaking() and link.queued == [1]
+    ast.cancel()                        # barge-in STOP
+    assert link.cancelled == [1] and not ast.is_speaking()
+
+
+async def test_stale_completion_from_old_clip_does_not_clear_new(monkeypatch):
+    ast.cancel()
+    link = _SpeakLink()
+    svc = _svc(monkeypatch, link)
+    await svc.speak("clip A")
+    gen_a = svc._gen
+    await svc.speak("clip B")           # B is now the active generation
+    # A's delayed completion fires late -> must NOT clear B's gate.
+    ast.clear(gen_a)
+    assert ast.is_speaking()
+    assert "b" in ast.current_text().lower()   # still clip B's text
 
 
 async def test_say_tool_clip_is_sanitized_and_cancellable(monkeypatch):

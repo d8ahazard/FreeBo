@@ -12,6 +12,7 @@ import time
 from typing import Callable, Optional
 
 _lock = threading.Lock()
+_generation = 0                          # monotonic playback id; bumps each new clip (stale-completion guard)
 _speaking_until = 0.0
 _current_text = ""                       # the in-flight TTS text (for barge-in self-echo rejection)
 _canceller: Optional[Callable[[], None]] = None  # cancels the in-flight clip (set by the speak path)
@@ -24,18 +25,37 @@ TAIL_S = 0.6
 MAX_GATE_S = 20.0
 
 
-def mark_speaking(seconds: float, text: str = "", canceller: Optional[Callable[[], None]] = None) -> None:
-    """Mark that the robot is speaking for ~`seconds` (clip duration); STT is muted until then + a tail.
-    `text` is the spoken line (used to reject self-echo during barge-in); `canceller` (if given) is invoked by
-    `cancel()` to stop the in-flight clip — it must be thread-safe (the speak path supplies a loop handoff)."""
-    global _speaking_until, _current_text, _canceller
+def begin_playback(text: str, seconds: float, canceller: Optional[Callable[[], None]] = None) -> int:
+    """Start a NEW playback generation (replacing any prior): open the echo gate for ~`seconds` (+tail), record
+    the spoken `text` (barge-in self-echo rejection), and store the `canceller`. Returns the generation id so
+    the caller can later clear/cancel ONLY its own clip (a stale completion from an older clip is a no-op)."""
+    global _generation, _speaking_until, _current_text, _canceller
     seconds = min(max(0.0, seconds), MAX_GATE_S)
     with _lock:
-        _speaking_until = max(_speaking_until, time.time() + seconds + TAIL_S)
-        if text:
-            _current_text = text
-        if canceller is not None:
+        _generation += 1
+        gen = _generation
+        _speaking_until = time.time() + seconds + TAIL_S
+        _current_text = text or ""
+        _canceller = canceller
+    return gen
+
+
+def set_canceller(generation: int, canceller: Optional[Callable[[], None]]) -> None:
+    """Attach/replace the canceller for `generation` IF it is still the active clip (else no-op)."""
+    global _canceller
+    with _lock:
+        if generation == _generation:
             _canceller = canceller
+
+
+def current_generation() -> int:
+    with _lock:
+        return _generation
+
+
+def mark_speaking(seconds: float, text: str = "", canceller: Optional[Callable[[], None]] = None) -> int:
+    """Back-compat shim (tests / legacy callers): start a fresh playback generation. Returns the generation."""
+    return begin_playback(text, seconds, canceller)
 
 
 def is_speaking() -> bool:
@@ -49,11 +69,26 @@ def current_text() -> str:
         return _current_text
 
 
-def cancel() -> None:
-    """Barge-in: stop the in-flight TTS immediately. Resets the echo gate at once (so STT re-listens) and
-    invokes the registered canceller (link playback flush). Idempotent — the canceller fires at most once."""
+def clear(generation: Optional[int] = None) -> None:
+    """Mark playback COMPLETE — reset the echo gate. If `generation` is given and is NOT the active clip, this
+    is a no-op (a stale completion from an older clip must never clear a newer clip's gate)."""
     global _speaking_until, _current_text, _canceller
     with _lock:
+        if generation is not None and generation != _generation:
+            return
+        _speaking_until = 0.0
+        _current_text = ""
+        _canceller = None
+
+
+def cancel(generation: Optional[int] = None) -> None:
+    """Barge-in / preempt: stop the in-flight TTS immediately. Resets the echo gate (so STT re-listens) and
+    invokes the registered canceller (link playback flush). If `generation` is given and is NOT the active
+    clip, this is a no-op (a stale cancel can't kill a newer clip). Idempotent — canceller fires at most once."""
+    global _speaking_until, _current_text, _canceller
+    with _lock:
+        if generation is not None and generation != _generation:
+            return
         cb = _canceller
         _canceller = None
         _speaking_until = 0.0

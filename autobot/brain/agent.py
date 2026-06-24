@@ -26,7 +26,7 @@ from typing import Awaitable, Callable
 from ..config import Settings
 from ..robot.link import RobotLink
 from . import commands, motion_model, navigator, visual_motion
-from .action_executor import ActionExecutor, State
+from .action_executor import ActionExecutor, State, back_up_sequence
 from .behavior import BehaviorController
 from .curiosity import Curiosity
 from .identity import Identity
@@ -356,14 +356,20 @@ class AgentBrain:
         s = self.settings.snapshot()
         if s.asleep or not s.allow_motion:
             return
-        preempt_ts = time.monotonic()
+        stages = dict(stages or {})
+        stages["preempt_requested"] = time.monotonic()
         await self.emergency_stop("visual looming reflex")   # cancels the active action + dispatches the stop
-        stop_dispatch = time.monotonic()
+        # Use the executor's REAL timestamps: the time immediately before link.stop() (acceptance reference)
+        # and when it returned (completion, a separate metric) — NOT "after emergency_stop returned".
+        stages["stop_dispatch"] = self.executor.last_stop_dispatch_ts or stages["preempt_requested"]
+        stages["stop_complete"] = self.executor.last_stop_complete_ts or stages["stop_dispatch"]
         self._reflex_blocked = True
-        arrival = stages.get("arrival", preempt_ts)
-        total_ms = (stop_dispatch - arrival) * 1000.0
+        arrival = stages.get("arrival", stages["preempt_requested"])
+        total_ms = (stages["stop_dispatch"] - arrival) * 1000.0          # ACCEPTANCE: arrival -> pre-stop
+        complete_ms = (stages["stop_complete"] - arrival) * 1000.0       # separate completion metric
         try:
-            self.metrics.record("reflex_stop", total_ms)   # acceptance value: arrival -> stop dispatch
+            self.metrics.record("reflex_stop", total_ms)
+            self.metrics.record("reflex_stop_complete", complete_ms)
         except Exception:  # noqa: BLE001
             pass
         await self._express("surprised")
@@ -371,8 +377,9 @@ class AgentBrain:
                          "text": f"(visual reflex: looming {stages.get('score', 0):.3f} — stopping)",
                          "ts": time.time()})
         await self.emit({"type": "reflex_latency", "ms": round(total_ms, 1),
+                         "complete_ms": round(complete_ms, 1),
                          "stages": {k: round(v, 4) for k, v in stages.items() if isinstance(v, (int, float))},
-                         "stop_dispatch": round(stop_dispatch, 4), "ts": time.time()})
+                         "ts": time.time()})
 
     # --- lifecycle ---
     def start(self):
@@ -1114,6 +1121,9 @@ class AgentBrain:
             self._append_history({"role": "user", "content": obs.text_summary()})
 
             actions: list[dict] = []
+            spoke = False   # cap speech to ONE utterance per reason cycle (a 7b cortex re-says/revises across
+            #                 tool rounds; with the serialized speech path each extra say cancels the prior
+            #                 clip -> an interrupt-cascade. One say per turn = one coherent spoken line.)
             try:
                 for _round in range(MAX_TOOL_ROUNDS):
                     with self.metrics.timer("provider"):
@@ -1152,10 +1162,15 @@ class AgentBrain:
                         cid = tc["id"] or f"call_{i}"
                         await self.emit({"type": "tool_call", "name": tc["name"],
                                          "args": tc["arguments"], "ts": time.time()})
-                        with self.metrics.timer("tool"):
-                            res = await self.registry.execute(tc["name"], tc["arguments"])
-                        if tc["name"] == "say" and isinstance(res, dict) and res.get("ok"):
-                            self._last_spoken = str(tc["arguments"].get("text", "")) or self._last_spoken
+                        if tc["name"] == "say" and spoke:
+                            # Already spoke this turn — skip extra/revised says (don't cut off the playing clip).
+                            res = {"ok": False, "skipped": "already spoke once this turn — do not repeat"}
+                        else:
+                            with self.metrics.timer("tool"):
+                                res = await self.registry.execute(tc["name"], tc["arguments"])
+                            if tc["name"] == "say" and isinstance(res, dict) and res.get("ok"):
+                                spoke = True
+                                self._last_spoken = str(tc["arguments"].get("text", "")) or self._last_spoken
                         actions.append({"name": tc["name"], "args": tc["arguments"], "result": res})
                         await self.emit({"type": "tool_result", "name": tc["name"], "result": res,
                                          "ts": time.time()})
@@ -1541,12 +1556,9 @@ class AgentBrain:
         rev = self._calib_drive("back")
         trn = self._calib_drive("right")
         if rev:
-            ar = await self.executor.run_drive(rev[0], rev[1], rev[2], settings=s, source="manual")
-            if ar.state == State.CANCELLED:
-                return   # STOP interrupted the reverse — abort before the (child) turn
-            if trn:
-                await self.executor.run_drive(trn[0], trn[1], trn[2], settings=s, source="manual",
-                                              parent_id=ar.id)
+            # The turn runs only if the reverse confirms 'moved'; any non-success outcome aborts (the helper
+            # enforces this even for source='manual').
+            await back_up_sequence(self.executor, settings=s, reverse=rev, turn=trn, source="manual")
         self._motion_reaction = None
         self._reflex_blocked = False
         self.behavior.clear_voice_intent()   # free to move again

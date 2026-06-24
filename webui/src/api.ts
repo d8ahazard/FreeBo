@@ -124,6 +124,17 @@ export const api = {
   calibrate() {
     return jpost("/api/calibrate", {});
   },
+  // --- audio calibration (temp Calibrate tab): reset starts an epoch, capture stops + saves the window ---
+  async audioDiag() {
+    const r = await fetch("/api/diag/audio");
+    return r.json();
+  },
+  audioReset() {
+    return jpost("/api/diag/audio/reset", {});
+  },
+  audioCapture(label: string) {
+    return jpost("/api/diag/audio/capture", { label });
+  },
   // --- overseer puppet mode: read the paralyzed brain's intent + live state, and drive the real robot ---
   async overseerState(since = 0) {
     const r = await fetch(`/api/overseer/state?since=${since}`);

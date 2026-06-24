@@ -1,0 +1,291 @@
+[
+  {
+    "label": "smoke",
+    "ts": 1782338085.2233825,
+    "window": {
+      "elapsed_s": 2.0,
+      "rms": {
+        "count": 0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 0,
+      "vad_ends": 0,
+      "seg_accepted": 0,
+      "seg_dropped": 0,
+      "recv": 0,
+      "chunks": 0,
+      "drop_speaking": 0,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 0
+      },
+      "queue_wait_ms": {
+        "count": 0
+      },
+      "transcripts": []
+    }
+  },
+  {
+    "label": "silence",
+    "ts": 1782338430.0559165,
+    "window": {
+      "elapsed_s": 15.7,
+      "rms": {
+        "count": 248,
+        "min": 122.0,
+        "mean": 183.2,
+        "p50": 156.0,
+        "p90": 158.0,
+        "p95": 158.6,
+        "p99": 908.6,
+        "max": 3252.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 1,
+      "vad_ends": 2,
+      "seg_accepted": 2,
+      "seg_dropped": 0,
+      "recv": 248,
+      "chunks": 248,
+      "drop_speaking": 0,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 2,
+        "min": 141.0,
+        "mean": 219.0,
+        "p50": 219.0,
+        "p90": 281.4,
+        "p95": 289.2,
+        "p99": 295.4,
+        "max": 297.0
+      },
+      "queue_wait_ms": {
+        "count": 2,
+        "min": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "transcripts": []
+    }
+  },
+  {
+    "label": "normal_1m",
+    "ts": 1782338462.3290622,
+    "window": {
+      "elapsed_s": 23.0,
+      "rms": {
+        "count": 448,
+        "min": 120.0,
+        "mean": 1000.6,
+        "p50": 157.0,
+        "p90": 3846.8,
+        "p95": 5336.5,
+        "p99": 8116.9,
+        "max": 10370.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 2,
+      "vad_ends": 1,
+      "seg_accepted": 0,
+      "seg_dropped": 1,
+      "recv": 448,
+      "chunks": 448,
+      "drop_speaking": 0,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 0
+      },
+      "queue_wait_ms": {
+        "count": 0
+      },
+      "transcripts": []
+    }
+  },
+  {
+    "label": "quiet",
+    "ts": 1782338495.3479905,
+    "window": {
+      "elapsed_s": 18.8,
+      "rms": {
+        "count": 301,
+        "min": 125.0,
+        "mean": 393.7,
+        "p50": 155.0,
+        "p90": 1090.0,
+        "p95": 1680.0,
+        "p99": 2734.0,
+        "max": 2871.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 2,
+      "vad_ends": 1,
+      "seg_accepted": 1,
+      "seg_dropped": 0,
+      "recv": 567,
+      "chunks": 301,
+      "drop_speaking": 266,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 0
+      },
+      "queue_wait_ms": {
+        "count": 1,
+        "min": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "transcripts": []
+    }
+  },
+  {
+    "label": "loud",
+    "ts": 1782338527.9786348,
+    "window": {
+      "elapsed_s": 13.2,
+      "rms": {
+        "count": 527,
+        "min": 0.0,
+        "mean": 5718.2,
+        "p50": 2176.0,
+        "p90": 17191.8,
+        "p95": 20550.4,
+        "p99": 25219.8,
+        "max": 28093.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 1,
+      "vad_ends": 0,
+      "seg_accepted": 0,
+      "seg_dropped": 0,
+      "recv": 659,
+      "chunks": 527,
+      "drop_speaking": 132,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 0
+      },
+      "queue_wait_ms": {
+        "count": 0
+      },
+      "transcripts": []
+    }
+  },
+  {
+    "label": "room_noise",
+    "ts": 1782338575.096639,
+    "window": {
+      "elapsed_s": 14.9,
+      "rms": {
+        "count": 184,
+        "min": 126.0,
+        "mean": 1767.6,
+        "p50": 155.0,
+        "p90": 7340.0,
+        "p95": 8570.4,
+        "p99": 11124.9,
+        "max": 11527.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 1,
+      "vad_ends": 2,
+      "seg_accepted": 2,
+      "seg_dropped": 0,
+      "recv": 184,
+      "chunks": 184,
+      "drop_speaking": 0,
+      "utterances": 1,
+      "stt_ms": {
+        "count": 2,
+        "min": 125.0,
+        "mean": 148.5,
+        "p50": 148.5,
+        "p90": 167.3,
+        "p95": 169.7,
+        "p99": 171.5,
+        "max": 172.0
+      },
+      "queue_wait_ms": {
+        "count": 2,
+        "min": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "transcripts": [
+        "8, 9, 10."
+      ]
+    }
+  },
+  {
+    "label": "tts_playback",
+    "ts": 1782338610.0378263,
+    "window": {
+      "elapsed_s": 15.2,
+      "rms": {
+        "count": 457,
+        "min": 125.0,
+        "mean": 289.7,
+        "p50": 160.0,
+        "p90": 462.6,
+        "p95": 701.8,
+        "p99": 2110.5,
+        "max": 4658.0
+      },
+      "noise_floor": 250.0,
+      "enter_thr": 250.0,
+      "exit_thr": 250.0,
+      "adaptive": false,
+      "vad_starts": 3,
+      "vad_ends": 2,
+      "seg_accepted": 2,
+      "seg_dropped": 0,
+      "recv": 457,
+      "chunks": 457,
+      "drop_speaking": 0,
+      "utterances": 0,
+      "stt_ms": {
+        "count": 0
+      },
+      "queue_wait_ms": {
+        "count": 1,
+        "min": 0.0,
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0
+      },
+      "transcripts": []
+    }
+  }
+]

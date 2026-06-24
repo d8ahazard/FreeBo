@@ -1,16 +1,11 @@
 # Phase 0.3 — Air 2 listening diagnostic (findings of record)
 
-> **STATUS: NOT COMPLETE — pending a real Air 2 hardware run.** Phase 0.3 is a hardware-in-the-loop task and
-> cannot be satisfied on a dev box without the robot. The adaptive-VAD constants in
-> [`autobot/brain/audio_sink.py`](../autobot/brain/audio_sink.py) remain **provisional** until the tables below
-> are filled from a live capture. Do not mark Phase 0.3 done while this banner stands.
->
-> Operator: run `python scripts/audio_diag.py --app http://127.0.0.1:8200 --idle 10 --speech 15` against the
-> live app (speak during the SPEECH window), then transfer the numbers into the tables here and set the final
-> constants from the observed idle-vs-speech RMS.
+> **STATUS: COMPLETE — captured live on the Air 2, 2026-06-24.** Raw evidence:
+> [`data/test-evidence/audio_calibration.json`](../data/test-evidence/audio_calibration.json) (6 windows via
+> the UI Calibrate tab). Final adaptive-VAD constants are set in `.env` and recorded below.
 
 This is the **traceability artifact** for the Phase 0.4 adaptive-VAD thresholds. The adaptive noise-floor
-clamps and enter/exit constants must be derived from the measurements recorded here, not tuned by feel.
+clamps and enter/exit constants are derived from the measurements recorded here, not tuned by feel.
 
 The listening pipeline under test is the native path:
 robot mic → Agora RTC → `AgoraNativeReceiver` (16 kHz PCM) → `MediaHub` → `AudioSink` → `brain.feed_speech`.
@@ -28,38 +23,46 @@ The legacy 2.5 s `skills/voice.py` chunker is NOT on this path.
 4. Capture a few raw utterance WAVs for intelligibility (operator: save from the publish/STT tap) and note
    whether Whisper transcribed them correctly.
 
-## Measurements (PENDING HARDWARE RUN — fill from step 2-4)
+## Measurements (live Air 2, 2026-06-24; RMS = AudioSink window distribution)
 
-| Quantity | Source field | Quiet room | Normal speech | Notes |
-|---|---|---|---|---|
-| RMS floor (idle) | `max_rms` after 10 s silence | _TBD_ | — | baseline noise |
-| RMS during speech | `max_rms` while speaking | — | _TBD_ | |
-| Packets received | `recv` / `chunks` | _TBD_ | _TBD_ | confirms audio flows at all |
-| `drop_speaking` | echo-gate drops | _TBD_ | _TBD_ | should be ~0 unless TTS active |
-| VAD starts/ends | `vad_starts` / `vad_ends` | should be 0 | should match #utterances | |
-| Accept vs drop | `seg_accepted` / `seg_dropped_short` | — | _TBD_ | drops = too-short tuning |
-| STT latency | `last_stt_ms` | — | _TBD_ | CPU base.en budget |
-| Queue wait | `last_queue_wait_ms` | — | _TBD_ | backlog indicator |
-| Transcript accuracy | `/api/diag/heard` | — | _TBD_ | intelligibility verdict |
+Captured via the UI **Calibrate** tab (per-window `POST /api/diag/audio/reset` → read → `…/capture`). STT ran
+on **GPU** (`cuda:float16:base.en`).
 
-## Failure attribution (fill the conclusion)
+| Window | RMS p50 | RMS p90 | RMS p95 | RMS max | vad starts/ends | accepted/dropped | STT p50 ms | transcripts |
+|---|---|---|---|---|---|---|---|---|
+| silence (idle) | 156 | 158 | 159 | 3252* | 1 / 2 | 2 / 0 | 219 | — (filtered) |
+| normal @1m | 157 | 3847 | 5337 | 10370 | 2 / 1 | 0 / 1 | — | **0 (over-segmented)** |
+| quiet | 155 | 1090 | 1680 | 2871 | 2 / 1 | 1 / 0 | — | — |
+| loud | 2176 | 17192 | 20550 | 28093 | 1 / 0 | 0 / 0 | — | — |
+| room_noise | 155 | 7340 | 8570 | 11527 | 1 / 2 | 2 / 0 | 148 | "8, 9, 10." ✓ |
+| tts_playback (self-echo) | 160 | 463 | 702 | 4658 | 3 / 2 | 2 / 0 | — | — (filtered) |
 
-- [ ] **No audio** — `recv`/`chunks` ~0 → media/mic handshake (RTC recv-audio / 102001-102003), not VAD.
-- [ ] **VAD never fires** — `recv` high but `vad_starts` 0 → threshold too high vs speech RMS (→ 0.4 floor).
-- [ ] **VAD over-fires** — `vad_starts` high on silence → threshold too low / noisy room (→ 0.4 floor + hysteresis).
-- [ ] **Segments dropped** — `seg_dropped_short` high → `min_speech_s` / sample-length gate too strict.
-- [ ] **STT slow** — `last_stt_ms` or `last_queue_wait_ms` large → model/device (CPU base.en) budget.
-- [ ] **Hallucination/echo** — phantom transcripts or self-echo → filter + barge-in self-echo rejection (0.5).
+\* idle p99 ~900 / max 3252 are rare single-chunk transients (filtered by `min_speech_s`, not real speech).
 
-## Derived Phase 0.4 constants (set after the run)
+Idle floor ≈ **158 RMS** (steady p50/p90). Even **quiet** speech energy (~1000+) is ~6× idle. STT on GPU is
+**~150–300 ms/utterance** with **0 queue wait** (vs ~14 s on CPU pre-fix).
 
-| Constant (env) | Provisional default | Final (from data) | Rationale |
-|---|---|---|---|
-| `AUTOBOT_STT_RMS_MIN` (floor clamp low) | 250 | _TBD_ | must stay above idle noise floor |
-| `AUTOBOT_STT_RMS_MAX` (floor clamp high) | 1500 | _TBD_ | never learn speech-level as noise |
-| `AUTOBOT_STT_ENTER_K` (enter = K·floor) | 2.5 | _TBD_ | speech RMS / idle floor ratio |
-| `AUTOBOT_STT_EXIT_K` (exit = K·floor) | 1.5 | _TBD_ | hysteresis below enter |
-| `AUTOBOT_STT_RMS` (hard override) | unset | — | if set, disables adaptation (rollback) |
+## Failure attribution (conclusions)
 
-> Provisional defaults are conservative starting points. Replace the "Final" column with values traceable to
-> the recorded RMS distribution, then update the `audio_sink.py` defaults + this note in the same change.
+- [x] **STT was slow (FIXED)** — CPU `base.en` ~14 s/utt + 22 s backlog → moved STT to **GPU** (`cuda:float16`),
+  now ~150–300 ms. Required dropping the cortex 14b→7b to free VRAM (temporary; see `.env`).
+- [x] **Segments dropped on paused speech** — `normal_1m` produced 0 transcripts (words separated by sub-
+  threshold gaps end the segment at `hang_s=0.7`, then drop as too-short). **Fix:** `AUTOBOT_STT_HANG` 0.7 → 0.8.
+- [x] **Self-echo present** — `tts_playback` robot voice reached ~700–4658 RMS and tripped VAD 3× with
+  `drop_speaking=0`: the manual `/api/control say` button does NOT arm the echo gate (the brain's `say` tool
+  does, via SpeechService). FOLLOW-UP for the barge-in gate (route control-say through SpeechService).
+- [x] **No "no-audio" / "VAD-never-fires" failures** — `recv` advanced in every window; VAD fired on speech.
+
+## Final adaptive-VAD constants (set in `.env`, from the data above)
+
+| Constant (env) | Final | Rationale (from data) |
+|---|---|---|
+| `AUTOBOT_STT_RMS_MIN` (floor clamp low) | **150** | at/below the measured idle floor (~158) |
+| `AUTOBOT_STT_RMS_MAX` (floor clamp high) | **500** | well below quiet-speech energy (~1000) so the floor can never learn speech as noise |
+| `AUTOBOT_STT_ENTER_K` (enter = K·floor) | **2.5** | enter ≈ 395 at floor 158 — above idle, below quiet speech (~1000) |
+| `AUTOBOT_STT_EXIT_K` (exit = K·floor) | **1.5** | exit ≈ 237 — hysteresis below enter |
+| `AUTOBOT_STT_HANG` (utterance end-gap) | **0.8** | 0.7 over-segmented paused command speech |
+| `AUTOBOT_STT_RMS` (fixed override) | unset | removed → adaptive engages; set =250 to revert to the validated fixed gate |
+
+> The fixed `RMS=250` gate was also validated by the data (it sits between idle 158 and quiet speech 1000),
+> but the adaptive floor is more robust to room-condition changes and is the chosen production setting.

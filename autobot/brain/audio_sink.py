@@ -82,6 +82,7 @@ class AudioSink:
         self._worker: Optional[threading.Thread] = None
         self._unsub_audio = None          # MediaHub unsubscribe handle (so stop() removes our subscriber)
         self._whisper = None
+        self._stt_device_loaded = None     # the actual device:compute:model Whisper loaded on (or CPU fallback)
         # Normal STT and barge-in STT share ONE Faster-Whisper model; serialize access so they never run it
         # concurrently (CTranslate2 models are not safe to call from two threads at once).
         self._whisper_lock = threading.Lock()
@@ -108,6 +109,15 @@ class AudioSink:
         self._last_stt_ms = 0.0       # wall ms of the last transcription
         self._last_queue_wait_ms = 0.0  # ms a segment waited in the STT queue before processing
         self._events: "deque[dict]" = deque(maxlen=64)  # recent stage transitions (NOT per-packet)
+        # --- window-scoped diagnostics (Correction 4): per-session RMS / STT / queue samples + transcripts so
+        # a measurement window can report a real distribution (count/min/mean/p50/p90/p95/p99/max), not just a
+        # cumulative max. diag_reset() starts an epoch; diag_window() reports since the reset.
+        self._rms_samples: "deque[int]" = deque(maxlen=30000)
+        self._stt_samples: "deque[float]" = deque(maxlen=1000)
+        self._queue_samples: "deque[float]" = deque(maxlen=1000)
+        self._diag_transcripts: "deque[str]" = deque(maxlen=200)
+        self._diag_base: dict = {}
+        self._diag_started = 0.0
         # --- barge-in (Phase 0.5): detect STOP/QUIET DURING our own TTS so the robot can be interrupted ---
         # The MediaHub audio callback only pushes the newest audio into a bounded single-window buffer and
         # returns (never STT/blocks). A dedicated worker classifies it (PCM -> STT -> narrow keyword match),
@@ -131,6 +141,61 @@ class AudioSink:
             self._events.append({"t": round(time.time(), 3), "stage": stage, **kw})
         except Exception:  # noqa: BLE001
             pass
+
+    # --- window-scoped diagnostics ---
+    @staticmethod
+    def _pct(sorted_vals: list, q: float):
+        if not sorted_vals:
+            return None
+        k = (len(sorted_vals) - 1) * q
+        f = int(k)
+        c = min(f + 1, len(sorted_vals) - 1)
+        if f == c:
+            return round(float(sorted_vals[f]), 1)
+        return round(float(sorted_vals[f]) + (sorted_vals[c] - sorted_vals[f]) * (k - f), 1)
+
+    def _stats(self, vals: list) -> dict:
+        if not vals:
+            return {"count": 0}
+        s = sorted(vals)
+        return {"count": len(s), "min": round(float(s[0]), 1), "mean": round(sum(s) / len(s), 1),
+                "p50": self._pct(s, 0.5), "p90": self._pct(s, 0.9), "p95": self._pct(s, 0.95),
+                "p99": self._pct(s, 0.99), "max": round(float(s[-1]), 1)}
+
+    def diag_reset(self) -> None:
+        """Start a fresh measurement epoch (e.g. before an idle window, then again before a speech window)."""
+        self._rms_samples.clear()
+        self._stt_samples.clear()
+        self._queue_samples.clear()
+        self._diag_transcripts.clear()
+        self._diag_base = {"vad_starts": self._vad_starts, "vad_ends": self._vad_ends,
+                           "seg_accepted": self._seg_accepted, "seg_dropped": self._seg_dropped_short,
+                           "recv": self._recv, "chunks": self._nchunks,
+                           "drop_speaking": self._drop_speaking, "utterances": self.utterances}
+        self._diag_started = time.time()
+
+    def diag_window(self) -> dict:
+        """Stats since the last diag_reset(): RMS distribution, thresholds/floor, VAD + segment counts, STT and
+        queue-wait distributions, and the transcripts produced in this window."""
+        b = self._diag_base
+        enter_thr, exit_thr = self._thresholds()
+        rms = list(self._rms_samples)
+        return {
+            "elapsed_s": round(time.time() - self._diag_started, 1) if self._diag_started else None,
+            "rms": self._stats(rms),
+            "noise_floor": round(self._floor, 1), "enter_thr": round(enter_thr, 1),
+            "exit_thr": round(exit_thr, 1), "adaptive": self.adaptive,
+            "vad_starts": self._vad_starts - b.get("vad_starts", 0),
+            "vad_ends": self._vad_ends - b.get("vad_ends", 0),
+            "seg_accepted": self._seg_accepted - b.get("seg_accepted", 0),
+            "seg_dropped": self._seg_dropped_short - b.get("seg_dropped", 0),
+            "recv": self._recv - b.get("recv", 0), "chunks": self._nchunks - b.get("chunks", 0),
+            "drop_speaking": self._drop_speaking - b.get("drop_speaking", 0),
+            "utterances": self.utterances - b.get("utterances", 0),
+            "stt_ms": self._stats(list(self._stt_samples)),
+            "queue_wait_ms": self._stats(list(self._queue_samples)),
+            "transcripts": list(self._diag_transcripts),
+        }
 
     def _thresholds(self) -> tuple[float, float]:
         """(enter, exit) RMS thresholds. Fixed mode: both equal `rms_threshold` (no hysteresis, old behavior).
@@ -163,6 +228,7 @@ class AudioSink:
                 "utterances": self.utterances, "last_text": self._last_text, "last_error": self.last_error,
                 "drop_empty": self._drop_empty, "drop_speaking": self._drop_speaking,
                 "drop_rms": self._drop_rms, "whisper_loaded": self._whisper is not None,
+                "stt_device": self._stt_device_loaded,
                 # per-stage diagnostics
                 "vad_starts": self._vad_starts, "vad_ends": self._vad_ends,
                 "seg_accepted": self._seg_accepted, "seg_dropped_short": self._seg_dropped_short,
@@ -233,6 +299,7 @@ class AudioSink:
         self._nchunks += 1
         if rms > self._max_rms:
             self._max_rms = rms
+        self._rms_samples.append(rms)   # window-scoped RMS distribution (diag)
         # Adaptive floor learns from silence (no-op in fixed mode); enter/exit hysteresis decides "voiced".
         self._update_floor(rms)
         enter_thr, exit_thr = self._thresholds()
@@ -290,11 +357,28 @@ class AudioSink:
             compute = os.environ.get("AUTOBOT_STT_COMPUTE", "int8" if device == "cpu" else "float16")
             try:
                 self._whisper = WhisperModel(model, device=device, compute_type=compute)
-            except Exception:  # noqa: BLE001 - bad device/model -> fall back to safe CPU base.en
+                self._stt_device_loaded = f"{device}:{compute}:{model}"
+            except Exception as e:  # noqa: BLE001 - bad device/model -> fall back to safe CPU base.en
+                self._stt_device_loaded = f"cpu:int8:base.en (FELL BACK from {device}: {type(e).__name__})"
                 self._whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
         return self._whisper
 
+    def _warm(self) -> None:
+        """Pre-load + warm the Whisper model at startup so the FIRST real utterance (and the first STOP) is not
+        a cold-start (cold GPU transcribe measured ~4.7s; warm is sub-second). Shared by normal + barge-in STT."""
+        try:
+            import numpy as np
+            m = self._get_whisper()
+            with self._whisper_lock:
+                segs, _ = m.transcribe(np.zeros(8000, dtype="float32"), language="en", vad_filter=False)
+                list(segs)
+            self._ev("stt_warmed", device=self._stt_device_loaded)
+        except Exception as e:  # noqa: BLE001
+            self.last_error = f"stt warm: {type(e).__name__}: {e}"
+            self._ev("stt_warm_failed", error=self.last_error)
+
     def _stt_loop(self) -> None:
+        self._warm()
         while self._running:
             with self._cv:
                 while self._running and not self._jobs:
@@ -303,6 +387,7 @@ class AudioSink:
                     break
                 seg, enq_ts = self._jobs.popleft()
             self._last_queue_wait_ms = (time.monotonic() - enq_ts) * 1000.0
+            self._queue_samples.append(self._last_queue_wait_ms)
             self._stt_runs += 1
             self._ev("stt_started", queue_wait_ms=round(self._last_queue_wait_ms, 1))
             t0 = time.monotonic()
@@ -314,8 +399,11 @@ class AudioSink:
                 self._ev("stt_failed", error=self.last_error)
                 continue
             self._last_stt_ms = (time.monotonic() - t0) * 1000.0
+            self._stt_samples.append(self._last_stt_ms)
             self._ev("transcript_produced", text=(text or "")[:60], ms=round(self._last_stt_ms, 1))
             self._last_text = text or self._last_text
+            if text:
+                self._diag_transcripts.append(text)
             if text and self.on_utterance:
                 self.utterances += 1
                 try:
