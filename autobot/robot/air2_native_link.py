@@ -230,7 +230,9 @@ class Air2NativeLink(RobotLink):
                "sleeping": False, "paused": self._paused, "resting": self.is_resting(), "touched": self._touched(),
                "variant": "AIR2", "via": "native_rtm+rtc", "browser_connected": False,
                "video_frames": self.hub.stats().get("video_count", 0),
-               "audio_frames": self.hub.stats().get("audio_count", 0), "ts": time.time()}
+               "audio_frames": self.hub.stats().get("audio_count", 0),
+               "telemetry_age": round(self.rtm.status_age(), 2),   # genuine source-update age (HOLD-on-stale)
+               "ts": time.time()}
         for k in ("imu", "accel", "gyro", "tof", "distance", "obstacle", "wifi", "wifiStrength",
                   "laser", "moveSpeed", "moveMode", "lowBatteryPercentage", "liveStatus", "avoidobstacle"):
             if k in st:
@@ -245,6 +247,16 @@ class Air2NativeLink(RobotLink):
         if not self._connected():
             return None, "RTM not connected (native link starting up)"
         return None, "no_frame_yet"
+
+    async def snapshot_sample(self):
+        """Sequence-aware snapshot from the MediaHub: real per-frame `seq` + monotonic `wall_ts`, so motion
+        evidence can require a NEW frame (seq newer than 'before') after a pulse and never read a stale cached
+        frame as 'stuck'."""
+        self._ensure_media()
+        fs = self.hub.latest_sample(max_w=960, quality=75)
+        if not fs.valid and not self._connected():
+            fs.error = "RTM not connected (native link starting up)"
+        return fs
 
     # --- control (native RTM) ---
     async def drive(self, ly: float, rx: float) -> dict[str, Any]:
@@ -354,6 +366,16 @@ class Air2NativeLink(RobotLink):
             self._tx_audio += 1
         res.setdefault("available", True)
         return res
+
+    def cancel_playback(self, playback_id: int | None = None) -> dict[str, Any]:
+        """Barge-in: stop the in-flight TTS clip on the robot speaker (drops its queued RTP -> silence). Keeps
+        the RTC/call + mic alive. Synchronous + thread-safe so it can be called from the audio worker via the
+        AudioState canceller. Fail-soft."""
+        try:
+            fn = getattr(self.receiver, "cancel_playback", None)
+            return fn(playback_id) if fn else {"ok": False, "error": "no publish track"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     async def say_text(self, text: str) -> dict[str, Any]:
         # The brain/web render WAV and call publish_speech() directly; this is a fallback for raw-text callers.

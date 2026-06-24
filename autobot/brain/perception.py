@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 
 from ..robot.link import RobotLink
+from ..robot.media_hub import FrameSample
 
 
 @dataclass
@@ -19,6 +20,9 @@ class Observation:
     snapshot_error: str | None = None
     ts: float = field(default_factory=time.time)
     caption: str = ""    # set in hybrid mode: a vision model's description of the frame (for a text-only brain)
+    # Sequence-aware frame sample (seq/wall_ts/age/valid). `jpeg` is retained as a plain field for
+    # compatibility (Phase 0.6); motion evidence reads `frame.seq` to require a NEW frame after a pulse.
+    frame: FrameSample | None = None
 
     @property
     def has_image(self) -> bool:
@@ -75,8 +79,10 @@ async def perceive(link: RobotLink, want_image: bool = True) -> Observation:
     telemetry = await link.telemetry()
     jpeg = None
     err = None
+    frame = None
     if want_image and telemetry.get("awake"):
-        jpeg, err = await link.snapshot()
+        frame = await link.snapshot_sample()
+        jpeg, err = frame.jpeg, frame.error
     elif want_image:
         err = "asleep"
-    return Observation(telemetry=telemetry, jpeg=jpeg, snapshot_error=err)
+    return Observation(telemetry=telemetry, jpeg=jpeg, snapshot_error=err, frame=frame)

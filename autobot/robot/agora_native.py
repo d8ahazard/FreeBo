@@ -156,7 +156,14 @@ class AgoraNativeReceiver:
         self._pub_ts = 0
         self._pub_task: Optional[asyncio.Task] = None
         self._want_publish = False                # keep the talkback track alive across RTC reconnects
-        self._tts_payloads: deque = deque()      # queued G.711 frames (TTS) to send on the publish loop
+        # Queued G.711 frames as (playback_id, frame). Tagging each frame with its clip id lets barge-in cancel
+        # a specific clip mid-stream (drop its remaining frames -> silence) WITHOUT killing the publish task —
+        # continuous silence must keep flowing to sustain the robot's mic/call. See cancel_playback().
+        self._tts_payloads: "deque[tuple[int, bytes]]" = deque()
+        self._playback_seq = 0                    # monotonic clip id
+        self._playbacks: dict[int, dict] = {}     # id -> handle {id, generation, expected_s, start_ts, cancelled}
+        self._active_playback_id: Optional[int] = None
+        self._cancelled_playbacks: set[int] = set()
         self._talk_on = os.environ.get("AUTOBOT_AIR2_NATIVE_TALK", "1").strip().lower() in (
             "1", "true", "yes", "on")
 
@@ -728,7 +735,13 @@ class AgoraNativeReceiver:
         silence = self._alaw_silence()
         sent = 0
         while self.connected:
-            payload = self._tts_payloads.popleft() if self._tts_payloads else silence
+            payload = silence
+            if self._tts_payloads:
+                pid, frame = self._tts_payloads.popleft()
+                # Cancelled clip: drop its frame, emit silence instead (keeps the call/mic alive).
+                payload = silence if pid in self._cancelled_playbacks else frame
+                if not self._tts_payloads or self._tts_payloads[0][0] != pid:
+                    self._finish_playback(pid)   # this clip's frames are exhausted
             pkt = RtpPacket(payload_type=8, sequence_number=self._pub_seq & 0xFFFF,
                             timestamp=self._pub_ts & 0xFFFFFFFF, ssrc=self._pub_ssrc, marker=False)
             pkt.payload = payload
@@ -744,10 +757,17 @@ class AgoraNativeReceiver:
                 print("[agora-native] audio publish active (G.711 A-law)", flush=True)
             await asyncio.sleep(0.02)
 
+    def _finish_playback(self, pid: int) -> None:
+        hb = self._playbacks.get(pid)
+        if hb is not None:
+            hb["done"] = True
+        if self._active_playback_id == pid:
+            self._active_playback_id = None
+
     async def publish_audio(self, wav_bytes: bytes) -> dict:
         """Queue a TTS clip (WAV) to stream into the RTC channel as G.711 A-law so the robot speaker plays it.
         Starts the publish track if needed. The robot also needs intercom enabled (RTM 102003), sent by the
-        link. Fail-soft."""
+        link. Returns a `playback_id` so the clip can be cancelled (barge-in). Fail-soft."""
         if not self._pub or not self.connected:
             return {"ok": False, "error": "RTC channel not connected"}
         try:
@@ -756,7 +776,35 @@ class AgoraNativeReceiver:
             return {"ok": False, "error": f"g711 encode failed: {type(e).__name__}: {e}"}
         if not frames:
             return {"ok": False, "error": "no audio frames to send"}
+        self._playback_seq += 1
+        pid = self._playback_seq
+        self._playbacks[pid] = {"id": pid, "generation": self._playback_seq,
+                                "expected_s": round(len(frames) * 0.02, 2), "start_ts": time.monotonic(),
+                                "cancelled": False, "done": False}
+        self._active_playback_id = pid
         self.ensure_publishing()
-        self._tts_payloads.extend(frames)
+        self._tts_payloads.extend((pid, f) for f in frames)
         return {"ok": True, "available": True, "sent_frames": len(frames), "robot_confirmed": False,
+                "playback_id": pid,
                 "note": "TTS queued on the G.711 publish track (confirm the robot speaker plays it)"}
+
+    def cancel_playback(self, playback_id: Optional[int] = None) -> dict:
+        """Barge-in: stop a TTS clip mid-stream. Invalidates that clip's queued frames (the publish loop emits
+        silence in their place), leaves the publish task + RTC/call running (silence sustains the mic), and is
+        idempotent. `None` cancels whatever is currently playing. Safe to call from any thread (deque/set ops
+        are atomic in CPython; no await)."""
+        pid = playback_id if playback_id is not None else self._active_playback_id
+        if pid is None:
+            return {"ok": True, "note": "nothing playing"}
+        self._cancelled_playbacks.add(pid)
+        # Drop this clip's still-queued frames (others, if any, survive).
+        self._tts_payloads = deque((p, f) for (p, f) in self._tts_payloads if p != pid)
+        hb = self._playbacks.get(pid)
+        if hb is not None:
+            hb["cancelled"] = True
+        if self._active_playback_id == pid:
+            self._active_playback_id = None
+        # Bound the cancelled-set so it can't grow unbounded over a long session.
+        if len(self._cancelled_playbacks) > 64:
+            self._cancelled_playbacks = set(sorted(self._cancelled_playbacks)[-32:])
+        return {"ok": True, "playback_id": pid}

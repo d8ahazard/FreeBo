@@ -25,15 +25,13 @@ from typing import Awaitable, Callable
 
 from ..config import Settings
 from ..robot.link import RobotLink
-from . import commands, locomotion, motion_model, reflex_vision, visual_motion
+from . import commands, motion_model, navigator, visual_motion
+from .action_executor import ActionExecutor, State
 from .behavior import BehaviorController
-from .reflex_vision import LoomingDetector
-from . import navigator
 from .curiosity import Curiosity
 from .identity import Identity
 from .memory import Memory
 from .metrics import Metrics
-from .motion_check import MotionConfirmer
 from .omni_client import OmniClient, OmniError, omni_enabled
 from .perception import Observation, perceive
 from .tasks import TaskStore
@@ -98,9 +96,6 @@ class AgentBrain:
         self.memory = memory
         self.identity = identity
         self.safety = SafetyFloor()
-        # Closed-loop motion confirmation: did the last AI move actually move us? (pose_provider wired by the
-        # web server to VSLAM when available; falls back to camera frame-diff otherwise.)
-        self.motion = MotionConfirmer()
         # Curiosity: tracks scene novelty + action repetition so the brain doesn't loop the same spot/move.
         self.curiosity = Curiosity()
         # Behavior: decides whether to roam at all (observe by default; roam only for a reason).
@@ -112,7 +107,7 @@ class AgentBrain:
         self._mp = _mp
         self.motion_profile = _mp.load()
         self._motion_state: str | None = None      # last classified outcome (for status/UI)
-        self._motion_reaction: object | None = None  # a pending stuck/blocked result the next decision reacts to
+        self._motion_reaction: str | None = None    # last move's evidence verdict ('stuck'/'blocked') to react to
         self.skills = build_default_skills()
         self.ctx = SkillContext(link=link, settings=settings, safety=self.safety,
                                 memory=memory, identity=identity, emit=emit)
@@ -146,8 +141,6 @@ class AgentBrain:
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
-        self._looming = LoomingDetector()  # camera looming reflex (substitute for ToF on sensorless robots)
-        self._loom_frame_ts = 0.0
         # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
         self._nav_cycle = 0
         self._nav_last_dir = "right"
@@ -155,8 +148,15 @@ class AgentBrain:
         self._proprio_jpeg: bytes | None = None   # last frame, for the camera-based "am I moving" proprioception
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_spoken = ""       # last line we said aloud (for the SPEAK_UP "say that again" command)
+        self._active_playback_id = None   # current TTS clip id on the link (for barge-in cancellation)
         # Per-phase latency metrics (perceive/provider/tool/reason/...). See docs/MATURITY.md §2.
         self.metrics = Metrics()
+        # Single authoritative motion path: every AI drive goes through the ActionExecutor, which authorizes
+        # via the safety floor, issues one pulse, and confirms with SEQUENCE-AWARE camera evidence (no fresh
+        # frame => UNKNOWN, never a false 'stuck'). Replaces the old dual confirm (locomotion immediate +
+        # MotionConfirmer next-cycle). See autobot/brain/action_executor.py.
+        self.executor = ActionExecutor(link, self.safety, emit=emit, metrics=self.metrics)
+        self.ctx.executor = self.executor
         # Hybrid 'eyes' (VLM service) health: None=unknown, True=reachable, False=down (cortex falls back to
         # seeing the camera directly). Tracked from perceive outcomes + an explicit cold-start probe.
         self._vlm_ok: bool | None = None
@@ -246,19 +246,28 @@ class AgentBrain:
         self.ctx.motion_profile = self.motion_profile
 
     def _calib_drive(self, action: str) -> tuple[float, float, float] | None:
-        """A drive vector for a coarse action, sized from the calibration profile when available so the robot
-        takes controlled steps; falls back to the fixed _OMNI_DRIVE tuples otherwise."""
+        """A drive vector for a coarse action, sized from the calibration profile when available, else from the
+        hard-coded motion-model seed values (deadband-safe per-variant defaults). The ActionExecutor re-clamps
+        through the safety floor and confirms the move; raw magnitudes here are intent, not trusted truth."""
         p = self.motion_profile
         if p is not None:
-            if action in ("forward",):
-                return (p.forward_speed, 0.0, p.forward_duration)
-            if action in ("back", "backward"):
-                return (-p.forward_speed, 0.0, min(p.forward_duration, 0.8))
-            if action == "left":
-                return (0.0, -p.turn_rx, p.turn_duration)
-            if action == "right":
-                return (0.0, p.turn_rx, p.turn_duration)
-        return self._OMNI_DRIVE.get(action)
+            fwd_speed, fwd_dur = p.forward_speed, p.forward_duration
+            turn_rx, turn_dur = p.turn_rx, p.turn_duration
+        else:
+            m = motion_model.for_variant(getattr(self.settings.snapshot(), "robot_variant", "AIR2"))
+            fwd_speed = max(m.forward_deadband + 0.05, m.forward_unit_speed)
+            fwd_dur = m.forward_unit_duration
+            turn_rx = max(m.turn_deadband + 0.02, m.turn_unit_rx)
+            turn_dur = m.turn_unit_duration
+        if action == "forward":
+            return (fwd_speed, 0.0, fwd_dur)
+        if action in ("back", "backward"):
+            return (-fwd_speed, 0.0, min(fwd_dur, 0.8))
+        if action == "left":
+            return (0.0, -turn_rx, turn_dur)
+        if action == "right":
+            return (0.0, turn_rx, turn_dur)
+        return None
 
     def feed_task(self, text: str) -> None:
         """A scheduled task fired: inject its text as a high-priority directive so the robot acts on it
@@ -297,6 +306,54 @@ class AgentBrain:
                 return
         self._speech_pending.set()
         self._post("speech", {"addressed": addressed})
+
+    def handle_critical(self, intent: str) -> None:
+        """Barge-in entry point, called from the AudioSink barge-in worker THREAD when a STOP/QUIET is heard
+        while the robot is talking. Does the thread-safe loop handoff (no async work on the audio thread)."""
+        loop = self._loop
+        if loop is None or not intent:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._handle_critical_async(intent), loop)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _handle_critical_async(self, intent: str) -> None:
+        """Apply a barge-in command immediately: cancel our own TTS, preempt + stop the robot, then run the
+        command. The clock for this started at the detected keyword (in the worker), not at utterance endpoint."""
+        from . import audio_state
+        audio_state.cancel()          # stop the in-flight TTS now (resets the echo gate + flushes the clip)
+        await self.executor.preempt("barge-in critical command")   # cancel any in-flight AI move + stop
+        try:
+            s = self.settings.snapshot()
+            await self._apply_command(intent, "", s)   # STOP -> hold position; QUIET -> hush window
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_visual_loom(self, score: float) -> None:
+        """Called from the VisualReflex WORKER thread when the camera shows something looming. Thread-safe
+        handoff to the loop — never touch the robot directly from the media/reflex thread."""
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._handle_loom(score), loop)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _handle_loom(self, score: float) -> None:
+        """Stop NOW for a looming obstacle and arm 'turn, don't push forward' for the next decision. Preempts
+        any in-flight AI move through the single executor. Fastest available visual reflex (not hard real-time
+        — it rides the cloud video stream)."""
+        s = self.settings.snapshot()
+        if s.asleep or not s.allow_motion:
+            return
+        with self.metrics.timer("reflex_stop"):
+            await self.executor.preempt("visual looming reflex")
+        self._reflex_blocked = True
+        await self._express("surprised")
+        await self.emit({"type": "thought", "text": f"(visual reflex: looming {score:.3f} — stopping)",
+                         "ts": time.time()})
 
     # --- lifecycle ---
     def start(self):
@@ -462,16 +519,8 @@ class AgentBrain:
                     have_tof = isinstance(tof, (int, float)) and tof >= 0
                     close = have_tof and REFLEX_STOP_CM > 0 and 0 <= tof < REFLEX_STOP_CM and not resting
                     reason = f"obstacle {int(tof)}cm ahead" if close else ""
-                    # Camera looming reflex: only when there's no real ToF (e.g. Air 2). Diverging optical flow
-                    # in the center = approaching something head-on; ignores turns (no divergence on a pivot).
-                    if not have_tof and reflex_vision.LOOM_THRESHOLD > 0 and not resting:
-                        obs = self.buffer.obs
-                        if obs is not None and getattr(obs, "jpeg", None) and self.buffer.frame_ts > self._loom_frame_ts:
-                            self._loom_frame_ts = self.buffer.frame_ts
-                            score = self._looming.update(obs.jpeg)
-                            if score >= reflex_vision.LOOM_THRESHOLD:
-                                close = True
-                                reason = "something looming close ahead"
+                    # Camera looming now runs at VIDEO RATE in VisualReflex (subscribed to the MediaHub),
+                    # not on this slow poll — see on_visual_loom(). This loop keeps the ToF/IR reflex (SE).
                     if close and not self._reflex_active:
                         self._reflex_active = True
                         self._reflex_blocked = True   # next cortex decision should turn, not drive forward
@@ -633,7 +682,14 @@ class AgentBrain:
         return True
 
     def _motion_allowed(self, s: Settings, resting: bool) -> bool:
-        return bool(s.allow_motion) and s.autonomy in ("assist", "auto") and not resting
+        if not (bool(s.allow_motion) and s.autonomy in ("assist", "auto") and not resting):
+            return False
+        # HOLD-on-stale-telemetry (Phase 0.8): if the telemetry plane has gone quiet (RTM source-update age
+        # past its budget), don't drive blind — video and telemetry have SEPARATE freshness limits.
+        age = (self.buffer.telemetry or {}).get("telemetry_age")
+        if isinstance(age, (int, float)) and age > getattr(s, "telemetry_max_age_s", 5.0):
+            return False
+        return True
 
     def _tool_exclusions(self, s: Settings, resting: bool) -> set[str]:
         if not self._motion_allowed(s, resting):
@@ -686,28 +742,25 @@ class AgentBrain:
         who = heard.get("speaker", "someone")
         return f'You just heard {who} say: "{text}". Respond if appropriate.'
 
-    # --- closed-loop motion confirmation ---
-    async def _confirm_motion(self, s: Settings, obs: Observation) -> None:
-        """If a move was issued last cycle, verify the robot actually moved (camera frame-diff + VSLAM pose).
-        Surfaces a `motion` event for the UI, records the state for status, and arms a one-shot reaction so the
-        next decision can escape a stuck/blocked situation instead of pushing forward into a wall again."""
-        self._motion_reaction = None   # one-shot: only valid for the cycle right after a move
-        if not getattr(s, "confirm_motion", True) or not self.motion.has_pending():
-            return
-        res = self.motion.confirm(obs.jpeg)
-        if not res:
-            return
-        self._motion_state = res.state
-        await self.emit({"type": "motion", "state": res.state, "detail": res.detail,
-                         "evidence": res.evidence, "ts": time.time()})
-        if res.state in ("stuck", "blocked"):
-            self._motion_reaction = res
-            await self.emit({"type": "thought", "text": f"(motion check: {res.state} — {res.detail})",
-                             "ts": time.time()})
+    # --- closed-loop motion reaction (evidence now comes inline from the ActionExecutor) ---
+    async def _drive_via_executor(self, s: Settings, ly: float, rx: float, duration: float,
+                                  action_label: str = "", source: str = "ai",
+                                  parent_id: str | None = None) -> dict:
+        """Route an AI drive through the single ActionExecutor (the only physical-motion path) and fold its
+        evidence verdict into the next-decision reaction state. Returns a result dict for the action log/UI."""
+        act = await self.executor.run_drive(ly, rx, duration, settings=s, source=source, parent_id=parent_id)
+        self._motion_state = act.result
+        self._motion_reaction = act.result if act.result in ("stuck", "blocked") else None
+        try:
+            self.curiosity.note_action(action_label or self._coarse_dir(ly, rx))
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": act.state == State.SUCCEEDED, "state": act.result, "lifecycle": act.state.value,
+                "action_id": act.id, "parent_id": act.parent_id,
+                "drove": {"ly": ly, "rx": rx, "duration": duration}}
 
     def _stuck_forward(self, action: str) -> bool:
-        r = self._motion_reaction
-        return (r is not None and getattr(r, "state", "") in ("stuck", "blocked")
+        return (self._motion_reaction in ("stuck", "blocked")
                 and action in ("forward", "back", "backward"))
 
     # --- robustness: small local models (e.g. qwen2.5:7b via Ollama) often write tool calls as prose
@@ -962,7 +1015,6 @@ class AgentBrain:
                 self.last_observation = obs
                 self._apply_pose(obs)
                 await self.registry.on_observe(obs)
-                await self._confirm_motion(s, obs)
             eye_anims = obs.telemetry.get("eye_animations", [])
             await self.emit({"type": "observation", "summary": obs.text_summary(),
                              "telemetry": obs.telemetry, "ts": obs.ts})
@@ -1088,12 +1140,15 @@ class AgentBrain:
                         actions.append({"name": tc["name"], "args": tc["arguments"], "result": res})
                         await self.emit({"type": "tool_result", "name": tc["name"], "result": res,
                                          "ts": time.time()})
-                        # Arm closed-loop motion confirmation for the next cycle.
-                        if (tc["name"] == "drive" and isinstance(res, dict) and res.get("ok")
-                                and isinstance(res.get("drove"), dict)):
-                            dly, drx = res["drove"].get("ly", 0.0), res["drove"].get("rx", 0.0)
-                            self.motion.record(obs.jpeg, dly, drx)
-                            self.curiosity.note_action(self._coarse_dir(dly, drx))
+                        # The drive tool routes through the ActionExecutor (inline sequence-aware evidence);
+                        # fold its verdict into the next-decision reaction state.
+                        if tc["name"] == "drive" and isinstance(res, dict):
+                            st = res.get("state")
+                            if st:
+                                self._motion_state = st
+                            self._motion_reaction = st if st in ("stuck", "blocked") else None
+                            d = res.get("drove") or {}
+                            self.curiosity.note_action(self._coarse_dir(d.get("ly", 0.0), d.get("rx", 0.0)))
                         messages.append({"role": "tool", "tool_call_id": cid, "content": json.dumps(res)})
                         self._append_history({"role": "tool", "tool_call_id": cid, "content": json.dumps(res)})
                     # Preempt low-priority wandering if someone just spoke — handle that next.
@@ -1136,14 +1191,11 @@ class AgentBrain:
         actions: list[dict] = []
         vec = self._calib_drive(action)
         if vec and self._motion_allowed(s, resting=False):
-            ly, rx, _dur = vec
+            ly, rx, dur = vec
             await self._set_status("acting")
             await self.emit({"type": "tool_call", "name": "drive", "args": {"action": action},
                              "ts": time.time()})
-            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
-                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
-            self.motion.record(obs.jpeg, ly, rx)
-            self.curiosity.note_action(action)
+            res = await self._drive_via_executor(s, ly, rx, dur, action)
             actions.append({"name": "drive", "args": {"action": action}, "result": res})
             await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
         elif action == "stop":
@@ -1211,15 +1263,12 @@ class AgentBrain:
 
         vec = self._calib_drive(action)
         if vec and self._motion_allowed(s, resting):
-            ly, rx, _dur = vec
+            ly, rx, dur = vec
             await self._set_status("acting")
             await self.emit({"type": "tool_call", "name": "drive",
                              "args": {"action": action}, "ts": time.time()})
-            # Closed-loop cerebellum owns the magnitudes/durations + camera-confirms the move.
-            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
-                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
-            self.motion.record(obs.jpeg, ly, rx)
-            self.curiosity.note_action(action)
+            # Single authoritative executor: clamps, pulses, and confirms with sequence-aware evidence.
+            res = await self._drive_via_executor(s, ly, rx, dur, action)
             actions.append({"name": "drive", "args": {"action": action}, "result": res})
             await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
         elif action == "stop":
@@ -1235,21 +1284,32 @@ class AgentBrain:
         return {"ok": True, "actions": actions, "vlm": True, "spoken": spoken, "action": action}
 
     async def _speak(self, text: str) -> None:
-        from . import audio_state, tts
+        from . import audio_state, critical_words, tts
         from .speech_clean import clean_spoken
         text = clean_spoken(text)
+        # Never let the robot UTTER a barge-in trigger word (stop/quiet/...) — it would self-trigger the
+        # interrupt detector (no hardware AEC on this path). Sanitize before rendering. See critical_words.
+        text = critical_words.strip_reserved(text)
         if not text:
             return
         self._last_spoken = text
         try:
             wav = tts.render_wav(text)
+            dur = audio_state.wav_duration_s(wav) if wav else 0.0
             if wav:
-                audio_state.mark_speaking(audio_state.wav_duration_s(wav))
+                audio_state.mark_speaking(dur, text=text)   # echo gate ON immediately (canceller added below)
             # Robot speaker: native links that can publish audio into the call take the rendered WAV directly
             # (keeps TTS out of the robot layer). Others get the text (browser/cloud TTS path).
             pub = getattr(self.link, "publish_speech", None)
             if pub and wav:
-                await pub(wav)
+                res = await pub(wav)
+                pid = res.get("playback_id") if isinstance(res, dict) else None
+                self._active_playback_id = pid
+                cancel = getattr(self.link, "cancel_playback", None)
+                if cancel is not None:
+                    # cancel_playback is sync + thread-safe; safe to call from the barge-in worker directly.
+                    audio_state.mark_speaking(dur, text=text,
+                                              canceller=lambda pid=pid, cancel=cancel: cancel(pid))
             elif self.link.prefers_text_tts():
                 await self.link.say_text(text)
             if wav:
@@ -1259,15 +1319,8 @@ class AgentBrain:
             pass
 
     # --- omni brain (MiniCPM-o: vision + audio + native speech, one model) ---
-    # (ly, rx, duration). Forward bursts are long enough to bridge the gap between fast nav cycles so the
-    # robot rolls continuously instead of lurch-stop-lurch (onboard avoidance + the deadman keep it safe).
-    # Shorter forward bursts (1.2s, was 2.0s): onboard avoidance is OFF, so re-check the camera more often
-    # instead of charging blind — far fewer bumps. Turns stay brief.
-    _OMNI_DRIVE = {
-        "forward": (0.7, 0.0, 1.2), "back": (-0.6, 0.0, 0.8), "backward": (-0.6, 0.0, 0.8),
-        "left": (0.0, -0.7, 0.7), "right": (0.0, 0.7, 0.7),
-    }
-
+    # Coarse action magnitudes/durations come from `_calib_drive` (calibration profile or motion-model seeds);
+    # the ActionExecutor re-clamps + confirms. (The old hard-coded _OMNI_DRIVE tuples were retired in Phase 0.)
     def _omni_instruction(self, s: Settings, obs: Observation) -> str:
         name = s.robot_name or "FreeBo"
         bits = [
@@ -1338,13 +1391,11 @@ class AgentBrain:
         # movement (gated by mode/toggles/resting exactly like the tool path)
         vec = self._calib_drive(action)
         if vec and self._motion_allowed(s, resting):
-            ly, rx, _dur = vec
+            ly, rx, dur = vec
             await self._set_status("acting")
             await self.emit({"type": "tool_call", "name": "drive",
                              "args": {"action": action}, "ts": time.time()})
-            res = await locomotion.drive(link=self.link, safety=self.safety, settings=s,
-                                         profile=self.motion_profile, ly=ly, rx=rx, source="ai", emit=self.emit)
-            self.motion.record(obs.jpeg, ly, rx)
+            res = await self._drive_via_executor(s, ly, rx, dur, action)
             actions.append({"name": "drive", "args": {"action": action}, "result": res})
             await self.emit({"type": "tool_result", "name": "drive", "result": res, "ts": time.time()})
         elif action == "stop":
@@ -1372,9 +1423,9 @@ class AgentBrain:
             bits.append("NOTE: a reflex just stopped you — an obstacle is very close ahead. TURN to a clear "
                         "direction; do NOT drive straight forward.")
         r = self._motion_reaction
-        if r is not None and getattr(r, "state", "") in ("stuck", "blocked"):
-            bits.append(f"NOTE: your last move appears {r.state} ({getattr(r, 'detail', '')}). If forward is "
-                        f"blocked, TURN to find a clear path instead of repeating the same move.")
+        if r in ("stuck", "blocked"):
+            bits.append(f"NOTE: your last move appears {r}. If forward is blocked, TURN to find a clear path "
+                        f"instead of repeating the same move.")
         heard = self._heard_line(s)
         if heard:
             bits.append(heard)

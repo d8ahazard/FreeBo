@@ -75,6 +75,20 @@ class VideoFrame:
 
 
 @dataclass
+class FrameSample:
+    """An atomic snapshot of the newest decoded frame: its JPEG plus the metadata needed to reason about
+    freshness (sequence + monotonic timestamp + age + validity). Motion evidence MUST compare `seq` to decide
+    whether a NEW frame arrived after a pulse — `seq is None` means the link can't provide sequence evidence
+    (treat as UNKNOWN, never as a confident verdict). All fields come from the SAME captured frame."""
+    jpeg: Optional[bytes]
+    seq: Optional[int]
+    wall_ts: float                 # time.monotonic() when the source frame was assembled (0.0 if none)
+    age: float                     # seconds between capture and now (monotonic)
+    valid: bool                    # a usable JPEG is present
+    error: Optional[str] = None
+
+
+@dataclass
 class AudioChunk:
     """One decoded audio chunk — int16 mono PCM, ready for STT/omni without re-decoding."""
     pcm: bytes                     # signed 16-bit little-endian, mono
@@ -177,6 +191,26 @@ class MediaHub:
             self._latest_jpeg = jpeg
             self._latest_jpeg_seq = f.seq
         return jpeg
+
+    def latest_sample(self, max_w: int = 960, quality: int = 75) -> FrameSample:
+        """Atomic newest-frame sample for motion evidence. Captures ONE `VideoFrame` reference under the lock,
+        then encodes THAT exact frame and reports ITS seq + monotonic wall_ts together — never a separate
+        metadata read that could race the encode. Reuses the JPEG cache when the newest frame is unchanged."""
+        with self._lock:
+            f = self._latest
+            cached = self._latest_jpeg if (f is not None and f.seq == self._latest_jpeg_seq) else None
+        if f is None:
+            return FrameSample(jpeg=None, seq=None, wall_ts=0.0, age=0.0, valid=False, error="no_frame_yet")
+        jpeg = cached if cached is not None else f.to_jpeg(quality=quality, max_w=max_w)
+        if cached is None and jpeg is not None:
+            with self._lock:
+                # only update the cache if the newest frame is still the one we just encoded
+                if self._latest is f:
+                    self._latest_jpeg = jpeg
+                    self._latest_jpeg_seq = f.seq
+        age = max(0.0, time.monotonic() - (f.wall_ts or time.monotonic()))
+        return FrameSample(jpeg=jpeg, seq=f.seq, wall_ts=f.wall_ts, age=age, valid=jpeg is not None,
+                           error=None if jpeg is not None else "encode_failed")
 
     def stats(self) -> dict:
         with self._lock:

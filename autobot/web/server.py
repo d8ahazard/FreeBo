@@ -57,6 +57,7 @@ from ..brain.slam import VisualSlam  # noqa: E402
 MEDIA_HUB = MediaHub()
 SLAM = VisualSlam()
 AUDIO_SINK = None
+VISUAL_REFLEX = None
 _frame_seq = 0
 
 
@@ -135,9 +136,6 @@ async def _startup():
     # Attach the VSLAM mapper to whichever hub is live (native link's RTC hub, or the shared browser-fed hub).
     with contextlib.suppress(Exception):
         SLAM.attach(_active_hub())
-    # Let the brain's closed-loop motion check corroborate camera frame-diff with VSLAM pose.
-    with contextlib.suppress(Exception):
-        brain.motion.pose_provider = SLAM.map_data
     # Give the brain (curiosity coverage) + spatial skills (place tagging / go_to_place) the same pose source.
     with contextlib.suppress(Exception):
         brain.pose_provider = SLAM.map_data
@@ -147,8 +145,18 @@ async def _startup():
         with contextlib.suppress(Exception):
             from ..brain.audio_sink import AudioSink
             global AUDIO_SINK
-            AUDIO_SINK = AudioSink(on_utterance=lambda text: brain.feed_speech(text, "someone nearby", False))
+            AUDIO_SINK = AudioSink(
+                on_utterance=lambda text: brain.feed_speech(text, "someone nearby", False),
+                on_critical=brain.handle_critical)   # barge-in: STOP/QUIET heard while the robot is talking
             AUDIO_SINK.attach(_active_hub())
+    # Video-rate looming reflex (fastest available visual collision cue): a cheap subscriber enqueues frames;
+    # a worker runs optical-flow and, on looming, stops + preempts via the loop. No-op on hubless links.
+    if hasattr(LINK, "hub"):
+        with contextlib.suppress(Exception):
+            from ..brain.reflex_vision import VisualReflex
+            global VISUAL_REFLEX
+            VISUAL_REFLEX = VisualReflex(on_loom=brain.on_visual_loom)
+            VISUAL_REFLEX.attach(_active_hub())
     # Tap inbound robot audio for the 2-way call (coexists with the voice/STT skill). No-op on links w/o audio.
     try:
         LINK.set_audio_sink(_audio_in_sink)
@@ -333,6 +341,18 @@ async def api_diag_heard():
         return JSONResponse({"ok": True, "heard": list(brain.buffer.transcripts)})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e), "heard": []})
+
+
+@app.get("/api/diag/audio")
+async def api_diag_audio():
+    """Per-stage AudioSink diagnostics (packet flow, VAD starts/ends, segment accept/drop, STT timings, noise
+    floor, recent stage transitions). Read-only — the data the Phase 0.3 listening diagnostic is read from to
+    attribute a failure to a specific stage (no audio vs VAD vs STT vs hallucination drop)."""
+    try:
+        dbg = AUDIO_SINK.debug() if (AUDIO_SINK and hasattr(AUDIO_SINK, "debug")) else {}
+        return JSONResponse({"ok": True, "audio_sink": dbg})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e), "audio_sink": {}})
 
 
 @app.post("/api/settings")
@@ -922,11 +942,19 @@ async def api_control(req: Request):
     kind = body.get("kind")
     s = SETTINGS.snapshot()
     if kind == "stop":
+        # Manual takeover: cancel any in-flight AI action first, then stop.
+        with contextlib.suppress(Exception):
+            await brain.executor.preempt("manual stop")
         return JSONResponse(await LINK.stop())
     # When dark, refuse anything that talks to the robot except stop/connection (Wake re-enables I/O).
     if s.asleep and kind in ("drive", "move", "say", "action"):
         return JSONResponse({"ok": False, "blocked": "asleep (wake first)"})
     if kind in ("drive", "move"):
+        # Manual motion preempts + cancels any active AI action and clears any circuit-breaker HOLD (the human
+        # is now in control). Manual control stays direct (only speed/duration-clamped by the safety floor).
+        with contextlib.suppress(Exception):
+            await brain.executor.preempt("manual takeover")
+            brain.executor.reset_breaker()
         d = brain.safety.check_drive(s, body.get("ly", 0.0), body.get("rx", 0.0),
                                      body.get("duration", 0.4), source="manual")
         if not d.allowed:

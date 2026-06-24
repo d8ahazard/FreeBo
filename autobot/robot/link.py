@@ -8,9 +8,13 @@ the agent loop and UI keep running and the robot stays stopped on error. See doc
 from __future__ import annotations
 
 import abc
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from ..config import Settings
+
+if TYPE_CHECKING:
+    from .media_hub import FrameSample
 
 
 class RobotLink(abc.ABC):
@@ -46,6 +50,15 @@ class RobotLink(abc.ABC):
     @abc.abstractmethod
     async def snapshot(self) -> tuple[bytes | None, str | None]:
         """Returns (jpeg_bytes, error). (None, reason) when asleep / not ready."""
+
+    async def snapshot_sample(self) -> "FrameSample":
+        """Sequence-aware snapshot for motion evidence. Default wraps `snapshot()` with `seq=None` (this link
+        can't prove frame freshness, so the executor must treat its evidence as UNKNOWN, never confident).
+        Hub-backed links (Air 2 native) override this to return real sequence numbers + timestamps."""
+        from .media_hub import FrameSample
+        jpeg, err = await self.snapshot()
+        return FrameSample(jpeg=jpeg, seq=None, wall_ts=time.monotonic(), age=0.0,
+                           valid=jpeg is not None, error=err)
 
     # --- control ---
     @abc.abstractmethod

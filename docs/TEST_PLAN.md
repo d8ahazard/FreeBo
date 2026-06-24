@@ -28,15 +28,43 @@ fills the gaps it can't prove. See [docs/TESTING.md](TESTING.md), [docs/AI_BRAIN
 Proves the code, protocol, and brain plumbing before touching the robot.
 
 - [ ] `python scripts/eboproto_check.py` -> `RESULT: PASS` (MAVLink byte-identity).
-- [ ] `python -m pytest -q -p no:recording` -> `tests/test_metrics.py` (7) green. KNOWN pre-existing failures
-  (unrelated to current work, identical on the untouched `autobot` copy): `test_brain.py::test_brain_vlm_tick_drives_and_arms_motion_check`,
-  `test_checks.py::test_video_fail_without_frame`, `test_checks.py::test_autonomy_pass_when_brain_drives_and_robot_moves`,
-  `test_motion.py::test_classify_blocked_partial_change`. `-p no:recording` is required (broken vcr plugin in this env).
+- [ ] `python -m pytest -q -p no:recording` -> green. `-p no:recording` is REQUIRED (broken vcr plugin in
+  this env). Phase 0 suites: `test_behavior.py`, `test_audio_sink.py`, `test_bargein.py`, `test_framesample.py`,
+  `test_action_executor.py`, `test_reflex.py` (+ existing `test_metrics.py`, `test_safety.py`). KNOWN
+  pre-existing failures (unrelated to this work; reproduce with our changes stashed): `test_checks.py::test_video_fail_without_frame`,
+  `test_checks.py::test_autonomy_pass_when_brain_drives_and_robot_moves`, `test_motion.py::test_classify_blocked_partial_change`.
+  NOTE: running `test_checks.py`+`test_motion.py` together can hang (pre-existing teardown issue) — run files
+  individually; and `test_reflex.py` (daemon threads) is flaky when combined with the asyncio executor suite —
+  run it alone.
 - [ ] `python scripts/bench_brain.py --ticks 50` -> per-phase latency table; `reason/perceive/provider/tool`
   rows present with sane p50.
+- [ ] `python scripts/obstacle_course.py` -> all offline checks PASS (executor lifecycle, stale-frame ->
+  UNKNOWN, oscillation -> HOLD, HOLD refuses, preempt -> CANCELLED). SIMULATION only — makes no collision claim.
 - [ ] `python scripts/ollama_probe.py` (only if the cortex is Ollama) -> `TOOLS/VISION/VISION+TOOLS: PASS`.
 
-PASS bar: eboproto PASS, metrics tests pass, bench prints, no NEW pytest failures.
+PASS bar: eboproto PASS, pytest green (no NEW failures), bench prints, obstacle_course offline all-PASS.
+
+### Phase 0 stabilization acceptance gates (listening / movement / safety)
+These are the release bar for the Phase 0 work. Latency gates are measured on the live robot; the structural
+gates are proven by the offline harness + unit suites above.
+
+- Critical-command recognition >= 95% over 100 commands; STOP p95 < 600 ms after endpoint.
+- STOP/QUIET during TTS cancels playback < 300 ms after keyword detection (barge-in clock starts at the keyword).
+- Deterministic command ack p95 < 1.2 s; motion dispatch < 250 ms after authorization; new-frame -> stop
+  reflex PROCESSING < 100 ms (measured from frame arrival; this is the fastest available VISUAL reflex on a
+  cloud stream, NOT a hard real-time guarantee).
+- Model first-audio p95 < 4 s initially (tighten once the Phase 2 serving stack is benchmarked). The robot may
+  acknowledge locally first while cognition continues.
+- Zero stale-frame `stuck` verdicts over 30 min; <= 2 oscillating recoveries before HOLD.
+- Zero collisions on the scripted 50-step hardware course at the tested speed/environment (NOT a universal
+  guarantee — see the physical-course contract below).
+- < 18 GB steady-state VRAM with a defined peak ceiling; 1-hour soak with no OOM / queue growth / restart.
+
+### Physical 50-step obstacle course (HARDWARE — gated)
+`AUTOBOT_COURSE_ENABLE_MOTION=1 python scripts/obstacle_course.py --hardware` (refuses to move without BOTH
+the flag and the env var). Document and hold constant: tested speed (`config.max_speed`), the 50-step course
+map + obstacle positions, lighting (steady, documented lux), the operator-stop procedure (UI STOP / power
+within reach), and the collision definition (any contact = a collision). PASS = 0 collisions over 50 steps.
 
 Result (2026-06-22, dev box, offline):
 - eboproto_check: PASS (`RESULT: PASS`; C self-test skipped - no compiler).

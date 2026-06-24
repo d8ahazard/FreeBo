@@ -223,9 +223,32 @@ need a torch/triton pair where `torch.compile` works. The global Python had a br
   therefore the latency knob — hence the fast (ACTION+EYES, ~1.2s) vs full (SEE/THINK/ACTION/EYES, ~4.5s)
   split in `vlm_service.decide`. For sub-100 ms/tok you'd need a graphing engine (vLLM/SGLang) under WSL2.
 
+## Phase 0 additions (listening / movement / safety)
+
+- **Listening** is the native `AudioSink` (robot mic -> Agora RTC -> `MediaHub` -> STT), not the legacy
+  `skills/voice.py` chunker. It has an **adaptive RMS noise floor** (learns only during confident silence and
+  never while we're speaking; enter/exit hysteresis; clamped so it can't learn speech as noise; set a fixed
+  `AUTOBOT_STT_RMS` to disable adaptation). Per-stage diagnostics: `GET /api/diag/audio`.
+- **Barge-in**: STOP/QUIET are detected DURING our own TTS by a bounded barge-in worker (the media callback
+  only enqueues the newest window; STT runs off-thread). Outbound TTS is sanitized so the robot never utters a
+  trigger word; self-echo is rejected against the in-flight TTS text. A confirmed critical command cancels the
+  TTS clip (`Air2NativeLink.cancel_playback` — drops the clip's RTP, keeps silence so the mic/call stays
+  alive), preempts the action, and stops. Gate: `AUTOBOT_BARGEIN` (default on).
+- **Telemetry freshness**: `RtmNode` records the monotonic time telemetry was ACTUALLY received; the link
+  exposes `telemetry_age`. The brain HOLDs motion when it exceeds `telemetry_max_age_s` (video has its own
+  `video_max_age_s`). Do NOT use the response's request-time `ts` for freshness.
+- **Motion** goes through the single `ActionExecutor` with sequence-aware evidence (`FrameSample.seq`) — no
+  fresh frame => UNKNOWN, never a false STUCK; circuit-breaker HOLD after 2 non-progress attempts. See
+  docs/MOTION.md (Phase 0 changes).
+
 ## DO NOT REGRESS
 - Keep the `101005` 2 s keepalive and sustained drive.
 - Keep the frame-stall watchdog and the keyframe-gate / seq-gap drop.
 - Telemetry comes as COMPRESSED RAW RTM peer messages — read `m.rawMessage` + inflate, parse NESTED
   `data.battery.percentage`. Do NOT revert to reading `m.text` or top-level `data.percentage`.
 - Keep the brain modular (no monolithic omni — it OOMs 32 GB RAM on load).
+- Barge-in: do NOT cancel the Agora publish TASK to stop a clip — only invalidate the clip's frames
+  (continuous silence must keep flowing or the robot stops sending its mic). `MediaHub` audio/video callbacks
+  must only enqueue + return (no STT / blocking / await on the media thread).
+- `snapshot()`/`latest_video_jpeg()` are LOCAL cache reads (not cloud requests); motion evidence must use
+  `snapshot_sample()`/`latest_sample()` so it compares frame SEQUENCE, not a possibly-stale cached JPEG.

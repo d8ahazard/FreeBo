@@ -37,6 +37,7 @@ class RtmNode:
         self.session_provider = session_provider
         self.on_event = on_event
         self.status: dict[str, Any] = {}        # latest battery/charge/sensors merged from inbound peer msgs
+        self._status_ts = 0.0                    # time.monotonic() when telemetry was last ACTUALLY received
         self.connected = False
         self.last_error: Optional[str] = None
         self._proc: Optional[subprocess.Popen] = None
@@ -148,6 +149,11 @@ class RtmNode:
         except Exception:  # noqa: BLE001
             pass
 
+    def status_age(self) -> float:
+        """Seconds since telemetry was ACTUALLY received from the robot (monotonic source-update time, not a
+        request time). float('inf') until the first telemetry arrives. Used for HOLD-on-stale-telemetry."""
+        return float("inf") if self._status_ts == 0.0 else (time.monotonic() - self._status_ts)
+
     # --- events from the sidecar ---
     def _handle_event(self, ev: dict) -> None:
         t = ev.get("ev")
@@ -165,6 +171,7 @@ class RtmNode:
                     continue
                 self.status[k] = v
             self.status["connected"] = True
+            self._status_ts = time.monotonic()   # genuine source-update time (NOT a request time)
         elif t == "log":
             self._logs.append(f"[{ev.get('level')}] {ev.get('msg')}")
         if self.on_event:

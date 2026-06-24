@@ -48,22 +48,24 @@ class SafetyFloor:
 
     def check_drive(self, s: Settings, ly: float, rx: float, duration: float, *,
                     source: str = "ai") -> Decision:
-        """Clamp a drive/move request. `source` 'ai' is rate-limited + autonomy-gated; 'manual' (UI) and
-        'overseer' (the human/agent puppeting the robot in overseer mode) are only speed/duration-clamped —
-        the human is in control, so they bypass the AI motion/autonomy/rate gates but still cannot exceed
-        the speed/duration caps (the speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
-        if source == "ai" and not getattr(s, "allow_motion", True):
+        """Clamp a drive/move request. AI sources ('ai' and 'recovery' — an executor-proposed recovery move)
+        are rate-limited + autonomy-gated + scope-gated; 'manual' (UI) and 'overseer' (the human/agent
+        puppeting the robot in overseer mode) are only speed/duration-clamped — the human is in control, so
+        they bypass the AI motion/autonomy/rate gates but still cannot exceed the speed/duration caps (the
+        speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
+        ai = source in ("ai", "recovery")
+        if ai and not getattr(s, "allow_motion", True):
             return Decision(False, "motion disabled by the user (Control toggle)")
-        if source == "ai" and not self.autonomy_allows_motion(s):
+        if ai and not self.autonomy_allows_motion(s):
             return Decision(False, f"autonomy is '{s.autonomy}': AI motion blocked")
-        if source == "ai":
+        if ai:
             if self._actions_this_tick >= s.max_actions_per_tick:
                 return Decision(False, f"rate limit: >{s.max_actions_per_tick} actions/tick")
             self._actions_this_tick += 1
         # Movement scope (set by the behavior controller; hard guarantee independent of the prompt):
         #   hold   -> no AI motion; adjust -> rotate in place only (zero translation); roam -> normal.
         # Conversational mode also forces rotate-only as a belt-and-braces floor.
-        if source == "ai":
+        if ai:
             if self._scope == "hold":
                 return Decision(False, "holding position (behavior: not roaming right now)")
             if self._scope == "adjust" or getattr(s, "mode", "explore") == "conversational":

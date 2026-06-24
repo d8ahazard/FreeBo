@@ -6,9 +6,10 @@ harmless tools (stop, look, wait, set_eyes, say) are "anyone". `say` is addition
 """
 from __future__ import annotations
 
+import math
 import time
 
-from .. import locomotion, tts
+from .. import locomotion, motion_model, tts
 from .base import Skill, SkillContext, ToolDef, fn_schema
 
 # Unit drive vectors. ly>0 forward; rx>0 turns right, rx<0 turns left (matches motor_frame).
@@ -77,16 +78,35 @@ class CoreSkill(Skill):
         ctx = self._c()
         s = ctx.settings.snapshot()
         prof = getattr(ctx, "motion_profile", None)
-        # We only take the INTENT (direction). The cerebellum (locomotion) owns the actual speeds/durations —
-        # this robot's drivetrain has big deadbands + a touchy turn, so raw magnitudes are unreliable (see
-        # docs/MOTION.md). It re-clamps through the safety floor and confirms motion via the camera.
+        # We only take the INTENT (direction/sign). The motor layer owns the actual speeds/durations — this
+        # robot's drivetrain has big deadbands + a touchy turn, so raw magnitudes are unreliable (docs/MOTION.md).
         if a.get("ly") is not None or a.get("rx") is not None:
-            ly, rx = float(a.get("ly", 0.0)), float(a.get("rx", 0.0))
+            sly, srx = float(a.get("ly", 0.0)), float(a.get("rx", 0.0))
         else:
             dx = DIRECTIONS.get(str(a.get("direction", "")).lower())
             if dx is None:
                 return {"ok": False, "error": "need a valid direction or ly/rx"}
-            ly, rx = dx
+            sly, srx = dx
+        # Size the intent from the calibration profile (else motion-model seeds), deadband-safe.
+        if prof is not None:
+            fwd, fdur, trx, tdur = prof.forward_speed, prof.forward_duration, prof.turn_rx, prof.turn_duration
+        else:
+            m = motion_model.for_variant(getattr(s, "robot_variant", "AIR2"))
+            fwd = max(m.forward_deadband + 0.05, m.forward_unit_speed)
+            fdur = m.forward_unit_duration
+            trx = max(m.turn_deadband + 0.02, m.turn_unit_rx)
+            tdur = m.turn_unit_duration
+        ly = math.copysign(fwd, sly) if sly else 0.0
+        rx = math.copysign(trx, srx) if srx else 0.0
+        dur = fdur if abs(sly) >= abs(srx) else tdur
+        executor = getattr(ctx, "executor", None)
+        if executor is not None:
+            # Single authoritative path: sequence-aware evidence + lifecycle (no fresh frame => UNKNOWN).
+            act = await executor.run_drive(ly, rx, dur, settings=s, source="ai")
+            return {"ok": act.state.value == "succeeded", "state": act.result,
+                    "lifecycle": act.state.value, "action_id": act.id,
+                    "drove": {"ly": ly, "rx": rx, "duration": dur}}
+        # Fallback (no executor wired, e.g. some tests): the cerebellum confirms + re-clamps.
         res = await locomotion.drive(link=ctx.link, safety=ctx.safety, settings=s, profile=prof,
                                      ly=ly, rx=rx, source="ai", emit=ctx.emit)
         if res.get("blocked"):

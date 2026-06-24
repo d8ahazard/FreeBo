@@ -46,10 +46,12 @@ class BehaviorController:
         self._voice_intent: str | None = None   # "stopped"|"explore"|"pursue"|"return"
         self._voice_until = 0.0
         self._voice_detail = ""
-        # Active explore (default ON): in `explore` mode the idle fallback ROAMS (drives around in short steps)
-        # instead of standing still and observing. Set AUTOBOT_ACTIVE_EXPLORE=0 for the old calm-companion
-        # behavior. Greet/patrol/command/voice overrides still take precedence.
-        self.active_explore = os.environ.get("AUTOBOT_ACTIVE_EXPLORE", "1").strip().lower() in (
+        # Active explore (default OFF — Phase 0): in `explore` mode the idle fallback can ROAM (drive around in
+        # short steps) instead of standing still and observing. Default-off makes the calm companion the
+        # baseline; set AUTOBOT_ACTIVE_EXPLORE=1 to opt back into continuous roaming. Re-enabling by default is
+        # gated on the Phase 0 motion acceptance suite passing (see docs/MOTION.md). Greet/patrol/command/voice
+        # overrides still take precedence either way.
+        self.active_explore = os.environ.get("AUTOBOT_ACTIVE_EXPLORE", "0").strip().lower() in (
             "1", "true", "yes", "on")
         self.current = Behavior(ROAM if self.active_explore else ADJUST,
                                 "explore_active" if self.active_explore else "observe")

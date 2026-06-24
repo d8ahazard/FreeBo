@@ -87,9 +87,36 @@ robot turns in re-checkable increments instead of overshooting.
 
 ## Rules for adding/altering motion
 
-- Never send raw `ly/rx` from the brain — go through `locomotion`. The brain speaks in intents.
+- Never send raw `ly/rx` from the brain — go through the executor. The brain speaks in intents.
 - Any new motion path still passes through `safety.check_drive`.
 - Update the constants here (and `motion_model.py`) in the same change, and keep this doc in sync.
 - The `moveSpeed`/`moveMode` firmware gear (RTM 103011) changes responsiveness but not as a clean monotonic
   gear; a real low-gear `moveSpeed` set needs the EBO app protocol sniffed — deferred, the cerebellum makes
   us robust without it.
+
+## Phase 0 changes (the single ActionExecutor)
+
+Motion confirmation was consolidated into ONE authoritative path,
+[autobot/brain/action_executor.py](../autobot/brain/action_executor.py) (the old dual confirm — locomotion's
+immediate frame-diff + the next-cycle `MotionConfirmer` — was retired; `MotionConfirmer` is deleted):
+
+- **Lifecycle:** `PROPOSED -> AUTHORIZED -> EXECUTING -> AWAITING_EVIDENCE -> SUCCEEDED | FAILED | UNKNOWN |
+  CANCELLED`. Evidence (moved/stuck/blocked/unknown) is a separate field from the lifecycle state.
+- **Sequence-aware evidence:** after a pulse the executor waits for a camera frame whose `seq` is newer than
+  the 'before' frame (via `FrameSample`/`MediaHub.latest_sample`). No fresh frame by the evidence deadline =>
+  **UNKNOWN, never STUCK** — a stale cached frame can no longer read as "didn't move".
+- **One pulse per intent:** coarse AI intents (forward/left/right/back) are a SINGLE confirmed pulse sized by
+  the calibration profile or motion-model seeds (the brain re-decides each tick). The old multi-pulse
+  closed-loop `turn(degrees)` and the hard-coded `_OMNI_DRIVE` tuples were retired.
+- **Circuit breaker:** after 2 consecutive non-progress attempts (failed/unknown/stuck/blocked, incl.
+  oscillating recoveries) the executor enters **HOLD** and refuses further AI/recovery motion until a manual
+  takeover / explicit `reset_breaker()`. UNKNOWN never escalates into a more aggressive move. Recovery is a
+  newly-authorized CHILD action (`parent_id`), not a continuation after a terminal state.
+- **Freshness gating:** AI motion is refused on a video frame older than `settings.video_max_age_s`; the brain
+  also HOLDs motion when telemetry hasn't updated within `settings.telemetry_max_age_s` (separate budgets).
+- **Reflex:** camera looming now runs at video rate in `VisualReflex` (subscribed to the MediaHub), not on a
+  slow poll; on looming it preempts the active action + stops via a thread-safe loop handoff. It is the
+  fastest AVAILABLE visual reflex, not a hard real-time guarantee (it rides the cloud stream).
+- **Default behavior:** `AUTOBOT_ACTIVE_EXPLORE` now defaults OFF (calm-observe). Re-enable continuous roaming
+  only after the Phase 0 motion-acceptance suite passes (see docs/TEST_PLAN.md).
+- Manual control stays direct but PREEMPTS + cancels any active AI action (and clears HOLD) first.

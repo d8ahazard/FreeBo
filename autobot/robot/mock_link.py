@@ -39,6 +39,8 @@ class MockRobotLink(RobotLink):
             "eyes_animation": "neutral", "last_drive": (0.0, 0.0), "tx_audio": 0, "frames": 1000,
         }
         self._snap_cache: tuple[bytes, float] = (b"", 0.0)
+        self._seq = 0
+        self._freeze_seq = False   # test knob: when True, snapshot_sample reuses the last seq (stale stream)
 
     # --- vision ---
     def _make_jpeg(self) -> bytes:
@@ -90,6 +92,20 @@ class MockRobotLink(RobotLink):
         if not self.state["awake"]:
             return None, "asleep_or_not_ready"
         return self._snapshot_bytes(), None
+
+    async def snapshot_sample(self):
+        """Sequence-aware snapshot with a controllable monotonic seq, so tests can drive fresh vs. stale-frame
+        motion evidence. Set `_freeze_seq=True` to simulate a stalled stream (same seq -> evidence UNKNOWN)."""
+        import time as _t
+
+        from .media_hub import FrameSample
+        if not self.state["awake"]:
+            return FrameSample(jpeg=None, seq=None, wall_ts=_t.monotonic(), age=0.0, valid=False,
+                               error="asleep_or_not_ready")
+        if not self._freeze_seq:
+            self._seq += 1
+        return FrameSample(jpeg=self._snapshot_bytes(), seq=self._seq, wall_ts=_t.monotonic(),
+                           age=0.0, valid=True)
 
     # --- control ---
     async def drive(self, ly: float, rx: float) -> dict[str, Any]:

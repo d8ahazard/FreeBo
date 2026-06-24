@@ -197,6 +197,12 @@ class Settings:
     max_move_duration: float = field(default_factory=lambda: _env_float("AUTOBOT_MAX_MOVE_DURATION", 2.5))
     max_actions_per_tick: int = 4      # rate limit on motion-causing actions per decision cycle
     history_turns: int = 8             # rolling conversation window kept for the model
+    # Freshness limits (Phase 0.8) — SEPARATE for video vs telemetry. The cloud A/V stream and the RTM
+    # telemetry plane stall independently, so they get independent staleness budgets. The executor refuses
+    # AI motion on a video frame older than `video_max_age_s`; the brain holds motion when telemetry hasn't
+    # updated within `telemetry_max_age_s`.
+    video_max_age_s: float = field(default_factory=lambda: _env_float("AUTOBOT_VIDEO_MAX_AGE", 2.0))
+    telemetry_max_age_s: float = field(default_factory=lambda: _env_float("AUTOBOT_TELEMETRY_MAX_AGE", 5.0))
 
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -210,6 +216,7 @@ class Settings:
         "tts_engine", "voice", "autodock_pct",
         "robot_name", "persona", "owner_name", "require_name", "obey_owner_only",
         "robot_variant", "setup_complete",
+        "video_max_age_s", "telemetry_max_age_s",
     }
 
     def update(self, **changes) -> list[str]:
@@ -225,6 +232,8 @@ class Settings:
                     v = max(0.5, min(60.0, float(v)))
                 elif k == "autodock_pct":
                     v = max(0, min(100, int(v)))
+                elif k in ("video_max_age_s", "telemetry_max_age_s"):
+                    v = max(0.2, min(30.0, float(v)))
                 elif k == "tts_engine" and v not in ("piper", "os"):
                     continue
                 elif k == "robot_variant":
@@ -293,6 +302,7 @@ _FIELD_NAMES = [
     "tts_engine", "voice", "autodock_pct",
     "robot_name", "persona", "owner_name", "require_name", "obey_owner_only",
     "max_move_duration", "max_actions_per_tick", "history_turns",
+    "video_max_age_s", "telemetry_max_age_s",
 ]
 
 

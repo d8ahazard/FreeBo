@@ -52,6 +52,9 @@ class SkillContext:
     motion_profile: Any = None
     # the behavior controller (set by the agent): voice/paraphrase commands can steer it (explore/stay/...).
     behavior: Any = None
+    # the single ActionExecutor (set by the agent): the ONLY physical-motion path. When present, the `drive`
+    # tool routes through it (sequence-aware evidence); when None, it falls back to locomotion directly.
+    executor: Any = None
 
 
 class Skill:
