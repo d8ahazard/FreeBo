@@ -11,6 +11,7 @@ happens off-thread. RMS uses stdlib `audioop` so VAD itself adds no dependency.
 from __future__ import annotations
 
 import audioop
+import contextlib
 import os
 import re
 import threading
@@ -65,6 +66,12 @@ class AudioSink:
         self._floor = float(self.rms_min)        # EMA noise floor (adaptive mode only)
         self._floor_alpha = float(os.environ.get("AUTOBOT_STT_FLOOR_ALPHA", "0.05"))
         self.on_utterance = on_utterance
+        # P0-R4.3/R4.7: the kernel owns the listening decision. The server injects these callables so the sink
+        # never re-interprets allow_audio_in/asleep/master-STOP itself. `requested` = Hear toggle on;
+        # `permitted` = effective (Hear on AND not master-STOP AND not asleep). When permitted() is False the
+        # sink stops VAD/STT and clears partial buffers, but raw transport liveness is still measured.
+        self.requested = None   # Optional[Callable[[], bool]]
+        self.permitted = None   # Optional[Callable[[], bool]]
         self.sample_rate = sample_rate
         self.min_speech_s = min_speech_s or float(os.environ.get("AUTOBOT_STT_MIN_SPEECH", "0.4"))
         self.hang_s = hang_s or float(os.environ.get("AUTOBOT_STT_HANG", "0.7"))
@@ -250,23 +257,42 @@ class AudioSink:
         the robot is speaking (echo-gated). Cheap; safe to poll several times a second."""
         from . import audio_state
         now = time.time()
+        # Synchronized read of the worker/VAD/queue flags (P0-R4.7) so the indicator never sees a torn state.
+        with self._lock:
+            in_speech = self._in_speech
+            jobs = len(self._jobs)
+            stt_busy = self._stt_busy
+            last_rms = self._last_rms
         age = (now - self._last_chunk_ts) if self._last_chunk_ts else None
-        stream_live = age is not None and age <= 1.5
+        transport_live = age is not None and age <= 1.5
         speaking = audio_state.is_speaking()
-        stt_active = self._stt_busy or bool(self._jobs)
+        stt_active = stt_busy or bool(jobs)
         recent_transcript = self._last_text_ts and (now - self._last_text_ts) < 2.0
         recent_error = self._err_ts and (now - self._err_ts) < 3.0
         enter_thr, exit_thr = self._thresholds()
+        # Truthful listening model: requested (Hear toggle) vs permitted (effective) vs the worker existing.
+        try:
+            listening_requested = bool(self.requested()) if self.requested else self._running
+        except Exception:  # noqa: BLE001
+            listening_requested = self._running
+        try:
+            permitted = bool(self.permitted()) if self.permitted else self._running
+        except Exception:  # noqa: BLE001
+            permitted = self._running
+        listening_effective = bool(self._running and permitted and transport_live)
+        echo_gated = bool(speaking)
 
-        if not self._running:
-            state = "OFF"
-        elif not stream_live:
+        if not self._running or not listening_requested:
+            state = "OFF"                       # Hear toggled off (or worker not running)
+        elif not permitted:
+            state = "INHIBITED"                 # Hear on but master STOP / asleep — NOT "NO MIC STREAM"
+        elif not transport_live:
             state = "ERROR" if recent_error else "NO MIC STREAM"
         elif speaking:
             state = "SPEAKING-ECHO-GATED"
         elif stt_active:
             state = "TRANSCRIBING"
-        elif self._in_speech:
+        elif in_speech:
             state = "HEARING SPEECH"
         elif recent_transcript:
             state = "HEARD"
@@ -275,23 +301,31 @@ class AudioSink:
         else:
             state = "LISTENING"
 
+        # Don't display a stale transcript forever (P0-R4.7): blank it after 30s.
+        show_text = self._last_text if (self._last_text_ts and (now - self._last_text_ts) < 30.0) else ""
         return {
             "enabled": self._running,
-            "stream_live": stream_live,
+            "transport_live": transport_live,
+            "stream_live": transport_live,       # back-compat alias
+            "listening_requested": listening_requested,
+            "listening_effective": listening_effective,
             "last_audio_age_ms": (round(age * 1000.0) if age is not None else None),
             "state": state,
-            "current_rms": int(self._last_rms),
+            "current_rms": int(last_rms),
             "noise_floor": round(self._floor, 1),
             "enter_threshold": round(enter_thr, 1),
             "exit_threshold": round(exit_thr, 1),
-            "vad_active": self._in_speech,
+            "vad_active": in_speech,
             "stt_active": stt_active,
-            "stt_queue_depth": len(self._jobs),
+            "stt_queue_depth": jobs,
+            "echo_gated": echo_gated,
             "speaking": speaking,
             "bargein_ready": bool(self.on_critical and self._bargein and speaking),
-            "last_transcript": self._last_text,
+            "last_transcript": show_text,
             "last_transcript_ts": (self._last_text_ts or None),
-            "error": self.last_error,
+            # Clear the surfaced error after recovery (>3s) but keep last-error history in self.last_error.
+            "error": (self.last_error if recent_error else None),
+            "last_error_history": self.last_error,
         }
 
     def attach(self, hub) -> None:
@@ -325,6 +359,22 @@ class AudioSink:
     def _on_chunk(self, chunk) -> None:
         self._recv += 1
         self._last_chunk_ts = time.time()   # stream liveness (set even if the chunk is later dropped)
+        # P0-R4.3: if listening is not permitted (Hear off / master STOP / asleep) do NOT process — drop any
+        # partial utterance + barge-in buffer so nothing is segmented, transcribed, or fed to the brain. Raw
+        # transport liveness above is still tracked for diagnostics.
+        if self.permitted is not None:
+            try:
+                _ok = bool(self.permitted())
+            except Exception:  # noqa: BLE001
+                _ok = True
+            if not _ok:
+                if self._in_speech or self._buf or self._bi_buf:
+                    with self._lock:
+                        self._in_speech = False
+                        self._buf = bytearray()
+                    with self._bi_lock:
+                        self._bi_buf = bytearray()
+                return
         pcm = chunk.pcm
         if not pcm:
             self._drop_empty += 1
@@ -452,6 +502,9 @@ class AudioSink:
             self._stt_busy = True
             self._ev("stt_started", queue_wait_ms=round(self._last_queue_wait_ms, 1))
             t0 = time.monotonic()
+            text = None
+            # P0-R4.7: try/finally guarantees _stt_busy is cleared even if _transcribe hangs/raises, so the
+            # indicator can never get stuck on TRANSCRIBING.
             try:
                 text = self._transcribe(seg)
             except Exception as e:  # noqa: BLE001
@@ -459,9 +512,9 @@ class AudioSink:
                 self.last_error = f"{type(e).__name__}: {e}"
                 self._err_ts = time.time()
                 self._ev("stt_failed", error=self.last_error)
-                self._stt_busy = False
                 continue
-            self._stt_busy = False
+            finally:
+                self._stt_busy = False
             self._last_stt_ms = (time.monotonic() - t0) * 1000.0
             self._stt_samples.append(self._last_stt_ms)
             self._ev("transcript_produced", text=(text or "")[:60], ms=round(self._last_stt_ms, 1))
@@ -469,7 +522,13 @@ class AudioSink:
             if text:
                 self._last_text_ts = time.time()
                 self._diag_transcripts.append(text)
-            if text and self.on_utterance:
+            # P0-R4.3: do not feed the brain if listening became impermissible mid-transcription (Hear off /
+            # master STOP raced the STT job).
+            permitted = True
+            if self.permitted is not None:
+                with contextlib.suppress(Exception):
+                    permitted = bool(self.permitted())
+            if text and permitted and self.on_utterance:
                 self.utterances += 1
                 try:
                     self.on_utterance(text)

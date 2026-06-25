@@ -17,6 +17,9 @@ class FakeAppClient:
         self._after = b"d" * 3000         # very different size => large proxy diff => "moved"
         self._moves = moves               # does the robot physically act on a move command?
         self._no_frame = no_frame
+        # Optional explicit snapshot script (list of bytes|None) consumed in order; a None entry models a
+        # missing frame. When unset, the still/after physics model below is used.
+        self._snaps = None
         self._moved = False
         self._slam = {"enabled": True, "frames": 200, "keyframes": 5,
                       "pose": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0}}
@@ -36,6 +39,9 @@ class FakeAppClient:
 
     async def snapshot(self):
         self._tel["video_frames"] = self._tel.get("video_frames", 0) + 7   # stream stays fresh
+        if self._snaps is not None:
+            frame = self._snaps.pop(0) if self._snaps else (self._after if self._moved else self._still)
+            return (None, "no_frame_yet") if frame is None else (frame, None)
         if self._no_frame:
             return None, "no_frame_yet"
         return (self._after if self._moved else self._still), None
@@ -158,9 +164,9 @@ async def test_vslam_skip_when_disabled():
 
 
 async def test_autonomy_pass_when_brain_drives_and_robot_moves():
-    # baseline frames identical (no noise); the post-drive frame differs a lot => moved.
-    # snapshot order in check_autonomy: baseline s1, baseline s2 (= pre-move ref), then post-drive frame.
-    c = FakeAppClient(_snaps=[b"x" * 100, b"x" * 100, b"y" * 900])
+    # check_autonomy snapshot order: _measure_baseline() takes 5 (last = pre-move ref), then _after_move_diff()
+    # takes 2. Identical baseline frames (no noise) + two very-different post-drive frames => moved.
+    c = FakeAppClient(_snaps=[b"x" * 100] * 5 + [b"y" * 900] * 2)
     r = await checks.check_autonomy(c, _opts())
     assert r.status == Status.PASS
 

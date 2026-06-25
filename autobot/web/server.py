@@ -149,6 +149,12 @@ async def _startup():
             AUDIO_SINK = AudioSink(
                 on_utterance=lambda text: brain.feed_speech(text, "someone nearby", False),
                 on_critical=brain.handle_critical)   # barge-in: STOP/QUIET heard while the robot is talking
+            # P0-R4.3/R4.7: the kernel owns the listening decision. requested = Hear toggle; permitted =
+            # effective (Hear on AND not master STOP AND not asleep). When not permitted the sink stops VAD/STT
+            # AND barge-in processing (raw transport liveness is still measured for diagnostics). During master
+            # STOP, TTS is already cancelled so barge-in is moot; the UI STOP/RESUME is the operator control.
+            AUDIO_SINK.requested = lambda: bool(SETTINGS.snapshot().allow_audio_in)
+            AUDIO_SINK.permitted = lambda: brain.safety.check_listen(SETTINGS.snapshot()).effective_enabled
             AUDIO_SINK.attach(_active_hub())
     # Video-rate looming reflex (fastest available visual collision cue): a cheap subscriber enqueues frames;
     # a worker runs optical-flow and, on looming, stops + preempts via the loop. No-op on hubless links.
@@ -437,35 +443,79 @@ async def api_diag_audio_capture(req: Request):
 async def api_settings(req: Request):
     body = await req.json()
     changed = SETTINGS.update(**body)
+    s = SETTINGS.snapshot()
+    # P0-R4.3: a toggle represents requested state, and turning a faculty OFF must act on the live organ
+    # immediately (preempt/cancel), not merely record intent. Turning back ON resumes that faculty subject to
+    # the master inhibit + other gates (the loops/sinks consult the kernel).
+    if "allow_motion" in changed and not s.allow_motion:
+        with contextlib.suppress(Exception):
+            await brain.emergency_stop("Move ability off")   # preempt active motion + stop (no latch)
+    if "talk_enabled" in changed and not s.talk_enabled:
+        with contextlib.suppress(Exception):
+            from ..brain import audio_state
+            audio_state.cancel()                              # cancel active TTS + flush queued playback
     await emit({"type": "settings", "changed": changed, "settings": SETTINGS.public_dict()})
+    if {"allow_motion", "allow_video", "allow_audio_in", "talk_enabled", "allow_think",
+            "asleep", "overseer"} & set(changed):
+        await _emit_capabilities()
     return JSONResponse({"ok": True, "changed": changed, **_state_payload()})
+
+
+async def _emit_capabilities() -> None:
+    """Broadcast the ONE authoritative capability-state event (P0-R4.6). Sourced from the kernel, with the
+    agent's richer motion block reason folded in."""
+    s = SETTINGS.snapshot()
+    motion_reason = ""
+    with contextlib.suppress(Exception):
+        motion_reason = brain.status_dict().get("motion_block_reason", "") or ""
+    snap = brain.safety.capability_snapshot(s, motion_reason=motion_reason)
+    await emit({"type": "capabilities", **snap})
 
 
 @app.post("/api/estop")
 async def api_estop():
-    """LATCHED emergency stop. The latch is set FIRST (synchronously, before any await) so every motion path
-    is blocked immediately; then we cancel TTS, preempt the executor, slam a link-level zero-frame burst, and
-    drop to manual. Motion stays blocked until /api/estop/reset."""
-    gen = brain.safety.estop_latch()        # set the gate NOW, before awaiting anything
+    """MASTER STOP (P0-R4.2): a master autonomous-faculty inhibit. The inhibit + motion latch + generation
+    bump are set FIRST (synchronously, before any await) so every faculty is blocked immediately; then we
+    cancel TTS, park reasoning, preempt the executor, slam a link-level zero-frame burst, and drop to manual.
+    Operator video + telemetry + RTM health + UI stay alive. Stays inhibited until an explicit /api/resume."""
+    gen = brain.safety.master_inhibit()     # set the gate NOW, before awaiting anything
     SETTINGS.update(autonomy="manual")
     with contextlib.suppress(Exception):
-        await brain.emergency_stop("estop", cancel_tts=True, latch=True)
+        await brain.emergency_stop("estop", cancel_tts=True, master=True)
     with contextlib.suppress(Exception):
         await LINK.stop()
-    await emit({"type": "estop", "ok": True, "latched": True, "generation": gen})
+    await emit({"type": "estop", "ok": True, "latched": True, "master_inhibited": True, "generation": gen})
     await emit({"type": "settings", "changed": ["autonomy"], "settings": SETTINGS.public_dict()})
-    return JSONResponse({"ok": True, "latched": True, "generation": gen})
+    await _emit_capabilities()
+    return JSONResponse({"ok": True, "latched": True, "master_inhibited": True, "generation": gen})
+
+
+@app.post("/api/resume")
+async def api_resume():
+    """RESUME (P0-R4.2): the explicit operator action that lifts the master STOP. It reconciles the
+    link/sidecar latch+generation FIRST and stays inhibited if the sidecar reset is not acknowledged; only
+    then clears the process latch + master inhibit. Each faculty restores to its own requested toggle;
+    autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
+    res: dict = {}
+    with contextlib.suppress(Exception):
+        res = await LINK.estop_reset() or {}
+    acked = res.get("ok", True) if isinstance(res, dict) else True
+    if not acked:
+        await _emit_capabilities()
+        return JSONResponse({"ok": False, "error": "link/sidecar reset not acknowledged; still inhibited",
+                             "reconcile": res}, status_code=409)
+    brain.safety.estop_reset()              # clear motion latch only after link reconciliation
+    brain.resume()                          # clear master inhibit + parked state
+    await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
+    await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})
+    await _emit_capabilities()
+    return JSONResponse({"ok": True, "resumed": True, "autonomy": "manual"})
 
 
 @app.post("/api/estop/reset")
 async def api_estop_reset():
-    """Clear the E-STOP latch so motion is PERMITTED again. Does NOT enable autonomous movement (autonomy
-    stays manual); the operator re-enables Auto/Move deliberately."""
-    brain.safety.estop_reset()
-    with contextlib.suppress(Exception):
-        await LINK.estop_reset()
-    await emit({"type": "estop_reset", "ok": True, "latched": False})
-    return JSONResponse({"ok": True, "latched": False})
+    """Back-compat alias for /api/resume (the UI's old 'Reset' button). Same reconciled lift of the STOP."""
+    return await api_resume()
 
 
 # Remembers the autonomy mode in force before going dark, so Wake restores it (not just "auto").
@@ -1050,6 +1100,10 @@ async def api_control(req: Request):
     if s.asleep and kind in ("drive", "move", "say", "action"):
         return JSONResponse({"ok": False, "blocked": "asleep (wake first)"})
     if kind in ("drive", "move"):
+        # P0-R4.3: the Move toggle governs ALL movement — manual no longer bypasses it. (A separately named
+        # operator override could be added here later; there is intentionally none today.)
+        if not s.allow_motion:
+            return JSONResponse({"ok": False, "blocked": "Move ability off"})
         # Manual motion preempts + cancels any active AI action and clears any circuit-breaker HOLD (the human
         # is now in control). Manual control stays direct (only speed/duration-clamped by the safety floor).
         with contextlib.suppress(Exception):

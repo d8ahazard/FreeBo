@@ -139,6 +139,7 @@ class AgentBrain:
         self._prev_state: tuple = ()
         self._was_touched = False
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
+        self._stopped = False        # master STOP parked state: reasoner/idle loops no-op until RESUME (P0-R4.2)
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
         # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
@@ -581,7 +582,9 @@ class AgentBrain:
         while self._running:
             s = self.settings.snapshot()
             ready, _ = self._brain_ready(s)
-            if ready and not s.asleep and s.autonomy == "auto" and s.allow_think and not self._idle_pending:
+            think_ok = self.safety.check_think(s).effective_enabled  # honors master STOP + asleep + Think toggle
+            if (ready and think_ok and s.autonomy == "auto" and not self._stopped
+                    and not self._idle_pending):
                 # Pre-flight gate: don't wander autonomously until movement is calibrated (manual still works).
                 if getattr(s, "require_calibration", True) and self.motion_profile is None:
                     if self.status != "needs_calibration":
@@ -609,16 +612,24 @@ class AgentBrain:
                     await self._safe_stop()
                     await self._set_status("asleep", "FreeBo is asleep")
                 continue
-            # Gating per trigger.
+            # Master STOP parks ALL reasoning + commands until an explicit RESUME (listening is off while
+            # stopped, so no voice RESUME). Drain the event without acting.
+            if self.safety.is_master_inhibited() or self._stopped:
+                self._idle_pending = False
+                self._speech_pending.clear()
+                continue
+            # Gating per trigger — routed through the central kernel (no direct allow_* interpretation here).
+            think_ok = self.safety.check_think(s).effective_enabled
+            listen_ok = self.safety.check_listen(s).effective_enabled
             if ev.kind == "idle":
                 self._idle_pending = False
-                if not (s.autonomy == "auto" and s.allow_think):
+                if not (s.autonomy == "auto" and think_ok):
                     continue
             if ev.kind == "speech":
                 self._speech_pending.clear()
-                if not ev.data.get("addressed") and not s.allow_audio_in:
+                if not ev.data.get("addressed") and not listen_ok:
                     continue
-            if ev.kind in ("state", "touch") and not s.allow_think:
+            if ev.kind in ("state", "touch") and not think_ok:
                 continue
             try:
                 if ev.kind == "command":
@@ -1481,14 +1492,21 @@ class AgentBrain:
             pass
 
     async def emergency_stop(self, reason: str, *, cancel_tts: bool = False,
-                             behavior_stop: bool = False, latch: bool = False) -> None:
+                             behavior_stop: bool = False, latch: bool = False,
+                             master: bool = False) -> None:
         """The ONE stop path used by every STOP source (recognized STOP, barge-in, STOP tool, ToF + visual
-        reflex, manual takeover, shutdown/error). It (1) optionally LATCHES the global E-STOP, (2) cancels
-        in-flight TTS, (3) preempts the active ActionExecutor action, (4) issues an idempotent bounded robot
-        stop (and a latched hard-stop burst at the link layer when latching), (5) updates behavior/HOLD.
+        reflex, manual takeover, shutdown/error). It (1) sets the gate — `master` STOP inhibits ALL autonomous
+        faculties + latches motion + drops to manual; `latch` is the motion-only latch (reflex/barge-in);
+        (2) cancels in-flight TTS, (3) parks reasoning so the reasoner stops acting, (4) preempts the active
+        ActionExecutor action, (5) issues a latched hard-stop burst at the link layer, (6) updates behavior.
         Safe to call when nothing is active (it just stops)."""
-        if latch:
-            self.safety.estop_latch()   # sync; sets the gate immediately (server also latches before await)
+        if master:
+            self.safety.master_inhibit()    # inhibit all faculties + latch motion + bump generation
+            self._stopped = True            # park: reasoner/idle loops no-op until RESUME
+            with contextlib.suppress(Exception):
+                self.settings.update(autonomy="manual")
+        elif latch:
+            self.safety.estop_latch()       # sync; sets the gate immediately (server also latches before await)
         if cancel_tts:
             from . import audio_state
             audio_state.cancel()
@@ -1496,7 +1514,7 @@ class AgentBrain:
             await self.executor.preempt(reason)
         except Exception:  # noqa: BLE001
             pass
-        if latch:
+        if latch or master:
             est = getattr(self.link, "estop", None)
             if est is not None:
                 try:
@@ -1505,6 +1523,12 @@ class AgentBrain:
                     pass
         if behavior_stop:
             self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
+
+    def resume(self) -> None:
+        """RESUME (operator): clear the master faculty inhibit + parked state. The caller (server) MUST have
+        reconciled the link/sidecar latch+generation first and cleared the motion latch via estop_reset()."""
+        self._stopped = False
+        self.safety.master_release()
 
     # --- always-respected voice commands ---
     async def _apply_command(self, intent: str, text: str, s: Settings) -> None:
@@ -1579,12 +1603,17 @@ class AgentBrain:
         self.behavior.clear_voice_intent()   # free to move again
 
     def _video_age(self) -> float | None:
-        """Seconds since the last camera frame reached the perception buffer (None if none yet)."""
+        """Seconds since the last camera frame reached the perception buffer (None if none yet). Single clock
+        domain: `buffer.frame_ts` is the wall-clock `obs.ts` (time.time()) set by the perceiver, compared
+        against time.time() here — never wall-minus-monotonic (P0-R4.5)."""
         return (time.time() - self.buffer.frame_ts) if self.buffer.frame_ts else None
 
     def _motion_block_reason(self, s: Settings) -> str:
-        """The SINGLE exact reason AI motion is blocked right now, or '' when ready. Mirrors the gates the
-        executor/safety floor actually enforce, in priority order, so the UI can show one clear verdict."""
+        """The SINGLE exact reason AI motion is blocked right now, or '' when ready (P0-R4.5). Motion is
+        blocked when evidence is MISSING, not only stale. Priority order mirrors the gates the executor/
+        safety floor actually enforce, so the UI shows one truthful verdict."""
+        if self.safety.is_master_inhibited():
+            return "master STOP"
         if self.safety.is_latched():
             return "E-STOP latched"
         if getattr(s, "asleep", False):
@@ -1594,6 +1623,12 @@ class AgentBrain:
         if s.autonomy == "manual":
             return "autonomy is manual"
         t = self.buffer.telemetry or {}
+        if not t:
+            return "no telemetry received"
+        if t.get("connected") is False:
+            return "RTM/control disconnected"
+        if self.buffer.frame_ts is None:
+            return "no video frame received"
         if self._resting(t):
             return "robot resting/docked"
         if getattr(s, "require_calibration", True) and self.motion_profile is None:
@@ -1629,8 +1664,10 @@ class AgentBrain:
             "metrics": self.metrics.summary(),
             # Motion readiness (P0-R3.2/R3.3): one place the UI reads to know whether/why the robot can move.
             "estop_latched": self.safety.is_latched(),
+            "master_inhibited": self.safety.is_master_inhibited(),
             "control_generation": self.safety.control_generation(),
             "hold": self.executor.in_hold(),
+            "capabilities": self.safety.capability_snapshot(s, motion_reason=block).get("capabilities", {}),
             "active_action": (act.to_dict() if act else None),
             "video_age": (round(self._video_age(), 2) if self._video_age() is not None else None),
             "telemetry_age": (self.buffer.telemetry or {}).get("telemetry_age"),

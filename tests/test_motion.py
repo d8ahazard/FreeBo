@@ -35,8 +35,8 @@ def test_classify_stuck_when_view_unchanged():
 
 
 def test_classify_blocked_partial_change():
-    # between still and move thresholds => obstructed/partial
-    assert classify_motion(0.02, expected="translate").state == "blocked"
+    # between still (0.006) and move (0.012) thresholds => obstructed/partial
+    assert classify_motion(0.009, expected="translate").state == "blocked"
 
 
 def test_classify_unknown_without_frame():
