@@ -66,13 +66,26 @@ def test_command_result_echo_updates_sidecar_view():
 
 def test_control_state_reports_synchronization():
     n, _ = _node()
-    n._auth_gen, n._auth_latched = 2, False
-    n._sidecar_gen, n._sidecar_latched = 2, False
+    # P0 §2/§5: synchronized requires a bound sidecar instance, control_ready, and matching
+    # epoch/generation/latch — not just generation+latch.
+    n._auth_gen, n._auth_epoch, n._auth_latched = 2, 5, False
+    n._sidecar_gen, n._sidecar_epoch, n._sidecar_latched = 2, 5, False
+    n._sidecar_instance_id = "SID"
+    n._sidecar_control_ready = True
+    n._sidecar_accepted_process = n._process_instance_id
     assert n.control_state()["synchronized"] is True
+    # any single divergence breaks synchronization
     n._sidecar_gen = 3
     cs = n.control_state()
     assert cs["synchronized"] is False
     assert cs["process_generation"] == 2 and cs["sidecar_generation"] == 3
+    n._sidecar_gen = 2
+    assert n.control_state()["synchronized"] is True
+    n._sidecar_epoch = 6        # epoch mismatch also desyncs
+    assert n.control_state()["synchronized"] is False
+    n._sidecar_epoch = 5
+    n._sidecar_control_ready = False   # control not ready desyncs
+    assert n.control_state()["synchronized"] is False
 
 
 def test_fail_pending_releases_blocked_waiters():

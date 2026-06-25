@@ -137,11 +137,11 @@ class OverseerGate(RobotLink):
     # --- safety ops: ALWAYS delegate to the real link, NEVER intercept as a proposal (P0-R4.1/fix). The base
     # RobotLink.estop() degrades to stop(); without these explicit overrides the gate would inherit that
     # degraded path and a master STOP would never reach Air2NativeLink.estop()'s latch + zero-frame burst.
-    async def estop(self, generation: int | None = None) -> dict[str, Any]:
-        return await self._inner.estop(generation=generation)
+    async def estop(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
+        return await self._inner.estop(generation=generation, epoch=epoch)
 
-    async def estop_reset(self, generation: int | None = None) -> dict[str, Any]:
-        return await self._inner.estop_reset(generation=generation)
+    async def estop_reset(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
+        return await self._inner.estop_reset(generation=generation, epoch=epoch)
 
     async def action(self, name: str) -> dict[str, Any]:
         if self._on():

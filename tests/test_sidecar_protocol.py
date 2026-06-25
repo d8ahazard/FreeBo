@@ -66,11 +66,39 @@ class Sidecar:
 @pytest.fixture
 def sc():
     s = Sidecar()
-    # Reconcile to a known unlatched state at generation 1 (sidecar boots default-safe latched=true).
-    s.send(cmd="set_control", command_id=1, generation=1, latched=False)
+    # Reconcile to a known unlatched state at epoch 1 / generation 1 (sidecar boots default-safe latched=true).
+    # P0 §2.3: an unlatching set_control MUST carry an epoch (a stale/epoch-less one can never unlatch).
+    s.send(cmd="set_control", command_id=1, epoch=1, generation=1, latched=False)
     s.result(1)
     yield s
     s.close()
+
+
+def test_ready_announces_sidecar_instance_id():
+    s = Sidecar()
+    try:
+        # the ready event captured by the constructor carried the id; re-prove via a command_result echo
+        s.send(cmd="ping")
+        s.send(cmd="set_control", command_id=99, epoch=1, generation=1, latched=False)
+        r = s.result(99)
+        assert isinstance(r.get("sidecar_instance_id"), str) and len(r["sidecar_instance_id"]) >= 8
+    finally:
+        s.close()
+
+
+def test_stale_set_control_cannot_unlatch_after_stop(sc):
+    sc.send(cmd="estop", command_id=20, epoch=2, generation=2)
+    sc.result(20)
+    # a stale set_control (epoch 1 < 2) must NOT unlatch
+    sc.send(cmd="set_control", command_id=21, epoch=1, generation=1, latched=False)
+    r = sc.result(21)
+    assert r["latched"] is True and r.get("control_state_applied") is False
+
+
+def test_unknown_raw_id_is_not_allowed_distinct_from_forbidden(sc):
+    sc.send(cmd="raw", command_id=22, id=999999, data={})
+    r = sc.result(22)
+    assert r["ok"] is False and r["error"].startswith("raw_id_not_allowed")
 
 
 def test_drive_without_generation_is_rejected(sc):
@@ -115,9 +143,10 @@ def test_estop_initial_zero_send_failure_is_reported():
 
 
 def test_raw_movement_id_is_rejected(sc):
+    # P0 §2.7: movement is in the IMMUTABLE hard-forbidden set (cannot travel raw, ever).
     sc.send(cmd="raw", command_id=7, id=101007, data={"ly": 50})
     r = sc.result(7)
-    assert r["ok"] is False and r["error"].startswith("raw_id_not_allowed")
+    assert r["ok"] is False and r["error"].startswith("raw_id_hard_forbidden")
 
 
 def test_reset_cannot_clear_a_newer_stop(sc):

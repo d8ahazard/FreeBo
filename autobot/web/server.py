@@ -592,7 +592,7 @@ async def api_resume():
                                                     "another reset active); still inhibited"}, status_code=409)
     res: dict = {}
     try:
-        res = await LINK.estop_reset(generation=token.generation) or {}
+        res = await LINK.estop_reset(generation=token.generation, epoch=token.epoch) or {}
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     link_ok = bool(res.get("ok", False)) if isinstance(res, dict) else False
@@ -607,7 +607,8 @@ async def api_resume():
         # sidecar immediately rather than leaving it dangerously unlatched. Keep all faculties inhibited.
         reassert_err = None
         with contextlib.suppress(Exception):
-            ra = await LINK.estop(generation=brain.safety.control_generation())
+            ra = await LINK.estop(generation=brain.safety.control_generation(),
+                                  epoch=brain.safety.transition_epoch())
             if not bool(ra.get("ok") if isinstance(ra, dict) else False):
                 reassert_err = "sidecar relatch not acknowledged"
         await _emit_capabilities()

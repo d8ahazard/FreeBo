@@ -70,16 +70,16 @@ class RobotLink(abc.ABC):
     @abc.abstractmethod
     async def stop(self) -> dict[str, Any]: ...
 
-    async def estop(self, generation: int | None = None) -> dict[str, Any]:
+    async def estop(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
         """Hard emergency stop at the link layer. Default = a normal stop; links with a sustained-drive
         sidecar (Air 2 native) override this to LATCH + slam a zero-frame burst so no in-flight drive resumes.
-        `generation` is the authoritative control generation (P0-R4.4) the link/sidecar should adopt. Every
-        implementation MUST accept it (no TypeError-fallback contract)."""
+        `generation`+`epoch` are the authoritative control transition (P0 §2) the link/sidecar should adopt.
+        Every implementation MUST accept them (no TypeError-fallback contract)."""
         return await self.stop()
 
-    async def estop_reset(self, generation: int | None = None) -> dict[str, Any]:
-        """Clear a link-level E-STOP latch (permits motion again). Default no-op. `generation` lets the link
-        reconcile to the authoritative generation on reset."""
+    async def estop_reset(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
+        """Clear a link-level E-STOP latch (permits motion again). Default no-op. `generation`+`epoch` let the
+        link reconcile to the authoritative control transition on reset."""
         return {"ok": True}
 
     @abc.abstractmethod

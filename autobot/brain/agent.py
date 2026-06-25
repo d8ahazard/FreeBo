@@ -1560,7 +1560,7 @@ class AgentBrain:
         if tok is not None:
             # Stamp the transport with THIS stop's generation (item 2 — never another stop's).
             try:
-                tr = await self.link.estop(generation=tok.generation)
+                tr = await self.link.estop(generation=tok.generation, epoch=tok.epoch)
                 result["transport_result"] = tr
                 result["transport_dispatch_succeeded"] = _link_transport_ok(tr)
             except Exception as e:  # noqa: BLE001

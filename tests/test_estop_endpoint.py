@@ -22,12 +22,12 @@ class _RecLink:
         self.estop_reset_calls: list = []
         self.stop_calls = 0
 
-    async def estop(self, generation=None):
-        self.estop_calls.append(generation)
+    async def estop(self, generation=None, epoch=None):
+        self.estop_calls.append((generation, epoch))
         return {"ok": True, "initial_zero_sdk_send_succeeded": True, "latched": True, "generation": generation}
 
-    async def estop_reset(self, generation=None):
-        self.estop_reset_calls.append(generation)
+    async def estop_reset(self, generation=None, epoch=None):
+        self.estop_reset_calls.append((generation, epoch))
         return {"ok": True, "latched": False, "generation": generation}
 
     async def stop(self):
@@ -44,16 +44,16 @@ def _gate(overseer: bool):
 
 async def test_gate_estop_delegates_even_when_overseer_on():
     gate, inner = _gate(overseer=True)
-    r = await gate.estop(generation=7)
-    assert inner.estop_calls == [7]          # reached the real link
+    r = await gate.estop(generation=7, epoch=3)
+    assert inner.estop_calls == [(7, 3)]     # reached the real link, carrying generation+epoch
     assert inner.stop_calls == 0             # did NOT degrade to plain stop()
     assert r["latched"] is True
 
 
 async def test_gate_estop_reset_delegates():
     gate, inner = _gate(overseer=True)
-    await gate.estop_reset(generation=7)
-    assert inner.estop_reset_calls == [7]
+    await gate.estop_reset(generation=7, epoch=3)
+    assert inner.estop_reset_calls == [(7, 3)]
 
 
 @pytest.mark.asyncio
@@ -64,7 +64,7 @@ async def test_api_estop_reaches_inner_estop_through_gate(monkeypatch):
     inner = server.brain.link._inner  # the real link wrapped by the brain's OverseerGate
     calls = {"estop": [], "stop": 0}
 
-    async def fake_estop(generation=None):
+    async def fake_estop(generation=None, epoch=None):
         calls["estop"].append(generation)
         return {"ok": True, "initial_zero_sdk_send_succeeded": True, "latched": True, "generation": generation}
 

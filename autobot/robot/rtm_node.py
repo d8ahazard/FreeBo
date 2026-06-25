@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -61,10 +62,20 @@ class RtmNode:
         # restarted sidecar can never accept motion under the wrong latch/generation. SIDECAR (echoed back in
         # command_result) is what the Node side actually holds; a mismatch must block motion.
         self._auth_gen = 0
+        self._auth_epoch = 0           # process transition epoch (mirrors SafetyFloor arbiter)
         self._auth_latched = False
         self._sidecar_gen = 0
+        self._sidecar_epoch = 0
         self._sidecar_latched = True   # unknown until the sidecar echoes its state -> assume NOT safe to move
         self._last_reconcile_error: Optional[str] = None
+        # --- instance identity (P0 §2.1) ---
+        # This server process's identity (once per RtmNode). The CURRENTLY-BOUND sidecar instance id is learned
+        # from `ready`; a command_result carrying a DIFFERENT sidecar id is from a replaced process and is
+        # rejected (fail closed) so a restarted sidecar can never spoof an old in-flight reconcile.
+        self._process_instance_id = uuid.uuid4().hex
+        self._sidecar_instance_id: Optional[str] = None
+        self._sidecar_control_ready = False      # only true once a correlated reconcile validates the instance
+        self._sidecar_accepted_process: Optional[str] = None
 
     # --- lifecycle ---
     def start(self) -> None:
@@ -93,6 +104,8 @@ class RtmNode:
         self._proc = None
         self.connected = False
         self._sidecar_latched = True   # unknown sidecar -> assume NOT safe to move until reconciled
+        self._sidecar_control_ready = False
+        self._sidecar_instance_id = None
         self._fail_pending("sidecar exited/reconnecting")
         if p:
             try:
@@ -189,7 +202,13 @@ class RtmNode:
     # --- events from the sidecar ---
     def _handle_event(self, ev: dict) -> None:
         t = ev.get("ev")
-        if t == "state":
+        if t == "ready":
+            # P0 §2.1: bind to THIS sidecar instance. Until a correlated reconcile validates it, motion stays
+            # blocked (control not ready, latch assumed on).
+            self._sidecar_instance_id = ev.get("sidecar_instance_id")
+            self._sidecar_control_ready = False
+            self._sidecar_latched = True
+        elif t == "state":
             self.connected = ev.get("state") == "CONNECTED"
         elif t == "connected":
             self.connected = True
@@ -205,11 +224,30 @@ class RtmNode:
             self.status["connected"] = True
             self._status_ts = time.monotonic()   # genuine source-update time (NOT a request time)
         elif t == "command_result":
-            # Learn the sidecar's authoritative latch/generation from every echo (P0-R4.4).
+            # P0 §2.1: reject a result from a REPLACED sidecar instance (fail closed) — never adopt its state.
+            sid = ev.get("sidecar_instance_id")
+            if sid is not None and self._sidecar_instance_id is not None and sid != self._sidecar_instance_id:
+                self._last_reconcile_error = "result_from_replaced_sidecar"
+                cid = ev.get("command_id")
+                if cid is not None:
+                    with self._pending_lock:
+                        slot = self._pending.get(cid)
+                    if slot is not None:
+                        slot["result"] = {**ev, "ok": False, "sent_to_agora": False,
+                                          "error": "result_from_replaced_sidecar"}
+                        slot["event"].set()
+                return   # do not fall through to on_event / state adoption
+            # Learn the sidecar's authoritative latch/generation/epoch + control-readiness from every echo.
             if ev.get("generation") is not None:
                 self._sidecar_gen = int(ev.get("generation"))
             if ev.get("latched") is not None:
                 self._sidecar_latched = bool(ev.get("latched"))
+            if ev.get("epoch") is not None:
+                self._sidecar_epoch = int(ev.get("epoch"))
+            if ev.get("control_ready") is not None:
+                self._sidecar_control_ready = bool(ev.get("control_ready"))
+            if ev.get("accepted_process_id") is not None:
+                self._sidecar_accepted_process = ev.get("accepted_process_id")
             cid = ev.get("command_id")
             if cid is not None:
                 with self._pending_lock:
@@ -242,9 +280,10 @@ class RtmNode:
             self.last_error = f"session not ok: {sess}"
             return
         self._send({"cmd": "connect", "session": sess})
-        # P0-R4.4: re-assert the authoritative latch+generation so a freshly (re)started sidecar — which
-        # defaults to motion-blocked — can only accept motion under the state Python actually commands.
-        self._send({"cmd": "set_control", "generation": self._auth_gen, "latched": self._auth_latched})
+        # P0 §2.3: re-assert the authoritative {process id, epoch, generation, latch} so a freshly (re)started
+        # sidecar — which defaults to motion-blocked — can only accept motion under the state Python commands.
+        self._send({"cmd": "set_control", "process_instance_id": self._process_instance_id,
+                    "epoch": self._auth_epoch, "generation": self._auth_gen, "latched": self._auth_latched})
 
     # --- commands to the sidecar ---
     def _send(self, cmd: dict) -> bool:
@@ -277,28 +316,38 @@ class RtmNode:
     def raw(self, msg_id: int, data: dict | None = None) -> bool:
         return self._send({"cmd": "raw", "id": msg_id, "data": data or {}})
 
-    def set_control(self, generation: int, latched: bool) -> bool:
-        """Push the authoritative latch + generation to the sidecar (P0-R4.4). Stored so it is re-asserted on
-        every (re)connect."""
+    def set_control(self, generation: int, latched: bool, epoch: int | None = None) -> bool:
+        """Push the authoritative {process id, epoch, generation, latch} to the sidecar (P0 §2.3). Stored so it
+        is re-asserted on every (re)connect."""
         self._auth_gen = int(generation)
         self._auth_latched = bool(latched)
-        return self._send({"cmd": "set_control", "generation": self._auth_gen, "latched": self._auth_latched})
+        if epoch is not None:
+            self._auth_epoch = int(epoch)
+        return self._send({"cmd": "set_control", "process_instance_id": self._process_instance_id,
+                           "epoch": self._auth_epoch, "generation": self._auth_gen,
+                           "latched": self._auth_latched})
 
-    def reset_control(self, generation: int, timeout: float = 0.8) -> dict:
-        """RESET that FAILS CLOSED (P0-R4 item 4). Desired latch stays True until a correlated estop_reset
-        response is fully validated: ok True, latched False, matching generation, rtm_connected True,
-        control_ready True. The request carries `expected_generation` (the desired gen we're resetting from) so
-        a newer STOP that advanced the sidecar generation rejects this reset. Only on full validation do we
-        commit the desired state to unlatched. Any exception/timeout/None/missing field leaves it latched."""
-        expected = self._auth_gen
-        res = self.send_acked({"cmd": "estop_reset", "expected_generation": expected,
-                               "generation": int(generation)}, timeout)
+    def reset_control(self, generation: int, epoch: int | None = None, timeout: float = 0.8) -> dict:
+        """RESET that FAILS CLOSED (P0 §2.4). Desired latch stays True until a correlated estop_reset response
+        is fully validated: ok True, latched False, matching generation+epoch, rtm_connected True, control_ready
+        True. The request carries expected_{generation,epoch,sidecar_id,process_id} (the desired state we're
+        resetting from) so a newer STOP, a replaced sidecar, or an unsynchronized instance rejects this reset.
+        Only on full validation do we commit the desired state to unlatched. Any exception/timeout/None/missing
+        field leaves it latched."""
+        new_epoch = self._auth_epoch if epoch is None else int(epoch)
+        res = self.send_acked({"cmd": "estop_reset",
+                               "expected_generation": self._auth_gen, "expected_epoch": self._auth_epoch,
+                               "expected_sidecar_id": self._sidecar_instance_id,
+                               "expected_process_id": self._process_instance_id,
+                               "generation": int(generation), "epoch": new_epoch}, timeout)
         ok = (res.get("ok") is True and res.get("latched") is False
               and res.get("generation") == int(generation)
+              and (res.get("epoch") is None or res.get("epoch") == new_epoch)
               and res.get("rtm_connected") is True and res.get("control_ready") is True)
         if ok:
             self._auth_latched = False
             self._auth_gen = int(generation)
+            self._auth_epoch = new_epoch
             self._last_reconcile_error = None
         else:
             self._last_reconcile_error = res.get("error") or "reset not validated (fail-closed)"
@@ -306,11 +355,23 @@ class RtmNode:
                 "error": (None if ok else self._last_reconcile_error)}
 
     def control_state(self) -> dict:
-        """Process vs sidecar latch/generation for the readiness surface (P0-R4.4). `synchronized` False means
-        the two disagree (e.g. a sidecar restart that hasn't been reconciled) — motion must be blocked."""
-        synced = (self._auth_gen == self._sidecar_gen) and (self._auth_latched == self._sidecar_latched)
-        return {"process_latched": self._auth_latched, "process_generation": self._auth_gen,
+        """Process vs sidecar control identity/epoch/generation/latch for the readiness surface (P0 §2 + §5).
+        `synchronized` False means the two disagree — a sidecar restart not yet reconciled, an instance
+        mismatch, control not ready, or differing epoch/generation/latch — and motion MUST be blocked."""
+        synced = (self._sidecar_instance_id is not None
+                  and self._sidecar_control_ready
+                  and self._auth_gen == self._sidecar_gen
+                  and self._auth_epoch == self._sidecar_epoch
+                  and self._auth_latched == self._sidecar_latched
+                  and (self._sidecar_accepted_process is None
+                       or self._sidecar_accepted_process == self._process_instance_id))
+        return {"process_instance_id": self._process_instance_id,
+                "sidecar_instance_id": self._sidecar_instance_id,
+                "sidecar_control_ready": self._sidecar_control_ready,
+                "process_latched": self._auth_latched, "process_generation": self._auth_gen,
+                "process_epoch": self._auth_epoch,
                 "sidecar_latched": self._sidecar_latched, "sidecar_generation": self._sidecar_gen,
+                "sidecar_epoch": self._sidecar_epoch,
                 "synchronized": synced, "last_reconcile_error": self._last_reconcile_error}
 
     # --- acknowledged commands (real Agora delivery, not pipe-write) ---
@@ -330,8 +391,15 @@ class RtmNode:
             self._auth_latched = True
             if cmd.get("generation") is not None:
                 self._auth_gen = int(cmd["generation"])
-        elif kind == "drive" and "generation" not in cmd:
-            cmd = {**cmd, "generation": self._auth_gen}
+            if cmd.get("epoch") is not None:
+                self._auth_epoch = int(cmd["epoch"])
+        elif kind == "drive":
+            # P0 §2.6/§3: stamp the full ticket so the sidecar can reject a stale (pre-STOP / wrong-instance)
+            # drive that arrives late. epoch+generation must match the accepted control state exactly.
+            cmd = {**cmd, "generation": cmd.get("generation", self._auth_gen),
+                   "epoch": cmd.get("epoch", self._auth_epoch),
+                   "process_instance_id": self._process_instance_id,
+                   "sidecar_instance_id": self._sidecar_instance_id}
         # NOTE (P0-R4 item 4): estop_reset does NOT mutate desired state here. The desired latch is cleared
         # only by reset_control() AFTER the sidecar response is validated — so a failed/partial reset fails
         # closed (stays latched).
@@ -364,7 +432,8 @@ class RtmNode:
         # Surface the sidecar's honest extra facts (P0-R4 item 2/4) when present, so callers report local
         # safety vs transport independently and can validate a reset response.
         for k in ("initial_zero_sdk_send_succeeded", "local_latch_set", "retry_count", "latched",
-                  "generation", "control_ready", "rtm_connected"):
+                  "generation", "epoch", "control_ready", "control_state_applied", "reconciled",
+                  "rtm_connected", "sidecar_instance_id", "accepted_process_id"):
             if k in res:
                 out[k] = res[k]
         rec = {**out, "cmd": cmd.get("cmd")}
