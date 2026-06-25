@@ -82,10 +82,12 @@ passed. Sidecar barrier cases proven: prepare-cannot-match-newer-STOP, STOP-afte
 reused-nonce-rejected, set_control-cannot-unlatch, parent-death→new-instance-starts-latched.
 
 ## Remaining sections (in progress)
-§3 RtmNode state machine, §4 effect-ticket enforcement on ALL routes + static audit, §5 priority-first STOP,
-§6 reasoning/faculty cancellation, §7 dark/wake lifecycle, §8 harness acceptance calcs, §9 the 20 forced-race
-tests, §10 authority audit, §11 UI/API contract, §12 evidence gate, §13 final report — NOT yet complete. This
-report stays WORK IN PROGRESS and Phase 0 stays FAIL until they land + the canonical suite runs 3x clean.
+Landed + tested: §1 (`dd2d6d2`), §2 (`7c86e93`), §3 safe subset (`e4127a4`). NOT yet complete: §4 effect-ticket
+enforcement on ALL routes + static audit, §5 priority-first STOP, §6 reasoning/faculty cancellation, §7 dark/wake
+lifecycle, §8 harness acceptance calcs, §9 the remaining forced-race tests + FAKE-seam controls, §10 authority
+audit, §11 UI/API contract, §12 evidence gate (3x clean), §13 final report. This report stays WORK IN PROGRESS
+and Phase 0 stays FAIL until they land + the canonical suite runs 3x clean. Full-suite gate not yet re-run at
+this SHA.
 
 ## Priority STOP evidence
 (Pending — §5.)
@@ -97,7 +99,16 @@ report stays WORK IN PROGRESS and Phase 0 stays FAIL until they land + the canon
 (Pending — §6.)
 
 ## Sidecar lifecycle evidence
-(Pending — §3 + §7.)
+§3 (commit `e4127a4`): RtmNode synchronized state machine (safe subset). Dedicated `_state_lock` (RLock) guards
+protocol/identity/reset state (command_result adoption + `control_state()` snapshot). Correct startup ordering:
+`_serve` reads + validates `ready` and binds that exact sidecar instance BEFORE connect/reconcile. Strict
+pending-command correlation: a result with the right id but wrong kind can never satisfy a waiter or mutate
+observed state. `synchronized` requires the accepted process id to EQUAL ours (no None allowance). Deterministic
+shutdown joins both the manager and the now-tracked stderr thread. Evidence: `pytest tests/test_rtm_node.py` →
+13 passed (incl. wrong-kind correlation). DEVIATION (documented): the connect-time reconcile still uses
+fire-and-forget `set_control`, which the sidecar now permits ONLY to assert/preserve a latch (never unlatch); a
+blocking correlated `set_control` on the manager thread would deadlock its own reader. Full correlated-ack
+startup (thread-split) is deferred. §7 dark/wake lifecycle still pending.
 
 ## Harness status
 Rewritten in the prior wave but NOT yet consuming nested transport evidence / full acceptance matrix
