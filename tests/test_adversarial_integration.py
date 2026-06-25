@@ -164,6 +164,48 @@ def test_stop_wins_over_concurrent_reconcile():
         sc.close()
 
 
+def test_prepare_rejected_while_estop_initial_zero_blocked():
+    # agent_next_2 §9 case 3 (FORCED with the block seam, no sleep): block the SDK send so the E-STOP's initial
+    # zero-frame is in flight (activeStops>0); a RESET prepare must be rejected.
+    sc = _reconciled()
+    try:
+        sc.send(cmd="__block")                                   # the next SDK send will block
+        sc.send(cmd="estop", command_id=1, epoch=2, generation=2)   # doEstop awaits the blocked zero-send
+        sc.send(cmd="prepare_reset", command_id=2, process_instance_id="P1", sidecar_instance_id=sc.sid,
+                expected_epoch=2, expected_generation=2, release_epoch=3, release_generation=3)
+        assert sc.result(2)["error"] == "estop_in_flight"        # rejected while a STOP dispatch is in flight
+        sc.send(cmd="__release")
+        assert sc.result(1)["local_latch_set"] is True           # the E-STOP then completes
+    finally:
+        sc.close()
+
+
+def test_two_simultaneous_prepares_one_accepted():
+    # §9 case 6: only ONE prepared reset may be active at a time.
+    sc = _reconciled()
+    try:
+        sc.send(cmd="estop", command_id=1, epoch=2, generation=2)
+        sc.result(1)
+        for cid in (2, 3):
+            sc.send(cmd="prepare_reset", command_id=cid, process_instance_id="P1", sidecar_instance_id=sc.sid,
+                    expected_epoch=2, expected_generation=2, release_epoch=3, release_generation=3)
+        r2, r3 = sc.result(2), sc.result(3)
+        assert r2["prepared"] is True
+        assert r3["error"] == "reset_already_prepared"
+    finally:
+        sc.close()
+
+
+def test_same_generation_newer_epoch_drive_rejected():
+    # §9 case 9: a drive with the matching generation but a NEWER epoch is stale and rejected.
+    sc = _reconciled()
+    try:
+        sc.send(cmd="drive", command_id=1, generation=1, epoch=2, ly=0.2, duration=0.1)
+        assert sc.result(1)["error"] == "stale_epoch"
+    finally:
+        sc.close()
+
+
 def test_raw_hard_forbidden_even_when_env_allows():
     # env tries to allowlist movement (101007) + dock (103043); the immutable hard-forbidden set wins.
     sc = Sidecar(env_extra={"AUTOBOT_RTM_RAW_ALLOW": "101007,103043"})

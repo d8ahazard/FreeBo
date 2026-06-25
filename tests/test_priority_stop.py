@@ -74,3 +74,27 @@ async def test_voice_stop_dispatches_master_stop_exactly_once(tmp_path, monkeypa
     await asyncio.sleep(0.05)                             # let the scheduled coroutine run
     assert calls["estop"] == 1                            # exactly once
     assert not any(k == "command" for k, _ in posts)      # NOT also enqueued as a command (no double STOP)
+
+
+async def test_bargein_and_tool_stop_each_dispatch_master_once(tmp_path, monkeypatch):
+    # agent_next_2 §9 case 17: barge-in STOP and the STOP tool each produce exactly ONE master STOP.
+    link = _RecLink()
+    brain = _brain(tmp_path, link)
+    brain._loop = asyncio.get_running_loop()
+    calls = {"n": 0}
+
+    async def fake_estop(reason, *, cancel_tts=False, behavior_stop=False, latch=False, master=False):
+        calls["n"] += 1 if master else 0
+        return {"ok": True, "master": master}
+
+    monkeypatch.setattr(brain, "emergency_stop", fake_estop)
+
+    # barge-in STOP (worker-thread handoff)
+    brain.handle_critical("stop")
+    await asyncio.sleep(0.05)
+    assert calls["n"] == 1
+
+    # STOP tool / command path
+    from autobot.config import SETTINGS
+    await brain._apply_command("STOP", "", SETTINGS.snapshot())
+    assert calls["n"] == 2                                # one more, exactly once per source

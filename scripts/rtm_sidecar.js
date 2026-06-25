@@ -161,10 +161,14 @@ function _needSession(why) {
 const FAKE = process.env.AUTOBOT_RTM_FAKE === "1";
 let _fakeFail = process.env.AUTOBOT_RTM_FAKE_FAIL === "1";
 
+// agent_next_2 §9: deterministic test seam — when armed (`__block`), the FAKE SDK send BLOCKS until `__release`,
+// so a test can force "STOP initial-zero send in flight" / "priority E-STOP before a blocked send" without sleeps.
+let _blockGate = null, _blockRelease = null;
 async function sendRtm(id, data) {
   // Returns {ok, error}: ok is the REAL Agora sendMessageToPeer result, not a pipe write. Callers that
   // don't care (keepalive/cadence) ignore it; the acked() path forwards it as a command_result.
   if (FAKE) {
+    if (_blockGate) { await _blockGate; }
     if (_fakeFail) return { ok: false, error: "fake_send_failed" };
     out({ ev: "sent", id, fake: true }); return { ok: true, error: null };
   }
@@ -501,6 +505,11 @@ async function handle(c) {
       log("info", "dock + control released"); return;
     }
     case "__fake": { if (FAKE) _fakeFail = !!c.fail; return; }   // test-only: toggle send failure
+    case "__block": { if (FAKE && !_blockGate) { _blockGate = new Promise((res) => { _blockRelease = res; }); } return; }
+    case "__release": { if (FAKE && _blockRelease) { _blockRelease(); _blockGate = null; _blockRelease = null; } return; }
+    case "__diag": { out({ ev: "diag", command_id: c.command_id ?? null, active_stops: activeStops,
+                           prepared_reset: !!preparedReset, latched, epoch, generation,
+                           sidecar_instance_id: SIDECAR_ID }); return; }
     case "raw": {
       // P0 §2.7: IMMUTABLE hard-forbidden set (movement/dock/ownership/speed/avoid/actuator) can never travel
       // raw, regardless of env. Beyond that it is an ALLOWLIST: any non-approved or unknown id is rejected.
