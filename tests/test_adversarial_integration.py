@@ -51,6 +51,7 @@ class Sidecar:
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
         self.ready = self.wait(lambda e: e.get("ev") == "ready", timeout=10)
+        self.sid = self.ready.get("sidecar_instance_id")
 
     def _read(self) -> None:
         try:
@@ -95,9 +96,17 @@ class Sidecar:
 
 
 def _reconciled() -> Sidecar:
+    """Fresh sidecar brought to unlatched epoch1/gen1 via the legal two-phase release (set_control can never
+    unlatch; only prepare_reset -> commit_reset can)."""
     sc = Sidecar()
-    sc.send(cmd="set_control", command_id=1, process_instance_id="P1", epoch=1, generation=1, latched=False)
-    sc.result(1)
+    sc.send(cmd="set_control", command_id=9001, process_instance_id="P1", epoch=0, generation=0, latched=True)
+    sc.result(9001)
+    sc.send(cmd="prepare_reset", command_id=9002, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            expected_epoch=0, expected_generation=0, release_epoch=1, release_generation=1)
+    nonce = sc.result(9002)["prepare_nonce"]
+    sc.send(cmd="commit_reset", command_id=9003, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            prepare_nonce=nonce)
+    sc.result(9003)
     return sc
 
 
@@ -206,44 +215,55 @@ def test_rtmnode_rejects_replaced_instance_result():
     assert n._last_reconcile_error == "result_from_replaced_sidecar"
 
 
-def test_reused_reset_token_via_rtmnode():
+def test_two_phase_reconcile_clears_desired_latch_via_rtmnode():
     n, sent = _node()
     n._sidecar_instance_id = "SID"
     n._auth_latched, n._auth_gen, n._auth_epoch = True, 5, 5
 
-    # First reset: feed a valid correlated estop_reset response -> reconciles, clears desired latch.
-    def feed_ok(cmd):
+    # Drive the two-phase release: prepare echoes a nonce; commit echoes the reconciled new state.
+    def feed(cmd):
         sent.append(cmd)
         cid = cmd.get("command_id")
-        if cmd.get("cmd") == "estop_reset" and cid is not None:
-            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "estop_reset",
-                             "sidecar_instance_id": "SID", "ok": True, "sent_to_agora": True, "latched": False,
-                             "generation": 5, "epoch": 5, "rtm_connected": True, "control_ready": True})
+        if cid is None:
+            return True
+        if cmd.get("cmd") == "prepare_reset":
+            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "prepare_reset",
+                             "sidecar_instance_id": "SID", "prepared": True, "prepare_nonce": "N",
+                             "latched": True, "control_ready": True})
+        elif cmd.get("cmd") == "commit_reset":
+            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "commit_reset",
+                             "sidecar_instance_id": "SID", "reconciled": True, "latched": False,
+                             "generation": 6, "epoch": 6, "control_ready": True})
         return True
 
-    n._send = feed_ok  # type: ignore[assignment]
-    r1 = n.reset_control(5, 5, timeout=1.0)
-    assert r1["ok"] is True and n._auth_latched is False
-    # A second reset with no STOP in between is a no-op success path; the important invariant is the desired
-    # latch is already cleared and cannot be "double-cleared" into an inconsistent state.
+    n._send = feed  # type: ignore[assignment]
+    r = n.reset_reconcile(5, 5, 6, 6, timeout=1.0)
+    assert r["ok"] is True and r["reconciled"] is True
+    assert n._auth_latched is False and n._auth_gen == 6 and n._auth_epoch == 6
+    # the prepare nonce was consumed by the commit; the desired latch cannot be double-cleared.
     assert n._auth_latched is False
 
 
-def test_reset_fails_closed_when_control_not_ready():
+def test_reset_fails_closed_when_commit_not_control_ready():
     n, sent = _node()
     n._sidecar_instance_id = "SID"
     n._auth_latched, n._auth_gen, n._auth_epoch = True, 3, 3
 
-    def feed_not_ready(cmd):
+    def feed(cmd):
         sent.append(cmd)
         cid = cmd.get("command_id")
-        if cmd.get("cmd") == "estop_reset" and cid is not None:
-            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "estop_reset",
-                             "sidecar_instance_id": "SID", "ok": False, "sent_to_agora": False,
-                             "error": "control_not_ready", "latched": True, "generation": 3, "epoch": 3,
-                             "rtm_connected": True, "control_ready": False})
+        if cid is None:
+            return True
+        if cmd.get("cmd") == "prepare_reset":
+            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "prepare_reset",
+                             "sidecar_instance_id": "SID", "prepared": True, "prepare_nonce": "N",
+                             "latched": True, "control_ready": True})
+        elif cmd.get("cmd") == "commit_reset":
+            n._handle_event({"ev": "command_result", "command_id": cid, "cmd": "commit_reset",
+                             "sidecar_instance_id": "SID", "reconciled": False, "latched": True,
+                             "error": "control_not_ready", "control_ready": False})
         return True
 
-    n._send = feed_not_ready  # type: ignore[assignment]
-    r = n.reset_control(3, 3, timeout=1.0)
+    n._send = feed  # type: ignore[assignment]
+    r = n.reset_reconcile(3, 3, 4, 4, timeout=1.0)
     assert r["ok"] is False and n._auth_latched is True   # stays latched (fail closed)

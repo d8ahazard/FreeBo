@@ -79,10 +79,15 @@ class RobotLink(abc.ABC):
         Every implementation MUST accept them (no TypeError-fallback contract)."""
         return await self.stop()
 
-    async def estop_reset(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
-        """Clear a link-level E-STOP latch (permits motion again). Default no-op. `generation`+`epoch` let the
-        link reconcile to the authoritative control transition on reset."""
-        return {"ok": True}
+    async def estop_reset(self, *, expected_epoch: int | None = None, expected_generation: int | None = None,
+                          release_epoch: int | None = None,
+                          release_generation: int | None = None) -> dict[str, Any]:
+        """Reconcile a link-level E-STOP latch via the prepared two-phase release (agent_next_2 §2). Default
+        (links with no sustained-drive sidecar) reconcile trivially to the reserved release state. Air 2 overrides
+        this to run sidecar prepare_reset -> commit_reset and reports honest reconciliation evidence (NOT an SDK
+        send). The process clears its own latch only after this returns reconciled + the reserved release state."""
+        return {"ok": True, "reconciled": True, "control_ready": True, "latched": False,
+                "epoch": release_epoch, "generation": release_generation}
 
     @abc.abstractmethod
     async def action(self, name: str) -> dict[str, Any]: ...

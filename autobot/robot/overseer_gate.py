@@ -142,8 +142,11 @@ class OverseerGate(RobotLink):
     async def estop(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
         return await self._inner.estop(generation=generation, epoch=epoch)
 
-    async def estop_reset(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
-        return await self._inner.estop_reset(generation=generation, epoch=epoch)
+    async def estop_reset(self, *, expected_epoch: int | None = None, expected_generation: int | None = None,
+                          release_epoch: int | None = None,
+                          release_generation: int | None = None) -> dict[str, Any]:
+        return await self._inner.estop_reset(expected_epoch=expected_epoch, expected_generation=expected_generation,
+                                             release_epoch=release_epoch, release_generation=release_generation)
 
     async def action(self, name: str) -> dict[str, Any]:
         if self._on():

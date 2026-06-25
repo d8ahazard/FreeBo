@@ -62,11 +62,16 @@ class StopToken:
 
 @dataclass
 class ResetToken:
-    """A single-use compare-and-swap snapshot captured when a RESET is ADMITTED. The reset may commit only if
-    it is still the active attempt, no STOP is in flight, and (epoch, generation) are unchanged."""
+    """A single-use reservation captured when a RESET is ADMITTED (agent_next_2 §2.1). It reserves a brand-new
+    post-resume (release_epoch, release_generation) — strictly newer than the current state — so commands
+    admitted before the completed RESUME stay stale forever. The reset finalizes only if it is still the active
+    attempt, no STOP is in flight, and the current (epoch, generation) still equal the expected ones. The
+    process/sidecar instances + the sidecar prepare nonce are tracked by the orchestration layer (RtmNode)."""
     reset_attempt_id: int
-    epoch: int
-    generation: int
+    expected_epoch: int
+    expected_generation: int
+    release_epoch: int
+    release_generation: int
 
 
 @dataclass
@@ -134,10 +139,11 @@ class ControlArbiter:
         with self._lock:
             return bool(self._active_stops)
 
-    # --- reset admission + CAS (items 3, 4) ---
+    # --- reset admission + finalization (agent_next_2 §2.1/§2.4) ---
     def begin_reset(self) -> Optional[ResetToken]:
         """Admit a reset ONLY when safe to even contact the link: no STOP in flight, currently latched +
-        inhibited, and no other reset already active. Returns None (rejected) otherwise."""
+        inhibited, and no other reset already active. Reserves a brand-new post-resume (release_epoch,
+        release_generation). Returns None (rejected) otherwise. Releases NO faculty."""
         with self._lock:
             if self._active_stops:
                 return None
@@ -147,22 +153,31 @@ class ControlArbiter:
                 return None
             self._reset_seq += 1
             self._active_reset_id = self._reset_seq
-            return ResetToken(self._reset_seq, self._epoch, self._generation)
+            return ResetToken(self._reset_seq, self._epoch, self._generation,
+                              self._epoch + 1, self._generation + 1)
 
-    def commit_reset(self, token: ResetToken) -> bool:
-        """Single-use CAS. Consumes the token on EVERY path (commit or abort), so it can never commit twice.
-        Commits only if it is the active attempt, nothing is in flight, and (epoch, generation) are unchanged."""
+    def finalize_reset(self, token: ResetToken) -> bool:
+        """Process finalization (§2.4): the single-use atomic install of the reserved release state. Consumes the
+        token on EVERY path so it can never finalize twice. Finalizes only if it is the active attempt, nothing
+        is in flight, and the current (epoch, generation) still equal the expected pre-reset values. On success
+        installs the reserved release epoch/generation and clears the latch + master inhibit."""
         with self._lock:
             if token.reset_attempt_id != self._active_reset_id:
                 return False                 # not the active attempt / already consumed
             self._active_reset_id = None      # consume
             if self._active_stops:
                 return False
-            if token.epoch != self._epoch or token.generation != self._generation:
-                return False
+            if token.expected_epoch != self._epoch or token.expected_generation != self._generation:
+                return False                 # a STOP (or anything) advanced state since admission
+            self._epoch = token.release_epoch
+            self._generation = token.release_generation
             self._latched = False
             self._inhibited = False
             return True
+
+    # Back-compat alias: the process finalize used to be called commit_reset.
+    def commit_reset(self, token: ResetToken) -> bool:
+        return self.finalize_reset(token)
 
     def abort_reset(self, token: ResetToken) -> None:
         with self._lock:
@@ -322,8 +337,12 @@ class SafetyFloor:
         """Admit a reset (None if rejected — STOP in flight / not latched / another reset active)."""
         return self.arb.begin_reset()
 
+    def finalize_reset(self, token: ResetToken) -> bool:
+        """Process finalization of a two-phase release (§2.4): atomically install the reserved release state."""
+        return self.arb.finalize_reset(token)
+
     def commit_reset(self, token: ResetToken) -> bool:
-        return self.arb.commit_reset(token)
+        return self.arb.commit_reset(token)   # back-compat alias for finalize_reset
 
     def abort_reset(self, token: ResetToken) -> None:
         self.arb.abort_reset(token)

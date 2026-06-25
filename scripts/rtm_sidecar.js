@@ -118,6 +118,7 @@ let latched = true;     // E-STOP latch: while true, ALL drive frames are refuse
 let generation = 0;     // control generation; bumped on E-STOP; drives stamped with a stale generation are dropped
 let epoch = 0;          // transition epoch (monotonic); mirrors the Python arbiter's epoch on each transition
 let activeStops = 0;    // count of E-STOP dispatches currently in flight (RESET refused while > 0)
+let preparedReset = null;   // agent_next_2 §2: the ONE prepared-reset record {nonce, releaseEpoch, ...} or null
 
 // One place to emit a correlated command_result so EVERY result carries the sidecar identity + control state
 // (P0 agent_next §2). Extra fields override the defaults.
@@ -336,52 +337,78 @@ async function handle(c) {
       if (c.process_instance_id != null) acceptedProcessId = c.process_instance_id;
       if (c.generation != null) generation = c.generation;
       if (c.epoch != null) epoch = c.epoch;
-      if (c.latched != null) {
-        // Latching is always honored. Unlatching is honored ONLY for a set_control that carried an epoch
-        // (proving it cleared the stale-epoch guard above) — a stale queued set_control with a lower epoch
-        // was already rejected, so it can never unlatch after a newer STOP. A set_control with no epoch can
-        // never clear a latch (fail safe).
-        if (c.latched) latched = true;
-        else if (c.epoch != null) latched = false;
-      }
+      // agent_next_2 §1.2: set_control may ASSERT or PRESERVE a latch but must NEVER clear it. Only the explicit
+      // two-phase RESET (prepare_reset -> commit_reset) may clear the latch.
+      if (c.latched === true) latched = true;
       if (latched) clearDrive();
       const control_ready = FAKE || !!(inst && sess);
-      result(c, { ok: true, control_state_applied: true, reconciled: true, control_ready });
+      result(c, { ok: true, control_state_applied: true, reconciled: true, control_ready, latch_cleared: false });
       log("info", "control reconciled (epoch " + epoch + ", gen " + generation + ", latched " + latched + ")");
       return;
     }
-    case "estop_reset": {
-      // P0 §2.4: validate ALL preconditions BEFORE clearing the latch (validation first, mutation second).
-      // Any failure leaves the sidecar latched. A RESET can never clear a NEWER STOP and can never run while
-      // an E-STOP dispatch is still in flight.
-      if (activeStops > 0) {
-        result(c, { ok: false, sent_to_agora: false, error: "estop_in_flight" });
-        log("warn", "RESET rejected (estop dispatch in flight)"); return;
+    case "prepare_reset": {
+      // agent_next_2 §2.2: phase 1 of the two-phase release. Validate ALL fields as mandatory; on success store
+      // ONE prepared-reset record + return a fresh nonce. STAY latched. This is NOT an SDK send.
+      const controlReady = FAKE || !!(inst && sess);
+      if (activeStops > 0) { result(c, { ok: false, prepared: false, error: "estop_in_flight" }); return; }
+      if (c.process_instance_id == null || c.sidecar_instance_id == null
+          || c.expected_epoch == null || c.expected_generation == null
+          || c.release_epoch == null || c.release_generation == null) {
+        result(c, { ok: false, prepared: false, error: "missing_identity" }); return;
       }
-      if (c.expected_sidecar_id != null && c.expected_sidecar_id !== SIDECAR_ID) {
-        result(c, { ok: false, sent_to_agora: false, error: "wrong_sidecar_instance" });
-        log("warn", "RESET rejected (sidecar instance mismatch)"); return;
+      if (c.sidecar_instance_id !== SIDECAR_ID
+          || (acceptedProcessId != null && c.process_instance_id !== acceptedProcessId)) {
+        result(c, { ok: false, prepared: false, error: "instance_mismatch" }); return;
       }
-      if (c.expected_process_id != null && acceptedProcessId != null && c.expected_process_id !== acceptedProcessId) {
-        result(c, { ok: false, sent_to_agora: false, error: "wrong_process_instance" }); return;
+      if (c.expected_epoch !== epoch || c.expected_generation !== generation) {
+        result(c, { ok: false, prepared: false, error: "stale_state" }); return;
       }
-      if (c.expected_generation != null && c.expected_generation !== generation) {
-        result(c, { ok: false, sent_to_agora: false, error: "stale_reset_generation" });
-        log("warn", "RESET rejected (stale gen " + c.expected_generation + " != " + generation + ")"); return;
+      if (!(c.release_epoch > epoch && c.release_generation > generation)) {
+        result(c, { ok: false, prepared: false, error: "release_not_newer" }); return;
       }
-      if (c.expected_epoch != null && c.expected_epoch !== epoch) {
-        result(c, { ok: false, sent_to_agora: false, error: "stale_reset_epoch" }); return;
+      if (!controlReady) { result(c, { ok: false, prepared: false, control_ready: false, error: "control_not_ready" }); return; }
+      if (preparedReset) { result(c, { ok: false, prepared: false, error: "reset_already_prepared" }); return; }
+      const nonce = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString("hex"));
+      preparedReset = { nonce, releaseEpoch: c.release_epoch, releaseGeneration: c.release_generation,
+                        expectedEpoch: c.expected_epoch, expectedGeneration: c.expected_generation,
+                        processId: c.process_instance_id };
+      // remains LATCHED; no state mutation, no SDK send
+      result(c, { ok: true, prepared: true, control_state_applied: false, sdk_send_attempted: false,
+                  prepare_nonce: nonce, latched: true, control_ready: controlReady });
+      log("info", "RESET prepared (release epoch " + c.release_epoch + "/gen " + c.release_generation + ")");
+      return;
+    }
+    case "commit_reset": {
+      // agent_next_2 §2.3: phase 2. Commit ONLY when the same prepared reset is still active, no STOP arrived
+      // after prepare, accepted state is still the expected old state, identities match, control ready. Then
+      // atomically install the new release epoch/gen + clear the latch + consume the nonce. This is NOT an
+      // SDK send (local state mutation only).
+      const pr = preparedReset;
+      if (!pr || c.prepare_nonce == null || c.prepare_nonce !== pr.nonce) {
+        result(c, { ok: false, reconciled: false, error: "no_prepared_reset" }); return;
       }
-      const control_ready = FAKE || !!(inst && sess);
-      if (!control_ready) {                                   // fail closed: no control session => stay latched
-        result(c, { ok: false, sent_to_agora: false, control_ready: false, error: "control_not_ready" }); return;
+      if (activeStops > 0) {                       // a STOP raced in after prepare -> invalidate
+        preparedReset = null;
+        result(c, { ok: false, reconciled: false, error: "estop_in_flight" }); return;
       }
-      // all preconditions hold — now mutate
+      if (epoch !== pr.expectedEpoch || generation !== pr.expectedGeneration) {
+        preparedReset = null;                       // state changed after prepare (e.g. a STOP) -> invalidate
+        result(c, { ok: false, reconciled: false, error: "state_changed_after_prepare" }); return;
+      }
+      if (c.sidecar_instance_id !== SIDECAR_ID
+          || (acceptedProcessId != null && c.process_instance_id !== acceptedProcessId)) {
+        result(c, { ok: false, reconciled: false, error: "instance_mismatch" }); return;
+      }
+      const controlReady = FAKE || !!(inst && sess);
+      if (!controlReady) { result(c, { ok: false, reconciled: false, control_ready: false, error: "control_not_ready" }); return; }
+      // atomic commit
+      epoch = pr.releaseEpoch;
+      generation = pr.releaseGeneration;
       latched = false;
-      if (c.generation != null) generation = c.generation;
-      if (c.epoch != null) epoch = c.epoch;
-      result(c, { ok: true, sent_to_agora: true, reconciled: true, control_ready: true });
-      log("info", "E-STOP reset — motion permitted again (epoch " + epoch + ", gen " + generation + ")");
+      preparedReset = null;
+      result(c, { ok: true, reconciled: true, control_state_applied: true, sdk_send_attempted: false,
+                  control_ready: true, latched: false });
+      log("info", "RESET committed — motion permitted (epoch " + epoch + ", gen " + generation + ")");
       return;
     }
     case "drive": {
@@ -466,6 +493,7 @@ async function doEstop(c) {
     latched = true;                                          // (1) latch BEFORE any await
     generation = (c.generation != null) ? c.generation : generation + 1;  // (2) invalidate generation
     if (c.epoch != null) epoch = c.epoch;                    //     adopt the arbiter's transition epoch
+    preparedReset = null;                                    //     a STOP invalidates any prepared RESET (§2)
     clearDrive();                                            // (3) clear repeat/timeout timers
     const z = zeroFrame();
     const dispatch_ts = Date.now();
@@ -519,8 +547,18 @@ process.stdin.on("data", (chunk) => {
     }
   }
 });
-process.stdin.on("end", () => teardown().finally(() => process.exit(0)));
-process.on("SIGTERM", () => teardown().finally(() => process.exit(0)));
+// agent_next_2 §2.5 parent-death fail-safe: on stdin end / parent loss / SIGTERM, immediately LATCH, invalidate
+// any prepared RESET, clear drive/effect timers, and dispatch a zero frame when transport is available — so a
+// dying parent can never leave the robot unlatched or moving, and a replacement process must fully reconcile.
+async function failSafeShutdown() {
+  latched = true;
+  preparedReset = null;
+  clearDrive();
+  try { await sendRtm(RTM_DRIVE, zeroFrame()); } catch (e) {}
+  await teardown();
+}
+process.stdin.on("end", () => failSafeShutdown().finally(() => process.exit(0)));
+process.on("SIGTERM", () => failSafeShutdown().finally(() => process.exit(0)));
 if (FAKE) connected = true;   // test seam: report connected so command_result.rtm_connected is sane
 // P0 §2.1: announce this sidecar's identity so Python binds to THIS instance and rejects a replaced one.
 out({ ev: "ready", sidecar_instance_id: SIDECAR_ID });

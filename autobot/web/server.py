@@ -582,44 +582,64 @@ async def api_resume():
     link/sidecar latch+generation FIRST and stays inhibited if the sidecar reset is not acknowledged; only
     then clears the process latch + master inhibit. Each faculty restores to its own requested toggle;
     autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
-    # P0-R4 atomicity item 3: ADMISSION FIRST — do not contact the link at all unless a reset is admissible
-    # (no STOP in flight, currently latched+inhibited, no other reset active). The unsafe side effect must not
-    # precede the decision.
+    # agent_next_2 §2: prepared two-phase release. SYNC PRECONDITION + ADMISSION FIRST — do not contact the link
+    # unless the sidecar is synchronized AND a reset is admissible (no STOP in flight, latched+inhibited, no other
+    # reset). The unsafe side effect never precedes the decision.
+    rtm = getattr(LINK, "rtm", None)
+    if rtm is not None and hasattr(rtm, "control_state"):
+        cs = rtm.control_state()
+        if not cs.get("synchronized", False):
+            await _emit_capabilities()
+            return JSONResponse({"ok": False, "phase": "preflight",
+                                 "error": "sidecar not synchronized; still inhibited", "control_state": cs},
+                                status_code=409)
     token = brain.safety.begin_reset()
     if token is None:
         await _emit_capabilities()
-        return JSONResponse({"ok": False, "error": "reset not admissible (STOP in flight / not latched / "
-                                                    "another reset active); still inhibited"}, status_code=409)
+        return JSONResponse({"ok": False, "phase": "admission",
+                             "error": "reset not admissible (STOP in flight / not latched / another reset "
+                                      "active); still inhibited"}, status_code=409)
+    # Phase 1+2 at the link: sidecar prepare_reset -> commit_reset. The sidecar stays latched until a validated
+    # commit; this returns reconciliation evidence (NOT an SDK send).
     res: dict = {}
     try:
-        res = await LINK.estop_reset(generation=token.generation, epoch=token.epoch) or {}
+        res = await LINK.estop_reset(expected_epoch=token.expected_epoch,
+                                     expected_generation=token.expected_generation,
+                                     release_epoch=token.release_epoch,
+                                     release_generation=token.release_generation) or {}
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    link_ok = bool(res.get("ok", False)) if isinstance(res, dict) else False
-    if not link_ok:
-        brain.safety.abort_reset(token)     # consume the attempt; stays latched
+    reconciled = (isinstance(res, dict) and res.get("reconciled") is True and res.get("latched") is False
+                  and res.get("control_ready") is True
+                  and res.get("epoch") == token.release_epoch
+                  and res.get("generation") == token.release_generation)
+    if not reconciled:
+        brain.safety.abort_reset(token)     # consume the attempt; process stays inhibited + latched
         await _emit_capabilities()
-        return JSONResponse({"ok": False, "error": res.get("error") or "link reset not reconciled; still inhibited",
+        return JSONResponse({"ok": False, "phase": res.get("phase", "reconcile"),
+                             "error": res.get("error") or "sidecar reset not reconciled; still inhibited",
                              "reconcile": res}, status_code=409)
-    # Link unlatched. Commit the CAS — fails if a newer STOP advanced the epoch while we awaited the link.
-    if not brain.safety.commit_reset(token):
-        # P0-R4 atomicity item 5: the link is now unlatched but the process is NOT — REASSERT the latch to the
-        # sidecar immediately rather than leaving it dangerously unlatched. Keep all faculties inhibited.
+    # §2.4 process finalization: install the reserved release state ONLY if no newer STOP raced in. If finalize
+    # fails after a sidecar commit, REMAIN inhibited and synchronously re-latch the sidecar (degraded-critical).
+    if not brain.safety.finalize_reset(token):
         reassert_err = None
         with contextlib.suppress(Exception):
             ra = await LINK.estop(generation=brain.safety.control_generation(),
                                   epoch=brain.safety.transition_epoch())
-            if not bool(ra.get("ok") if isinstance(ra, dict) else False):
+            # the sidecar latches locally regardless of transport; require that local latch was asserted.
+            relatched = isinstance(ra, dict) and (ra.get("local_latch_set") is True or ra.get("latched") is True)
+            if not relatched:
                 reassert_err = "sidecar relatch not acknowledged"
         await _emit_capabilities()
-        return JSONResponse({"ok": False, "critical": reassert_err is not None,
-                             "error": "superseded by a newer STOP; sidecar re-latched, still inhibited",
-                             "reassert_error": reassert_err}, status_code=409)
-    brain.resume()                          # clear parked state (latch+inhibit already released by the CAS)
+        return JSONResponse({"ok": False, "phase": "finalize", "critical": reassert_err is not None,
+                             "error": "superseded by a newer STOP after sidecar commit; sidecar re-latched, "
+                                      "still inhibited", "reassert_error": reassert_err}, status_code=409)
+    brain.resume()                          # clear parked state (latch+inhibit released by finalize_reset)
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})
     await _emit_capabilities()
-    return JSONResponse({"ok": True, "resumed": True, "autonomy": "manual"})
+    return JSONResponse({"ok": True, "resumed": True, "autonomy": "manual",
+                         "epoch": token.release_epoch, "generation": token.release_generation})
 
 
 @app.post("/api/estop/reset")

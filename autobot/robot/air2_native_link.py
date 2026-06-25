@@ -299,11 +299,18 @@ class Air2NativeLink(RobotLink):
             cmd["epoch"] = int(epoch)
         return await asyncio.to_thread(self.rtm.send_acked, cmd, 0.8)
 
-    async def estop_reset(self, generation: int | None = None, epoch: int | None = None) -> dict[str, Any]:
-        # P0 §2.4: reconciled, fail-closed reset. The desired latch clears ONLY after the sidecar response is
-        # validated (ok + unlatched + matching generation+epoch + connected + control_ready + instance match).
-        gen = int(generation) if generation is not None else self.rtm.control_state()["process_generation"]
-        return await asyncio.to_thread(self.rtm.reset_control, gen, epoch, 0.8)
+    async def estop_reset(self, *, expected_epoch: int | None = None, expected_generation: int | None = None,
+                          release_epoch: int | None = None,
+                          release_generation: int | None = None) -> dict[str, Any]:
+        # agent_next_2 §2: prepared two-phase release (prepare_reset -> commit_reset). Reconciled, fail-closed:
+        # the desired latch clears ONLY after a validated commit (reconciled + unlatched + control_ready + exact
+        # reserved release epoch/gen + instance match). No `sent_to_agora` — this is local state reconciliation.
+        cs = self.rtm.control_state()
+        ee = cs["process_epoch"] if expected_epoch is None else int(expected_epoch)
+        eg = cs["process_generation"] if expected_generation is None else int(expected_generation)
+        re = (ee + 1) if release_epoch is None else int(release_epoch)
+        rg = (eg + 1) if release_generation is None else int(release_generation)
+        return await asyncio.to_thread(self.rtm.reset_reconcile, ee, eg, re, rg, 0.8)
 
     async def action(self, name: str) -> dict[str, Any]:
         n = (name or "").lower()

@@ -26,9 +26,11 @@ class _RecLink:
         self.estop_calls.append((generation, epoch))
         return {"ok": True, "initial_zero_sdk_send_succeeded": True, "latched": True, "generation": generation}
 
-    async def estop_reset(self, generation=None, epoch=None):
-        self.estop_reset_calls.append((generation, epoch))
-        return {"ok": True, "latched": False, "generation": generation}
+    async def estop_reset(self, *, expected_epoch=None, expected_generation=None,
+                          release_epoch=None, release_generation=None):
+        self.estop_reset_calls.append((expected_epoch, expected_generation, release_epoch, release_generation))
+        return {"ok": True, "reconciled": True, "latched": False, "control_ready": True,
+                "epoch": release_epoch, "generation": release_generation}
 
     async def stop(self):
         self.stop_calls += 1
@@ -52,8 +54,8 @@ async def test_gate_estop_delegates_even_when_overseer_on():
 
 async def test_gate_estop_reset_delegates():
     gate, inner = _gate(overseer=True)
-    await gate.estop_reset(generation=7, epoch=3)
-    assert inner.estop_reset_calls == [(7, 3)]
+    await gate.estop_reset(expected_epoch=3, expected_generation=7, release_epoch=4, release_generation=8)
+    assert inner.estop_reset_calls == [(3, 7, 4, 8)]
 
 
 @pytest.mark.asyncio

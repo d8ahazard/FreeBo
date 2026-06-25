@@ -73,6 +73,19 @@ def test_reset_token_is_single_use():
     assert a.commit_reset(tok) is False     # cannot commit twice
 
 
+def test_finalize_reset_installs_a_strictly_newer_release_state():
+    # agent_next_2 §2.1/§2.4: RESUME reserves + installs a brand-new post-resume epoch/generation, so any
+    # command admitted before the completed RESUME stays stale forever.
+    a = _stopped_ready_for_reset()          # epoch=1, gen=1, latched+inhibited
+    pre_epoch, pre_gen = a.epoch(), a.generation()
+    tok = a.begin_reset()
+    assert tok.release_epoch > pre_epoch and tok.release_generation > pre_gen
+    assert a.epoch() == pre_epoch and a.generation() == pre_gen   # reserved, NOT yet installed
+    assert a.finalize_reset(tok) is True
+    assert a.epoch() == tok.release_epoch and a.generation() == tok.release_generation
+    assert not a.is_latched() and not a.is_master_inhibited()
+
+
 def test_reset_cas_fails_after_a_newer_stop():
     a = _stopped_ready_for_reset()
     tok = a.begin_reset()

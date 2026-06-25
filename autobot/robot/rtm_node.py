@@ -335,32 +335,56 @@ class RtmNode:
                            "epoch": self._auth_epoch, "generation": self._auth_gen,
                            "latched": self._auth_latched})
 
-    def reset_control(self, generation: int, epoch: int | None = None, timeout: float = 0.8) -> dict:
-        """RESET that FAILS CLOSED (P0 §2.4). Desired latch stays True until a correlated estop_reset response
-        is fully validated: ok True, latched False, matching generation+epoch, rtm_connected True, control_ready
-        True. The request carries expected_{generation,epoch,sidecar_id,process_id} (the desired state we're
-        resetting from) so a newer STOP, a replaced sidecar, or an unsynchronized instance rejects this reset.
-        Only on full validation do we commit the desired state to unlatched. Any exception/timeout/None/missing
-        field leaves it latched."""
-        new_epoch = self._auth_epoch if epoch is None else int(epoch)
-        res = self.send_acked({"cmd": "estop_reset",
-                               "expected_generation": self._auth_gen, "expected_epoch": self._auth_epoch,
-                               "expected_sidecar_id": self._sidecar_instance_id,
-                               "expected_process_id": self._process_instance_id,
-                               "generation": int(generation), "epoch": new_epoch}, timeout)
-        ok = (res.get("ok") is True and res.get("latched") is False
-              and res.get("generation") == int(generation)
-              and (res.get("epoch") is None or res.get("epoch") == new_epoch)
-              and res.get("rtm_connected") is True and res.get("control_ready") is True)
+    def prepare_reset(self, expected_epoch: int, expected_generation: int,
+                      release_epoch: int, release_generation: int, timeout: float = 0.8) -> dict:
+        """Phase 1 of the two-phase release (agent_next_2 §2.2). Ask the sidecar to RESERVE a prepared-reset
+        record for the reserved release state, validating identity + exact current state. The sidecar stays
+        latched and returns a fresh nonce. Returns the correlated result (with `prepared` + `prepare_nonce`)."""
+        res = self.send_acked({"cmd": "prepare_reset",
+                               "process_instance_id": self._process_instance_id,
+                               "sidecar_instance_id": self._sidecar_instance_id,
+                               "expected_epoch": int(expected_epoch),
+                               "expected_generation": int(expected_generation),
+                               "release_epoch": int(release_epoch),
+                               "release_generation": int(release_generation)}, timeout)
+        ok = bool(res.get("prepared")) and bool(res.get("prepare_nonce"))
+        if not ok:
+            self._last_reconcile_error = res.get("error") or "prepare_reset not acknowledged"
+        return {**res, "ok": ok}
+
+    def commit_reset(self, prepare_nonce: str, expected_epoch: int, expected_generation: int,
+                     release_epoch: int, release_generation: int, timeout: float = 0.8) -> dict:
+        """Phase 2 of the two-phase release (agent_next_2 §2.3). Ask the sidecar to COMMIT the prepared reset
+        (carrying the nonce + exact identities). Only on a validated reconcile (reconciled + unlatched +
+        control_ready + exact new epoch/gen) do we commit the desired process state to unlatched. This is a
+        local state mutation, NOT an Agora send."""
+        res = self.send_acked({"cmd": "commit_reset",
+                               "process_instance_id": self._process_instance_id,
+                               "sidecar_instance_id": self._sidecar_instance_id,
+                               "prepare_nonce": prepare_nonce}, timeout)
+        ok = (res.get("reconciled") is True and res.get("latched") is False
+              and res.get("control_ready") is True
+              and res.get("epoch") == int(release_epoch)
+              and res.get("generation") == int(release_generation))
         if ok:
             self._auth_latched = False
-            self._auth_gen = int(generation)
-            self._auth_epoch = new_epoch
+            self._auth_epoch = int(release_epoch)
+            self._auth_gen = int(release_generation)
             self._last_reconcile_error = None
         else:
-            self._last_reconcile_error = res.get("error") or "reset not validated (fail-closed)"
-        return {**res, "ok": ok, "reconciled": ok,
-                "error": (None if ok else self._last_reconcile_error)}
+            self._last_reconcile_error = res.get("error") or "commit_reset not reconciled (fail-closed)"
+        return {**res, "ok": ok, "reconciled": ok, "error": (None if ok else self._last_reconcile_error)}
+
+    def reset_reconcile(self, expected_epoch: int, expected_generation: int,
+                        release_epoch: int, release_generation: int, timeout: float = 0.8) -> dict:
+        """Run the full two-phase release: prepare then commit. FAILS CLOSED at every step — any prepare/commit
+        rejection leaves the desired latch True and returns reconciled=False with the failing phase + evidence."""
+        pr = self.prepare_reset(expected_epoch, expected_generation, release_epoch, release_generation, timeout)
+        if not pr.get("ok"):
+            return {**pr, "ok": False, "reconciled": False, "phase": "prepare"}
+        cr = self.commit_reset(pr["prepare_nonce"], expected_epoch, expected_generation,
+                               release_epoch, release_generation, timeout)
+        return {**cr, "phase": "commit", "prepare": pr}
 
     def control_state(self) -> dict:
         """Process vs sidecar control identity/epoch/generation/latch for the readiness surface (P0 §2 + §5).
@@ -441,7 +465,8 @@ class RtmNode:
         # safety vs transport independently and can validate a reset response.
         for k in ("initial_zero_sdk_send_succeeded", "local_latch_set", "retry_count", "latched",
                   "generation", "epoch", "control_ready", "control_state_applied", "reconciled",
-                  "rtm_connected", "sidecar_instance_id", "accepted_process_id"):
+                  "rtm_connected", "sidecar_instance_id", "accepted_process_id",
+                  "prepared", "prepare_nonce", "sdk_send_attempted", "dispatch_ts", "completion_ts"):
             if k in res:
                 out[k] = res[k]
         rec = {**out, "cmd": cmd.get("cmd")}
