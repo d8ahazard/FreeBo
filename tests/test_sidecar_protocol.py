@@ -127,3 +127,14 @@ def test_reset_cannot_clear_a_newer_stop(sc):
     sc.send(cmd="estop_reset", command_id=9, expected_generation=1, generation=1)
     r = sc.result(9)
     assert r["ok"] is False and r["error"] == "stale_reset_generation" and r["latched"] is True
+
+
+def test_matching_reset_clears_latch_and_reports_control_ready(sc):
+    sc.send(cmd="estop", command_id=10, generation=3)
+    sc.result(10)
+    sc.send(cmd="estop_reset", command_id=11, expected_generation=3, generation=3)
+    r = sc.result(11)
+    assert r["ok"] is True and r["latched"] is False and r["control_ready"] is True and r["generation"] == 3
+    # drive at the reset generation now succeeds
+    sc.send(cmd="drive", command_id=12, ly=0.2, rx=0.0, generation=3)
+    assert sc.result(12)["sent_to_agora"] is True

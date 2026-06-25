@@ -579,19 +579,19 @@ async def api_resume():
     autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
     res: dict = {}
     gen = brain.safety.control_generation()
+    # The contract is normalized: every link's estop_reset accepts `generation`. Any exception fails CLOSED.
     try:
         res = await LINK.estop_reset(generation=gen) or {}
-    except TypeError:
-        with contextlib.suppress(Exception):
-            res = await LINK.estop_reset() or {}
-    except Exception:  # noqa: BLE001
-        res = {}
-    acked = res.get("ok", True) if isinstance(res, dict) else True
+    except Exception as e:  # noqa: BLE001
+        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # P0-R4 item 4: fail CLOSED — default False if `ok` is missing/malformed. Process state stays latched +
+    # inhibited unless the link reported a fully-validated reconciliation.
+    acked = bool(res.get("ok", False)) if isinstance(res, dict) else False
     if not acked:
         await _emit_capabilities()
-        return JSONResponse({"ok": False, "error": "link/sidecar reset not acknowledged; still inhibited",
+        return JSONResponse({"ok": False, "error": res.get("error") or "reset not reconciled; still inhibited",
                              "reconcile": res}, status_code=409)
-    brain.safety.estop_reset()              # clear motion latch only after link reconciliation
+    brain.safety.estop_reset()              # clear motion latch only after link reconciliation succeeded
     brain.resume()                          # clear master inhibit + parked state
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})

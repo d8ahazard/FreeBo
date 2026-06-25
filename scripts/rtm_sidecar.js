@@ -319,7 +319,7 @@ async function handle(c) {
       if (c.generation != null) generation = c.generation;
       out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "estop_reset",
             ok: true, sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
-            rtm_connected: connected, control_ready: !!(inst && sess), latched, generation });
+            rtm_connected: connected, control_ready: FAKE || !!(inst && sess), latched, generation });
       log("info", "E-STOP reset — motion permitted again (gen " + generation + ")");
       return;
     }

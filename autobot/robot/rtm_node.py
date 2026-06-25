@@ -284,6 +284,27 @@ class RtmNode:
         self._auth_latched = bool(latched)
         return self._send({"cmd": "set_control", "generation": self._auth_gen, "latched": self._auth_latched})
 
+    def reset_control(self, generation: int, timeout: float = 0.8) -> dict:
+        """RESET that FAILS CLOSED (P0-R4 item 4). Desired latch stays True until a correlated estop_reset
+        response is fully validated: ok True, latched False, matching generation, rtm_connected True,
+        control_ready True. The request carries `expected_generation` (the desired gen we're resetting from) so
+        a newer STOP that advanced the sidecar generation rejects this reset. Only on full validation do we
+        commit the desired state to unlatched. Any exception/timeout/None/missing field leaves it latched."""
+        expected = self._auth_gen
+        res = self.send_acked({"cmd": "estop_reset", "expected_generation": expected,
+                               "generation": int(generation)}, timeout)
+        ok = (res.get("ok") is True and res.get("latched") is False
+              and res.get("generation") == int(generation)
+              and res.get("rtm_connected") is True and res.get("control_ready") is True)
+        if ok:
+            self._auth_latched = False
+            self._auth_gen = int(generation)
+            self._last_reconcile_error = None
+        else:
+            self._last_reconcile_error = res.get("error") or "reset not validated (fail-closed)"
+        return {**res, "ok": ok, "reconciled": ok,
+                "error": (None if ok else self._last_reconcile_error)}
+
     def control_state(self) -> dict:
         """Process vs sidecar latch/generation for the readiness surface (P0-R4.4). `synchronized` False means
         the two disagree (e.g. a sidecar restart that hasn't been reconciled) — motion must be blocked."""
@@ -305,15 +326,15 @@ class RtmNode:
         # late. estop/estop_reset carry Python's authoritative generation so the sidecar adopts it.
         kind = cmd.get("cmd")
         if kind == "estop":
+            # STOP commits the desired latch IMMEDIATELY (fail-safe), before the ack.
             self._auth_latched = True
-            if cmd.get("generation") is not None:
-                self._auth_gen = int(cmd["generation"])
-        elif kind == "estop_reset":
-            self._auth_latched = False
             if cmd.get("generation") is not None:
                 self._auth_gen = int(cmd["generation"])
         elif kind == "drive" and "generation" not in cmd:
             cmd = {**cmd, "generation": self._auth_gen}
+        # NOTE (P0-R4 item 4): estop_reset does NOT mutate desired state here. The desired latch is cleared
+        # only by reset_control() AFTER the sidecar response is validated — so a failed/partial reset fails
+        # closed (stays latched).
         evt = threading.Event()
         with self._pending_lock:
             self._pending[cid] = {"event": evt, "result": None}

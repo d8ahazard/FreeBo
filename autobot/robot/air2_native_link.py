@@ -282,10 +282,10 @@ class Air2NativeLink(RobotLink):
         return await asyncio.to_thread(self.rtm.send_acked, cmd, 0.8)
 
     async def estop_reset(self, generation: int | None = None) -> dict[str, Any]:
-        cmd: dict[str, Any] = {"cmd": "estop_reset"}
-        if generation is not None:
-            cmd["generation"] = int(generation)
-        return await asyncio.to_thread(self.rtm.send_acked, cmd, 0.8)
+        # P0-R4 item 4: reconciled, fail-closed reset. The desired latch clears ONLY after the sidecar
+        # response is validated (ok + unlatched + matching generation + connected + control_ready).
+        gen = int(generation) if generation is not None else self.rtm.control_state()["process_generation"]
+        return await asyncio.to_thread(self.rtm.reset_control, gen, 0.8)
 
     async def action(self, name: str) -> dict[str, Any]:
         n = (name or "").lower()
