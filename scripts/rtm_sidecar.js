@@ -300,14 +300,13 @@ async function connect(session) {
 // hand control back to the robot.
 function startControlCadence() {
   clearTimers();
+  // agent_next_2 §7.1: controller-ownership keepalive (LOGIN/KEEPALIVE) MAY run while latched — it preserves our
+  // ability to issue the emergency zero-frame and is not itself motion. But avoidance-OFF is a safety-weakening
+  // effect: NEVER send it while latched (prefer safety-preserving avoidance while stopped). It is sent only when
+  // unlatched (the brain has its own camera motion-confirm + the robot keeps fall-arrest), like the EBO app.
   if (sess && sess.ebo_id) sendRtm(RTM_LOGIN, { userId: sess.ebo_id });
-  // avoidobstacle OFF: the EBO app sends false while driving, and ON makes the robot refuse/stall motion
-  // (it blocks commanded moves on perceived obstacles). The brain has its own camera motion-confirm + the
-  // robot keeps fall-arrest, so we drive with avoidance off like the app does.
-  sendRtm(RTM_AVOID, { avoidobstacle: false });
+  if (!latched) sendRtm(RTM_AVOID, { avoidobstacle: false });
   timers.push(setInterval(() => sendRtm(RTM_KEEPALIVE, { state: 0 }), 2000));
-  // Claim control firmly at startup, like the EBO app (it sends controller-login ~every 3s several times
-  // before driving). One login can be missed/contended; a short burst makes the grant stick.
   let claims = 0;
   const claimTimer = setInterval(() => {
     if (sess && sess.ebo_id) sendRtm(RTM_LOGIN, { userId: sess.ebo_id });
@@ -316,7 +315,7 @@ function startControlCadence() {
   timers.push(claimTimer);
   timers.push(setInterval(() => {
     if (sess && sess.ebo_id) sendRtm(RTM_LOGIN, { userId: sess.ebo_id });
-    sendRtm(RTM_AVOID, { avoidobstacle: false });   // keep avoidance off so it never re-blocks motion
+    if (!latched) sendRtm(RTM_AVOID, { avoidobstacle: false });   // never weaken avoidance while latched
   }, 30000));
   // Periodic health stat for /api/debug/rtm (consecutive send failures + connection state).
   timers.push(setInterval(() => out({ ev: "stat", consecutive_send_failures: _sendFails, rtm_connected: connected }), 2000));
@@ -474,17 +473,32 @@ async function handle(c) {
     case "move_speed": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
       return acked(c, RTM_MOVE_MODE, { moveSpeed: c.speed | 0 }); }
     case "release": {
-      // Stop our controller heartbeat so the robot reverts to its OWN autonomy (e.g. low-battery return
-      // home). We stay logged into RTM (still receive telemetry) but no longer claim active control.
-      clearDrive(); clearTimers(); log("info", "control released — robot autonomy active"); return;
-    }
-    case "resume": { startControlCadence(); log("info", "control resumed"); return; }
-    case "dock_release": {
-      // Tell it to dock, then immediately release control so its onboard return-to-charge can run.
-      await sendRtm(RTM_DOCK, null);
+      // agent_next_2 §4.3/§7: relinquishing control hands the robot to its OWN autonomy — a safety-weakening
+      // effect. REFUSED while latched/mid-STOP (effectOk). Correlated result so the caller can observe it.
+      const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
       clearDrive(); clearTimers();
-      log("info", "dock + control released");
-      return;
+      result(c, { control_state_applied: true, released: true, sdk_send_attempted: false });
+      log("info", "control released — robot autonomy active"); return;
+    }
+    case "resume": {
+      // Re-claim controller OWNERSHIP cadence. This is ownership (not motion) and is permitted even while
+      // latched (we WANT control); it requires matching identity. Avoidance-off stays gated on !latched inside
+      // the cadence, so resuming under a latch never weakens avoidance.
+      if (c.process_instance_id != null && c.sidecar_instance_id != null
+          && (c.sidecar_instance_id !== SIDECAR_ID
+              || (acceptedProcessId != null && c.process_instance_id !== acceptedProcessId))) {
+        result(c, { ok: false, error: "instance_mismatch" }); return;
+      }
+      startControlCadence();
+      result(c, { control_state_applied: true, resumed: true, sdk_send_attempted: false });
+      log("info", "control resumed"); return;
+    }
+    case "dock_release": {
+      const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      const r = await sendRtm(RTM_DOCK, null);
+      clearDrive(); clearTimers();
+      result(c, { sent_to_agora: !!r.ok, released: true, error: r.error || null });
+      log("info", "dock + control released"); return;
     }
     case "__fake": { if (FAKE) _fakeFail = !!c.fail; return; }   // test-only: toggle send failure
     case "raw": {

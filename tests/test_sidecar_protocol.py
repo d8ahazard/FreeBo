@@ -250,6 +250,18 @@ def test_stale_stop_latches_but_never_regresses_state(sc):
     assert r2["token_status"] == "stale"
 
 
+def test_release_refused_while_latched_but_ownership_resume_allowed(sc):
+    # agent_next_2 §7: releasing control (handing the robot to its own autonomy) is a safety-weakening effect,
+    # refused while latched. Re-claiming controller OWNERSHIP (resume) is permitted even latched.
+    sc.send(cmd="estop", command_id=90, epoch=2, generation=2)
+    sc.result(90)
+    sc.send(cmd="release", command_id=91, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=2, generation=2, ticket_id=1)
+    assert sc.result(91)["error"] == "estop_latched"
+    sc.send(cmd="resume", command_id=92, process_instance_id="P1", sidecar_instance_id=sc.sid)
+    assert sc.result(92)["resumed"] is True
+
+
 def test_parent_death_latches_and_new_instance_starts_latched():
     # agent_next_2 §2.5: closing the parent pipe after an unlatched release must fail-safe (latch + zero + exit);
     # a brand-new sidecar instance then starts LATCHED and refuses effects until a full new reconciliation.

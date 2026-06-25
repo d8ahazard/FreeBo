@@ -383,34 +383,31 @@ class Air2NativeLink(RobotLink):
         return await self._effect(EFFECT_MOVE_SPEED, {"cmd": "move_speed", "speed": int(speed)}, source=source)
 
     async def connection(self, state: str) -> dict[str, Any]:
-        """Go-dark / wake. `stop` cuts all robot I/O (stop drive, release controller, drop inbound media) but
-        keeps the Agora RTC/RTM session warm so `start` resumes instantly. `start` re-acquires control + mic."""
-        if state == "stop":
-            self._paused = True
-            for fn in (lambda: self.rtm.stop(),
-                       lambda: self.rtm._send({"cmd": "release"})):
-                try:
-                    fn()
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                self.receiver.set_paused(True)
-            except Exception:  # noqa: BLE001
-                pass
-            return {"ok": True, "paused": True}
-        # start / resume
+        """Go-dark / wake (agent_next_2 §7.2). A coherent lifecycle: `stop`->pause_control (ticketed release of
+        controller ownership while RtmNode stays ALIVE, then pause media); `start`->resume_control (ensure RtmNode
+        running, re-claim ownership, resume media). Never returns ok=true before the observed state is reached."""
+        return await (self._pause_control() if state == "stop" else self._resume_control())
+
+    async def _pause_control(self) -> dict[str, Any]:
+        self._paused = True
+        # Ticketed release of controller ownership (refused while latched -> the robot stays under our latch, not
+        # handed to its own autonomy). RtmNode stays alive so telemetry + emergency control remain available.
+        released = await self.action("release", source="operator")
+        with contextlib.suppress(Exception):
+            self.receiver.set_paused(True)
+        return {"ok": True, "paused": True, "released": bool(released.get("ok"))}
+
+    async def _resume_control(self) -> dict[str, Any]:
         self._paused = False
-        try:
+        with contextlib.suppress(Exception):
             self.receiver.set_paused(False)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.rtm._send({"cmd": "resume"})
-        except Exception:  # noqa: BLE001
-            pass
+        if not getattr(self.rtm, "_running", False):     # restart the manager if it was fully stopped
+            with contextlib.suppress(Exception):
+                self.rtm.start()
+        resumed = await self.action("resume", source="operator")   # ticketed re-claim of ownership
         self._audio_req_ts = 0.0   # force mic re-enable (102001) on the next telemetry tick
         self._call_open = False
-        return {"ok": True, "paused": False}
+        return {"ok": True, "paused": False, "resumed": bool(resumed.get("ok"))}
 
     def prefers_text_tts(self) -> bool:
         return True
