@@ -1750,6 +1750,32 @@ class AgentBrain:
                 return "control state reconciling (sidecar)"
         return ""
 
+    def _readiness(self, s: Settings) -> dict:
+        """Distinct, truthful readiness fields (P0 §5) — NO generic `connected`. RTC video liveness is reported
+        SEPARATELY and never implies motion readiness; motion needs RTM control readiness + instance identity +
+        a synchronized epoch/gen/latch (a valid ticket is admitted per dispatch)."""
+        arb = self.safety.arb.snapshot()
+        rtm = getattr(self.link, "rtm", None)
+        cs: dict = {}
+        if rtm is not None and hasattr(rtm, "control_state"):
+            with contextlib.suppress(Exception):
+                cs = rtm.control_state() or {}
+        v = self._video_age()
+        return {
+            "rtm_connected": (bool(getattr(rtm, "connected", False)) if rtm is not None else None),
+            "rtc_video_connected": (v is not None and v <= getattr(s, "video_max_age_s", 2.0)),
+            "sidecar_process_ready": ((cs.get("sidecar_instance_id") is not None) if cs else None),
+            "sidecar_control_ready": cs.get("sidecar_control_ready"),
+            "process_instance_id": cs.get("process_instance_id"),
+            "sidecar_instance_id": cs.get("sidecar_instance_id"),
+            "process_latched": arb["desired_latched"], "sidecar_latched": cs.get("sidecar_latched"),
+            "process_epoch": arb["transition_epoch"], "sidecar_epoch": cs.get("sidecar_epoch"),
+            "process_generation": arb["desired_generation"], "sidecar_generation": cs.get("sidecar_generation"),
+            "synchronized": cs.get("synchronized"),
+            "stop_in_flight": arb["stop_in_flight"], "reset_active": arb["reset_active"],
+            "last_reconcile_error": cs.get("last_reconcile_error"),
+        }
+
     def status_dict(self) -> dict:
         s = self.settings.snapshot()
         act = self.executor.active()
@@ -1780,4 +1806,5 @@ class AgentBrain:
             "telemetry_age": (self.buffer.telemetry or {}).get("telemetry_age"),
             "motion_block_reason": block,
             "motion_ready": (block == ""),
+            "readiness": self._readiness(s),
         }
