@@ -118,6 +118,10 @@ class RtmNode:
 
     def _kill(self) -> None:
         p = self._proc
+        if p is not None:
+            self._emit_obs("system.lifecycle", "sidecar_shutdown",
+                           effective="disconnected", outcome="degraded",
+                           reason=("closing" if self._closing else "reconnecting"))
         self._proc = None
         self.connected = False
         self._sidecar_latched = True   # unknown sidecar -> assume NOT safe to move until reconciled
@@ -183,11 +187,24 @@ class RtmNode:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _emit_obs(self, category: str, type_: str, **kw) -> None:
+        """Translate a sidecar/transport lifecycle signal into the canonical Python journal (agent_next_4 §4.3/
+        §4.6). The sidecar NEVER writes its own log file — every sidecar event reaches the journal through here.
+        Robot layer depends only on the stdlib-only top-level observability module (no brain import)."""
+        try:
+            from .. import observability as _obs
+            _obs.emit(category, type_, "sidecar",
+                      process_instance_id=self._process_instance_id,
+                      sidecar_instance_id=self._sidecar_instance_id, **kw)
+        except Exception:  # noqa: BLE001 - observability must never break transport
+            pass
+
     def _serve(self, node: str) -> None:
         self._kill_stale_sidecars()
         self._proc = subprocess.Popen(
             [node, str(SIDECAR)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=str(REPO_ROOT))
+        self._emit_obs("system.lifecycle", "sidecar_spawn", outcome="ok", detail={"pid": self._proc.pid})
         self._stderr_thread = threading.Thread(target=self._drain_stderr, args=(self._proc,),
                                                name="rtm-stderr", daemon=True)
         self._stderr_thread.start()
@@ -238,12 +255,19 @@ class RtmNode:
             self._sidecar_instance_id = ev.get("sidecar_instance_id")
             self._sidecar_control_ready = False
             self._sidecar_latched = True
+            self._emit_obs("system.lifecycle", "sidecar_ready", outcome="ok")
         elif t == "state":
             self.connected = ev.get("state") == "CONNECTED"
+            self._emit_obs("system.lifecycle", "rtm_state",
+                           effective=("connected" if self.connected else "disconnected"),
+                           outcome=("ok" if self.connected else "degraded"),
+                           detail={"state": ev.get("state"), "reason": ev.get("reason")})
         elif t == "connected":
             self.connected = True
             self.status["connected"] = True
+            self._emit_obs("system.lifecycle", "rtm_connected", effective="connected", outcome="ok")
         elif t == "need_session":
+            self._emit_obs("system.lifecycle", "session_refresh", outcome="degraded")
             self._connect(force=True)   # token likely expired -> must re-login with a FRESH session
         elif t == "peer":
             p = ev.get("parsed") or {}
@@ -293,6 +317,12 @@ class RtmNode:
                     self._sidecar_control_ready = bool(ev.get("control_ready"))
                 if ev.get("accepted_process_id") is not None:
                     self._sidecar_accepted_process = ev.get("accepted_process_id")
+            self._emit_obs("control.transport", "command_result", command_id=cid,
+                           effective=("sent" if ev.get("sent_to_agora") else "not_sent"),
+                           outcome=("ok" if ev.get("sent_to_agora") else "degraded"),
+                           epoch=ev.get("epoch"), generation=ev.get("generation"),
+                           detail={"cmd": ev.get("cmd"), "rtm_id": ev.get("rtm_id"),
+                                   "reconciled": ev.get("reconciled"), "error": ev.get("error")})
             if cid is not None:
                 with self._pending_lock:
                     slot = self._pending.get(cid)
@@ -483,6 +513,9 @@ class RtmNode:
             self.last_fail_send = out
             return out
         out["queued_to_sidecar"] = True
+        self._emit_obs("control.transport", "queued_to_sidecar", command_id=cid,
+                       epoch=cmd.get("epoch"), generation=cmd.get("generation"),
+                       outcome="ok", detail={"cmd": kind})
         got = evt.wait(timeout)
         with self._pending_lock:
             slot = self._pending.pop(cid, None)
@@ -494,10 +527,17 @@ class RtmNode:
         if not got or res is None:
             out["error"] = "ack timeout"
             self.last_fail_send = {**out, "cmd": cmd.get("cmd")}
+            self._emit_obs("control.transport", "timed_out", command_id=cid, outcome="degraded",
+                           latency_ms=out["ack_ms"], detail={"cmd": kind})
             return out
         out["sent_to_agora"] = bool(res.get("sent_to_agora"))
         out["ok"] = out["sent_to_agora"]
         out["error"] = res.get("error")
+        self._emit_obs("control.transport", "acknowledgement_received", command_id=cid,
+                       effective=("sent" if out["sent_to_agora"] else "not_sent"),
+                       outcome=("ok" if out["sent_to_agora"] else "degraded"), latency_ms=out["ack_ms"],
+                       epoch=res.get("epoch"), generation=res.get("generation"),
+                       detail={"cmd": kind, "error": res.get("error")})
         # Surface the sidecar's honest extra facts (P0-R4 item 2/4) when present, so callers report local
         # safety vs transport independently and can validate a reset response.
         for k in ("initial_zero_sdk_send_succeeded", "local_latch_set", "retry_count", "latched",

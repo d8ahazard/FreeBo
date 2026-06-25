@@ -827,20 +827,31 @@ async def api_resume():
     # agent_next_2 §2: prepared two-phase release. SYNC PRECONDITION + ADMISSION FIRST — do not contact the link
     # unless the sidecar is synchronized AND a reset is admissible (no STOP in flight, latched+inhibited, no other
     # reset). The unsafe side effect never precedes the decision.
+    iid = brain.safety.current_incident_id()    # SAME causal incident the master STOP opened (agent_next_4 §3.1)
+
+    def _rev(phase, effective, outcome, **detail):
+        with contextlib.suppress(Exception):
+            obs.emit(obs.CAT_SAFETY_TRANSITION, "resume", "api", requested="resume", effective=effective,
+                     outcome=outcome, phase=phase, incident_id=iid, detail=detail)
+
     rtm = getattr(LINK, "rtm", None)
     if rtm is not None and hasattr(rtm, "control_state"):
         cs = rtm.control_state()
         if not cs.get("synchronized", False):
+            _rev("preflight", "inhibited", "rejected", reason="sidecar not synchronized")
             await _emit_capabilities()
             return JSONResponse({"ok": False, "phase": "preflight",
                                  "error": "sidecar not synchronized; still inhibited", "control_state": cs},
                                 status_code=409)
     token = brain.safety.begin_reset()
     if token is None:
+        _rev("admission", "inhibited", "rejected", reason="reset not admissible")
         await _emit_capabilities()
         return JSONResponse({"ok": False, "phase": "admission",
                              "error": "reset not admissible (STOP in flight / not latched / another reset "
                                       "active); still inhibited"}, status_code=409)
+    _rev("admission", "inhibited", "admitted", expected_epoch=token.expected_epoch,
+         release_generation=token.release_generation)
     # Phase 1+2 at the link: sidecar prepare_reset -> commit_reset. The sidecar stays latched until a validated
     # commit; this returns reconciliation evidence (NOT an SDK send).
     res: dict = {}
@@ -855,8 +866,11 @@ async def api_resume():
                   and res.get("control_ready") is True
                   and res.get("epoch") == token.release_epoch
                   and res.get("generation") == token.release_generation)
+    _rev("prepare", "inhibited", ("reconciled" if reconciled else "failed"),
+         reconciled=reconciled, sidecar_phase=res.get("phase"))
     if not reconciled:
         brain.safety.abort_reset(token)     # consume the attempt; process stays inhibited + latched
+        _rev("reconcile", "inhibited", "failed", reason=res.get("error") or "sidecar reset not reconciled")
         await _emit_capabilities()
         return JSONResponse({"ok": False, "phase": res.get("phase", "reconcile"),
                              "error": res.get("error") or "sidecar reset not reconciled; still inhibited",
@@ -872,6 +886,8 @@ async def api_resume():
             relatched = isinstance(ra, dict) and (ra.get("local_latch_set") is True or ra.get("latched") is True)
             if not relatched:
                 reassert_err = "sidecar relatch not acknowledged"
+        _rev("finalize", "inhibited", ("degraded" if reassert_err else "superseded"),
+             critical=reassert_err is not None, reason="superseded by a newer STOP after sidecar commit")
         await _emit_capabilities()
         return JSONResponse({"ok": False, "phase": "finalize", "critical": reassert_err is not None,
                              "error": "superseded by a newer STOP after sidecar commit; sidecar re-latched, "
@@ -879,7 +895,8 @@ async def api_resume():
     brain.resume()                          # clear parked state (latch+inhibit released by finalize_reset)
     with contextlib.suppress(Exception):
         obs.emit(obs.CAT_SAFETY_TRANSITION, "resume", "api", requested="resume", effective="released",
-                 outcome="reconciled", epoch=token.release_epoch, generation=token.release_generation,
+                 outcome="reconciled", phase="resumed", incident_id=iid,
+                 epoch=token.release_epoch, generation=token.release_generation,
                  correlation_id=f"reset-gen{token.release_generation}")
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})

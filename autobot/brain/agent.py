@@ -547,18 +547,53 @@ class AgentBrain:
                     if self._vlm_ok is None:
                         await self._vlm_health(s)
                     if fresh:
-                        cap = await self._vlm_perceive(obs, s)
-                        if cap:
-                            await self._set_caption(cap)
+                        cap = await self._vision_request(obs, s, "vlm/perceive", self._vlm_perceive)
                 elif vlm_enabled(s) or omni_enabled(s):
                     pass  # the vision brain sees the frame itself each cycle — no separate caption model
                 elif self._hybrid(s) and fresh:
-                    cap = await self._caption(obs, s)
-                    if cap:
-                        await self._set_caption(cap)
+                    cap = await self._vision_request(obs, s, s.ai_vision_model or "caption", self._caption)
             except Exception:  # noqa: BLE001
                 pass
             await asyncio.sleep(CAPTION_PERIOD)
+
+    async def _vision_request(self, obs, s, model_label: str, fn):
+        """Run an AI-facing vision request (caption/VLM) with vision.lifecycle instrumentation: frame_selected ->
+        request_started -> completed/failed, and stale_result_discarded if a newer frame arrived meanwhile. No
+        pixels/base64/caption text are ever recorded — only frame metadata + result class (agent_next_4 §4.5)."""
+        from .. import observability as _obs
+        seq = getattr(obs.frame, "seq", None) if getattr(obs, "frame", None) else None
+        frame_ts = self.buffer.frame_ts
+        corr = f"vision-{seq if seq is not None else int(frame_ts * 1000)}"
+        with contextlib.suppress(Exception):
+            _obs.emit(_obs.CAT_VISION, "frame_selected", model_label, correlation_id=corr,
+                      detail={"frame_seq": seq, "frame_age_s": round(max(0.0, time.time() - frame_ts), 3),
+                              "jpeg_bytes": (len(obs.jpeg) if getattr(obs, "jpeg", None) else None)})
+            _obs.emit(_obs.CAT_VISION, "request_started", model_label, correlation_id=corr)
+        t0 = time.perf_counter()
+        cap = ""
+        try:
+            cap = await fn(obs, s)
+        except Exception as e:  # noqa: BLE001 - the underlying fns already fail soft, but be defensive
+            with contextlib.suppress(Exception):
+                _obs.emit(_obs.CAT_VISION, "failed", model_label, correlation_id=corr, outcome="failed",
+                          latency_ms=(time.perf_counter() - t0) * 1000.0, reason=type(e).__name__)
+            return ""
+        lat = (time.perf_counter() - t0) * 1000.0
+        if not cap:
+            with contextlib.suppress(Exception):
+                _obs.emit(_obs.CAT_VISION, "failed", model_label, correlation_id=corr, outcome="failed",
+                          latency_ms=lat, reason="empty result")
+            return ""
+        if self.buffer.frame_ts > frame_ts:    # a newer frame superseded this request before we stored it
+            with contextlib.suppress(Exception):
+                _obs.emit(_obs.CAT_VISION, "stale_result_discarded", model_label, correlation_id=corr,
+                          outcome="discarded", latency_ms=lat)
+            return ""
+        with contextlib.suppress(Exception):
+            _obs.emit(_obs.CAT_VISION, "completed", model_label, correlation_id=corr, outcome="ok",
+                      latency_ms=lat, detail={"result_class": "caption", "chars": len(cap)})
+        await self._set_caption(cap)
+        return cap
 
     def _current_pose(self) -> dict | None:
         """The live VSLAM map_data dict, or None if SLAM isn't running/enabled. Fail-soft."""
@@ -1124,9 +1159,34 @@ class AgentBrain:
         t0 = time.perf_counter()
         task = asyncio.current_task()
         self._reason_tasks.add(task)             # §6.1: track EVERY active invocation (owner + waiters)
+        corr = f"reason-gen{token}"
+        from .. import observability as _obs
+        with contextlib.suppress(Exception):
+            _obs.emit(_obs.CAT_REASON, "lock_wait_started", trigger, correlation_id=corr,
+                      generation=token, detail={"mode": brain_mode(s), "model": s.ai_model})
         try:
-            return await self._reason_inner(trigger, s, token)
+            res = await self._reason_inner(trigger, s, token)
+            with contextlib.suppress(Exception):
+                lat = (time.perf_counter() - t0) * 1000.0
+                if token != self._reason_gen:    # §4.1: a stale/superseded cycle must NEVER emit `completed`
+                    _obs.emit(_obs.CAT_REASON, "cancelled", trigger, outcome="superseded", correlation_id=corr,
+                              generation=token, latency_ms=lat, reason="superseded by newer generation")
+                elif res.get("cancelled"):
+                    _obs.emit(_obs.CAT_REASON, "cancelled", trigger, outcome="cancelled", correlation_id=corr,
+                              generation=token, latency_ms=lat, reason=str(res.get("reason") or "")[:120])
+                elif res.get("ok") is False and res.get("error"):
+                    _obs.emit(_obs.CAT_REASON, "failed", trigger, outcome="failed", correlation_id=corr,
+                              generation=token, latency_ms=lat, reason=str(res.get("error"))[:120])
+                else:
+                    _obs.emit(_obs.CAT_REASON, "completed", trigger, outcome="ok", correlation_id=corr,
+                              generation=token, latency_ms=lat,
+                              detail={"actions": res.get("actions"), "spoke": res.get("spoke")})
+            return res
         except (ReasonCancelled, asyncio.CancelledError):
+            with contextlib.suppress(Exception):
+                _obs.emit(_obs.CAT_REASON, "cancelled", trigger, outcome="cancelled", correlation_id=corr,
+                          generation=token, latency_ms=(time.perf_counter() - t0) * 1000.0,
+                          reason="reasoning cancelled by master STOP")
             return {"ok": False, "cancelled": True, "reason": "reasoning cancelled by master STOP"}
         finally:
             self._reason_tasks.discard(task)
@@ -1135,6 +1195,10 @@ class AgentBrain:
     async def _reason_inner(self, trigger: str, s: Settings, token: int = 0) -> dict:
         async with self._reason_lock:
             self._reason_guard(token, s)   # a STOP may have landed while we waited for the lock
+            with contextlib.suppress(Exception):
+                from .. import observability as _obs
+                _obs.emit(_obs.CAT_REASON, "started", trigger, correlation_id=f"reason-gen{token}",
+                          generation=token, detail={"mode": brain_mode(s)})
             self.safety.begin_tick()
             self.ctx.flags.clear()
             self.last_tick_ts = time.time()
@@ -1234,6 +1298,11 @@ class AgentBrain:
             try:
                 for _round in range(MAX_TOOL_ROUNDS):
                     self._reason_guard(token, s)   # boundary: before each provider round
+                    _pw = time.perf_counter()
+                    with contextlib.suppress(Exception):
+                        from .. import observability as _obs
+                        _obs.emit(_obs.CAT_REASON, "provider_wait_started", trigger, correlation_id=f"reason-gen{token}",
+                                  generation=token, detail={"round": _round, "model": s.ai_model, "mode": brain_mode(s)})
                     with self.metrics.timer("provider"):
                         result = await provider.chat(messages, tools=tools)
                     self._reason_guard(token, s)   # boundary: after the provider await (STOP may have landed)
@@ -1272,6 +1341,12 @@ class AgentBrain:
                         await self.emit({"type": "tool_call", "name": tc["name"],
                                          "args": tc["arguments"], "ts": time.time()})
                         self._reason_guard(token, s)   # boundary: before EACH tool side effect
+                        _corr = f"reason-gen{token}"
+                        _tt = time.perf_counter()
+                        with contextlib.suppress(Exception):
+                            from .. import observability as _obs
+                            _obs.emit(_obs.CAT_REASON_TOOL, "requested", tc["name"], correlation_id=_corr,
+                                      generation=token, detail={"arg_keys": sorted((tc.get("arguments") or {}).keys())})
                         if tc["name"] == "say" and spoke:
                             # Already spoke this turn — skip extra/revised says (don't cut off the playing clip).
                             res = {"ok": False, "skipped": "already spoke once this turn — do not repeat"}
@@ -1281,6 +1356,16 @@ class AgentBrain:
                             if tc["name"] == "say" and isinstance(res, dict) and res.get("ok"):
                                 spoke = True
                                 self._last_spoken = str(tc["arguments"].get("text", "")) or self._last_spoken
+                        with contextlib.suppress(Exception):
+                            from .. import observability as _obs
+                            _rc = ("ok" if isinstance(res, dict) and res.get("ok") else
+                                   "skipped" if isinstance(res, dict) and res.get("skipped") else
+                                   "blocked" if isinstance(res, dict) and res.get("blocked") else "failed")
+                            _obs.emit(_obs.CAT_REASON_TOOL, ("completed" if _rc in ("ok", "skipped") else "denied"
+                                      if _rc == "blocked" else "failed"), tc["name"], correlation_id=_corr,
+                                      generation=token, outcome=_rc, latency_ms=(time.perf_counter() - _tt) * 1000.0,
+                                      detail={"action_id": (res.get("action_id") if isinstance(res, dict) else None),
+                                              "state": (res.get("state") if isinstance(res, dict) else None)})
                         actions.append({"name": tc["name"], "args": tc["arguments"], "result": res})
                         await self.emit({"type": "tool_result", "name": tc["name"], "result": res,
                                          "ts": time.time()})
@@ -1659,18 +1744,29 @@ class AgentBrain:
         if behavior_stop:
             with contextlib.suppress(Exception):
                 self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
-        # Phase 1 observability (agent_next_3 §C3): one structured record per STOP dispatch, correlated by gen.
+        # Phase 1 observability (agent_next_4 §3.1): the STOP opens ONE causal incident, carried through inhibit ->
+        # cancellation -> transport dispatch and (later) RESET. The RESET path reads the same incident id.
         with contextlib.suppress(Exception):
             from .. import observability as _obs
-            _obs.emit(_obs.CAT_SAFETY_TRANSITION, "master_stop" if master else ("motion_latch" if latch else "stop"),
-                      reason if isinstance(reason, str) else "stop",
-                      requested="stop", effective="inhibited" if master else "latched",
-                      outcome=("dispatched" if result.get("transport_dispatch_succeeded") else "degraded"),
-                      epoch=result.get("epoch"), generation=result.get("generation"),
-                      correlation_id=(f"stop-gen{result.get('generation')}" if result.get("generation") is not None else None),
+            iid = self.safety.current_incident_id() if master else None
+            gen = result.get("generation")
+            corr = f"stop-gen{gen}" if gen is not None else None
+            src = reason if isinstance(reason, str) else "stop"
+            kind = "master_stop" if master else ("motion_latch" if latch else "stop")
+            # phase: local inhibit/latch + reasoning cancellation already asserted above
+            _obs.emit(_obs.CAT_SAFETY_TRANSITION, kind, src, requested="stop",
+                      effective="inhibited" if master else "latched", outcome="asserted",
+                      phase="inhibit", incident_id=iid, epoch=result.get("epoch"), generation=gen, correlation_id=corr,
                       detail={"local_inhibit_asserted": result.get("local_inhibit_asserted"),
-                              "executor_preempted": result.get("executor_preempted"),
-                              "error": result.get("error")})
+                              "executor_preempted": result.get("executor_preempted")})
+            # phase: the priority link E-STOP transport result (initial zero send + scheduled retries)
+            tr = result.get("transport_result") or {}
+            _obs.emit(_obs.CAT_TRANSPORT, "estop_dispatch", src, requested="estop",
+                      effective="sent" if result.get("transport_dispatch_succeeded") else "failed",
+                      outcome=("dispatched" if result.get("transport_dispatch_succeeded") else "degraded"),
+                      phase="dispatch", incident_id=iid, epoch=result.get("epoch"), generation=gen, correlation_id=corr,
+                      detail={"initial_zero_sdk_send_succeeded": tr.get("initial_zero_sdk_send_succeeded"),
+                              "retry_count": tr.get("retry_count"), "error": result.get("error")})
         return result
 
     def resume(self) -> None:

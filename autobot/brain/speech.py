@@ -29,8 +29,18 @@ class SpeechService:
         self.last_spoken = ""
         self.active_playback_id = None
         self._gen = 0                      # AudioState generation of our current clip
+        self._utt_seq = 0                  # per-utterance correlation source (speech.lifecycle)
         self._play_lock = asyncio.Lock()   # exactly ONE active robot utterance at a time
         self._clear_tasks: set[asyncio.Task] = set()   # P0 §6: tracked so teardown cancels+awaits them
+
+    @staticmethod
+    def _obs(type_: str, source: str, corr: Optional[str] = None, **kw):
+        # speech.lifecycle: NEVER record text/audio — only char/byte counts, duration, engine label, ids (§4.4).
+        try:
+            from .. import observability as _obs
+            _obs.emit(_obs.CAT_SPEECH, type_, source, correlation_id=corr, **kw)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _emit(self, ev: dict) -> None:
         if self.emit:
@@ -51,6 +61,11 @@ class SpeechService:
                 return
             if self.active_playback_id == pid:
                 self.active_playback_id = None
+                self._obs("playback_completed", "speech", corr=f"speech-pid-{pid}", outcome="ok",
+                          detail={"playback_id": pid, "duration_s": round(dur, 3)})
+            else:
+                self._obs("stale_result_discarded", "speech", corr=f"speech-pid-{pid}", outcome="discarded",
+                          detail={"playback_id": pid})
             audio_state.clear(gen)   # no-op if a newer clip is already active
         try:
             # P0 §6: TRACK the task so a teardown can cancel + await it (don't leak a pending task that the
@@ -81,6 +96,8 @@ class SpeechService:
                     cancel(pid)
                 except Exception:  # noqa: BLE001
                     pass
+            self._obs("cancelled", "speech", corr=f"speech-pid-{pid}", outcome="cancelled",
+                      reason="superseded", detail={"playback_id": pid})
             self.active_playback_id = None
         audio_state.cancel(self._gen)   # clear the prior generation's gate/canceller (no-op if already gone)
 
@@ -101,19 +118,29 @@ class SpeechService:
         if not text:
             return {"ok": False, "error": "empty text"}
 
+        self._utt_seq += 1
+        corr = f"speech-{self._utt_seq}"
+        self._obs("requested", "speech", corr=corr, detail={"char_count": len(text), "engine": s.tts_engine})
         async with self._play_lock:
             self.last_spoken = text
             await self._cancel_active()   # one audible utterance: cancel the previous before publishing
             try:
                 pub = getattr(self.link, "publish_speech", None)
                 if callable(pub):
+                    _t = time.perf_counter()
+                    self._obs("render_started", "speech", corr=corr, detail={"engine": "wav/" + s.tts_engine})
                     wav = tts.render_wav(text)
                     if not wav:
+                        self._obs("render_failed", "speech", corr=corr, outcome="failed", reason="empty render")
                         return self._as_dict(await self.link.say_text(text))
                     dur = audio_state.wav_duration_s(wav)
+                    self._obs("render_completed", "speech", corr=corr, outcome="ok",
+                              latency_ms=(time.perf_counter() - _t) * 1000.0,
+                              detail={"audio_bytes": len(wav), "duration_s": round(dur, 3)})
                     cancellable = getattr(self.link, "cancel_playback", None) is not None
                     gen = audio_state.begin_playback(text, dur)   # gate ON + new generation
                     self._gen = gen
+                    self._obs("publish_started", "speech", corr=corr)
                     res = await pub(wav)
                     pid = res.get("playback_id") if isinstance(res, dict) else None
                     ok = (not isinstance(res, dict)) or (res.get("ok") is not False)
@@ -123,11 +150,15 @@ class SpeechService:
                         audio_state.clear(gen)
                         self.active_playback_id = None
                         why = "publish ok=false" if not ok else "cancellable link returned no playback_id"
+                        self._obs("publish_failed", "speech", corr=corr, outcome="failed", reason=why)
                         return {"ok": False, "error": why}
                     self.active_playback_id = pid
                     if cancellable:
                         cancel = getattr(self.link, "cancel_playback")
                         audio_state.set_canceller(gen, lambda pid=pid, cancel=cancel: cancel(pid))
+                    self._obs("publish_completed", "speech", corr=corr, outcome="ok", detail={"playback_id": pid})
+                    self._obs("playback_started", "speech", corr=f"speech-pid-{pid}", outcome="ok",
+                              detail={"playback_id": pid, "duration_s": round(dur, 3), "char_count": len(text)})
                     await self._emit({"type": "speech", "text": text, "b64": base64.b64encode(wav).decode(),
                                       "sr": 0, "ts": time.time()})
                     self._schedule_clear(gen, pid, dur)
@@ -146,6 +177,7 @@ class SpeechService:
             except Exception as e:  # noqa: BLE001
                 audio_state.clear(self._gen)   # clear THIS clip's speaking state on failure
                 self.active_playback_id = None
+                self._obs("failed", "speech", corr=corr, outcome="failed", reason=type(e).__name__)
                 return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     @staticmethod

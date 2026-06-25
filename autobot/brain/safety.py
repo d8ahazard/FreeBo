@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -106,6 +107,7 @@ class ControlArbiter:
         self._reset_seq = 0
         self._active_reset_id: Optional[int] = None
         self._effect_seq = 0          # monotonic ticket-id source for admitted effects
+        self._incident_id: Optional[str] = None   # agent_next_4 §3: one causal id per STOP, carried through RESET
 
     # --- transitions ---
     def begin_master_stop(self) -> StopToken:
@@ -120,6 +122,7 @@ class ControlArbiter:
             did = self._dispatch_seq
             self._active_stops.add(did)
             self._active_reset_id = None    # a new STOP cancels any pending reset admission
+            self._incident_id = uuid.uuid4().hex   # this STOP opens a fresh causal incident
             return StopToken(self._epoch, self._generation, did)
 
     def latch_motion(self) -> StopToken:
@@ -222,12 +225,17 @@ class ControlArbiter:
         with self._lock:
             return self._inhibited
 
+    def current_incident_id(self) -> Optional[str]:
+        with self._lock:
+            return self._incident_id
+
     def snapshot(self) -> dict:
         with self._lock:
             return {"transition_epoch": self._epoch, "desired_generation": self._generation,
                     "desired_latched": self._latched, "master_inhibited": self._inhibited,
                     "stop_in_flight": bool(self._active_stops),
-                    "reset_active": self._active_reset_id is not None}
+                    "reset_active": self._active_reset_id is not None,
+                    "incident_id": self._incident_id}
 
     def _unsafe_clear_for_tests(self) -> None:
         """TEST/no-sidecar ONLY — never a production release path (item 10)."""
@@ -398,6 +406,10 @@ class SafetyFloor:
     # --- master autonomous-faculty inhibit ---
     def is_master_inhibited(self) -> bool:
         return self.arb.is_master_inhibited()
+
+    def current_incident_id(self) -> Optional[str]:
+        """The causal incident id opened by the most recent master STOP (agent_next_4 §3)."""
+        return self.arb.current_incident_id()
 
     # NOTE (P0-R4 atomicity item 10): there is intentionally NO public unconditional master_inhibit /
     # master_release / estop_reset / force_clear. STOP goes through begin_master_stop() (tokenized); release
