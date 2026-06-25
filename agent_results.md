@@ -69,25 +69,55 @@ Caps: forward ≤0.20, turn ≤0.18, duration ≤0.60 s, normal stop after each 
 RESUME after each master STOP, freshness gate, never an unbounded held drive.
 
 ## R4.0 physical evidence SHA
-NONE — not run by the agent. When the operator runs it, evidence lands under
-`data/test-evidence/hardware/<sha>/r4_0/<timestamp>/`.
+**RUN once (operator-supervised), ABORTED.** Software SHA `ae6e71eb7478a62bfea6bc1cf039948dbd8c9d28` (clean tree,
+app-reported SHA matched, AIR2 link, synchronized). Evidence:
+`data/test-evidence/hardware/ae6e71eb7478a62bfea6bc1cf039948dbd8c9d28/r4_0/20260625-181247/` (manifest.json +
+rows.jsonl, 26 rows). Arming: all conditions + the 7-item checklist confirmed (`armed_ok=true`). Pre-run control
+reconcile (STOP→RESUME) succeeded and live-validated the E-STOP transport (initial-zero sent, ack 172 ms,
+two-phase resume reconciled).
 
 ## R4.0 trial results
-NOT RUN.
+- 5 eyes, 5 forward (0.20/0.4 s), 5 turn (0.18/0.4 s), 10 normal stops: all dispatched; operator observed each
+  motion **halt, with NO post-stop motion and NO unexpected motion**.
+- 1st master-STOP trial (forward_pulse scenario): the STOP was correct at every layer (`local_inhibit=true`,
+  `local_latch_set=true`, `initial_zero_sdk_send_succeeded=true`, retry_count=3, gen/epoch 2→3, sidecar adopted,
+  re-`synchronized=true`), but the operator could not confirm a physical halt (`motion_started_observed=false`,
+  `halt_observed=?`) → the harness ABORTED (unknown is not a pass) and issued a priority E-STOP. Trials 2–10 not
+  run.
 
 ## R4.0 acceptance report
-NOT RUN. The runner computes `acceptance_report()` (required trial counts, STOP local-inhibit/transport/observed-
-halt/no-post-stop-motion/latch/stale-effect-rejected/explicit-RESUME, stop/ack/motion-dispatch p95, journal
-health); any missing measurement fails the gate. Verified by 16 harness unit tests with a simulated client.
+`pass=false`. `counts_ok=false` (aborted after 1/10 master-STOPs). STOP latency p95 281 ms (≤600 ✓), ack p95
+766 ms (≤1200 ✓), **motion_dispatch p95 1031 ms (≤250 ✗)**, journal healthy throughout. No safety gate was
+violated; the gate failed to COMPLETE, it did not record an unsafe event.
 
 ## R4.0 verdict
-**NOT RUN — pending supervised operator execution.** No PASS may be claimed without operator observations.
+**ABORTED on the first master-STOP — "STOP halt not observed."** NO confirmed safety failure: the STOP path
+asserted inhibit+latch and dispatched on every attempt, every observed motion halted, and no post-stop or
+unexpected motion was reported. Root cause (see below). Robot left **latched + inhibited**. Per the directive,
+the wave stops here; only the observed issue is to be fixed; **no broad refactor; Phase 2 NOT entered.**
+
+### Root cause (from evidence, not inference)
+1. **Cloud motion-dispatch latency ~0.5–1.0 s (p95 1031 ms vs 250 ms target).** Drive commands reach the robot
+   over the Agora/RTM cloud path with high, variable lag.
+2. **The 100 ms drive keepalive repeat** (sidecar `driveRepeat`, by design so the robot's deadman doesn't cut a
+   pulse) bunches under that lag, so a short 0.4–0.6 s pulse presents as several discrete same-direction nudges —
+   the operator's "repeating itself." It is latch-safe (each repeat checks `!latched`), so every pulse still
+   halted.
+3. **Harness staging flaw:** the master-STOP scenario fires a 0.6 s pulse then immediately the STOP; under ~1 s
+   dispatch lag the pulse auto-zeroes (its `driveStopTimer`) BEFORE the STOP lands, so there is no active motion
+   to halt → the operator cannot observe a STOP-arresting-motion → correct abort.
+
+### Narrow fix candidates (not yet applied — operator to choose; no broad refactor)
+- Harness: for STOP scenarios, keep the robot in motion until the STOP fires using back-to-back capped pulses
+  (each still ≤0.20/≤0.18 mag, ≤0.6 s, no unbounded held drive) so a STOP-during-motion is observable.
+- Investigate/measure the cloud motion-dispatch latency (the dominant real issue) before re-running R4.0.
+- Neither touches the safety floor or the frozen Phase 0 invariants.
 
 ## Phase status
 - Phase 0 software gate: ACCEPTED, FROZEN
-- Phase 0 physical gate: PENDING (R4.0 not yet run)
+- Phase 0 physical gate: **R4.0 ABORTED (no safety failure; staging/latency)** — re-run required
 - Phase 1 observability: COMPLETE FOR R4.0
-- Phase 2 cognition/model benchmarking: BLOCKED (requires an R4.0 PASS)
+- Phase 2 cognition/model benchmarking: **BLOCKED** (requires an R4.0 PASS — not achieved)
 - Phase 3 personality: BLOCKED
 
 ## Conditional Phase 2 status
