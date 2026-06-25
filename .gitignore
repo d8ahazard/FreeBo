@@ -69,8 +69,10 @@ Thumbs.db
 /tc_*.txt
 /checks_out.txt
 /checks_err.txt
-# raw test-evidence logs (summarized in agent_results.md; not committed as noise)
-/data/test-evidence/
+# raw test-evidence logs (summarized in agent_results.md). Committed software-run evidence lives under
+# data/test-evidence/software/<sha>/ (NOT ignored); transient root-run logs elsewhere are ignored.
+/data/test-evidence/*
+!/data/test-evidence/software/
 /tmp/
 
 # ---- FreeBo repo: big artifacts live in GitHub Releases, not git (see docs/REPRO.md) ----
