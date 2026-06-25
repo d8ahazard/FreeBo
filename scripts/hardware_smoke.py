@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -32,7 +33,12 @@ REPO = Path(__file__).resolve().parents[1]
 EVID = REPO / "data" / "test-evidence"
 
 # §3.3 conservative R4.0 caps (harness-level, in ADDITION to the frozen safety floor).
-R4_0_CAPS = {"forward_mag": 0.20, "turn_mag": 0.18, "duration_s": 0.60}
+# NOTE (agent_next_5 hardware re-prep, operator-authorized): the Air 2 FORWARD DEADBAND is 0.25
+# (autobot/brain/motion_model.py: forward_deadband=0.25, forward_min=0.30), so the original ≤0.20 forward cap was
+# BELOW the threshold that produces any forward motion — the first supervised run saw forward "twitch but not
+# travel". Forward is raised to 0.30 (= forward_min, still ≪ forward_max 0.55 and ≪ the safety-floor max_speed) so
+# forward actually moves; turn (0.18, above the 0.10/0.12 turn band) is unchanged.
+R4_0_CAPS = {"forward_mag": 0.30, "turn_mag": 0.18, "duration_s": 0.60}
 FRESHNESS_GATE_S = 2.0           # refuse motion when camera/telemetry age exceeds this
 
 # Acceptance thresholds (ms).
@@ -163,6 +169,43 @@ class HarnessAbort(RuntimeError):
     pass
 
 
+class SustainedMover:
+    """agent_next_5 re-prep: keep the robot ACTUALLY moving until a master-STOP fires, so a STOP-arrests-motion is
+    observable under the ~1 s cloud dispatch latency (a single ≤0.6 s pulse auto-zeroes before a late STOP lands).
+    It loops issuing CAPPED pulses (each ≤0.6 s — NO unbounded held drive) on a SEPARATE client so the priority
+    E-STOP on the main client is never queued behind it. It stops on `.stop()` or as soon as a pulse is refused
+    (the STOP latched the robot)."""
+
+    def __init__(self, post, ly: float, rx: float, *, pulse_s: float = 0.5, gap_s: float = 0.15) -> None:
+        self._post = post
+        self.ly, self.rx = clamp_caps(ly, rx, pulse_s)[:2]
+        self.pulse_s = min(pulse_s, R4_0_CAPS["duration_s"])
+        self.gap_s = gap_s
+        self._stop = threading.Event()
+        self.pulses = 0
+        self.refused = False
+        self._t = threading.Thread(target=self._run, name="hw-mover", daemon=True)
+
+    def start(self) -> "SustainedMover":
+        self._t.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            res = self._post("/api/control", {"kind": "move", "ly": self.ly, "rx": self.rx, "duration": self.pulse_s})
+            self.pulses += 1
+            api = res.get("api_response", {}) if isinstance(res, dict) else {}
+            if api.get("blocked") or api.get("ok") is False:
+                self.refused = True            # robot latched (STOP landed) -> stop issuing motion
+                return
+            self._stop.wait(self.gap_s)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._t.is_alive():
+            self._t.join(timeout=3.0)
+
+
 def _freshness_ok(readiness: dict) -> bool:
     """Refuse motion when camera/telemetry freshness exceeds the gate (§3.3)."""
     for k in ("video_age", "telemetry_age"):
@@ -219,7 +262,7 @@ def acceptance_report(rows: list, eligible: bool, thresholds: dict | None = None
 
 class Harness:
     def __init__(self, base: str, *, auto: bool, armed_flag: bool, expect_sha: str, owner_token: str | None = None,
-                 client=None, prompter=None) -> None:
+                 client=None, mover_client=None, prompter=None) -> None:
         self.base = base.rstrip("/")
         self.auto = auto
         self.armed_flag = armed_flag
@@ -230,12 +273,22 @@ class Harness:
         self.checklist: dict = {}
         self.arming: dict = {}
         self.aborted: str | None = None
+        self._stop_settle = 1.2          # seconds to let real motion get underway before firing a master STOP
         self._prompt = prompter if prompter is not None else (lambda q: input(q))
         if client is not None:
             self.c = client
         else:
             import httpx
             self.c = httpx.Client(timeout=15.0)
+        # SEPARATE client for sustained motion so the priority E-STOP on the main client never queues behind a
+        # blocking move. Defaults to a second httpx client; tests inject a thread-safe sim.
+        if mover_client is not None:
+            self._mc = mover_client
+        elif client is not None:
+            self._mc = client            # injected single client (tests make it thread-safe)
+        else:
+            import httpx
+            self._mc = httpx.Client(timeout=15.0)
 
     # --- transport ---
     def _headers(self) -> dict:
@@ -249,10 +302,16 @@ class Harness:
             return {}
 
     def _post(self, path: str, body: dict | None = None) -> dict:
+        return self._post_with(self.c, path, body)
+
+    def _mover_post(self, path: str, body: dict | None = None) -> dict:
+        return self._post_with(self._mc, path, body)
+
+    def _post_with(self, client, path: str, body: dict | None = None) -> dict:
         t0 = time.monotonic()
         status, api = None, {}
         try:
-            r = self.c.post(self.base + path, json=body or {}, headers=self._headers())
+            r = client.post(self.base + path, json=body or {}, headers=self._headers())
             status = getattr(r, "status_code", None)
             api = r.json()
         except Exception as e:  # noqa: BLE001
@@ -385,12 +444,18 @@ class Harness:
             row = self.record(f"turn_{i}", "turn", self._move(0.0, R4_0_CAPS["turn_mag"], 0.4), observe=True)
             self._guard_or_abort(row, is_stop=False)
             self._normal_stop()
-        # 10 master-STOP trials: two each of the five scenarios (§3.4), each followed by an explicit RESUME.
+        # 10 master-STOP trials: two each of the five scenarios (§3.4). For each, keep the robot ACTIVELY MOVING
+        # (sustained capped pulses on the mover client) so the STOP arrests real motion, fire the STOP, then stop
+        # the mover and RESUME. The latch makes the mover's next pulse get refused (it self-stops).
         scenarios = ["forward_pulse", "turn_pulse", "executor_move", "queued_inflight", "rtm_interrupt"]
         for i in range(REQUIRED_TRIALS["master_stop"]):
             scn = scenarios[i % len(scenarios)]
-            self._setup_scenario(scn)
-            self._master_stop(f"estop_{i}_{scn}")
+            mover = self._start_scenario_motion(scn)
+            try:
+                time.sleep(self._stop_settle)  # let real motion get underway (covers the ~1s dispatch latency)
+                self._master_stop(f"estop_{i}_{scn}")
+            finally:
+                mover.stop()                   # signal + join the background mover (latch already refuses it)
             if i == 0:
                 self._stale_effect_probe()     # while latched: a stale/latched effect MUST be rejected (§3.6)
             self._resume(f"resume_{i}")
@@ -408,24 +473,25 @@ class Harness:
         if not rejected:
             self._abort("a stale/latched effect was ACCEPTED (must be rejected)")
 
-    def _setup_scenario(self, scn: str) -> None:
-        """Create the motion context deterministically via existing APIs (capped). The STOP fires immediately
-        after, exercising STOP during an active effect."""
-        if scn == "forward_pulse":
-            self._move(R4_0_CAPS["forward_mag"], 0.0, R4_0_CAPS["duration_s"])
-        elif scn == "turn_pulse":
-            self._move(0.0, R4_0_CAPS["turn_mag"], R4_0_CAPS["duration_s"])
-        elif scn == "executor_move":
-            # a longer (still capped) move approximates an executor-controlled motion in flight
-            self._move(R4_0_CAPS["forward_mag"], 0.0, R4_0_CAPS["duration_s"])
-        elif scn == "queued_inflight":
-            for _ in range(3):                 # several capped requests so multiple frames are in flight
-                self._move(R4_0_CAPS["forward_mag"], 0.0, R4_0_CAPS["duration_s"])
+    def _start_scenario_motion(self, scn: str) -> SustainedMover:
+        """Begin the motion context for a STOP trial as SUSTAINED capped pulses (so the robot is genuinely moving
+        when the STOP fires, despite cloud latency). Returns the running mover; the caller fires the STOP then
+        calls mover.stop(). All pulses are clamped to the R4.0 caps; this is back-to-back capped pulses, NOT an
+        unbounded held drive."""
+        fwd, turn = R4_0_CAPS["forward_mag"], R4_0_CAPS["turn_mag"]
+        if scn == "turn_pulse":
+            mover = SustainedMover(self._mover_post, 0.0, turn)
+        else:                                  # forward_pulse / executor_move / queued_inflight / rtm_interrupt
+            mover = SustainedMover(self._mover_post, fwd, 0.0)
+        mover.start()
+        if scn == "queued_inflight":
+            for _ in range(2):                 # extra capped frames in flight alongside the sustained stream
+                self._mover_post("/api/control", {"kind": "move", "ly": fwd, "rx": 0.0, "duration": 0.4})
         elif scn == "rtm_interrupt":
             # controlled RTM/sidecar interruption via the EXISTING connection control (no new motion surface)
-            self._move(R4_0_CAPS["forward_mag"], 0.0, R4_0_CAPS["duration_s"])
             self._post("/api/control", {"kind": "connection", "state": "stop"})
             self._post("/api/control", {"kind": "connection", "state": "start"})
+        return mover
 
     # --- evidence ---
     def save(self) -> dict:

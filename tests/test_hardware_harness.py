@@ -9,6 +9,7 @@ Prove the honesty + safety invariants with a fully simulated client + prompter:
 from __future__ import annotations
 
 import importlib.util
+import threading
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ class _SimClient:
         self.latched = False
         self.calls: list[tuple[str, dict]] = []
         self._cmd = 0
+        self._lock = threading.Lock()          # mover thread + main thread share this client
         self.sha, self.variant, self.synchronized = sha, variant, synchronized
         self.journal_alive, self.estop_dispatches, self.video_age = journal_alive, estop_dispatches, video_age
 
@@ -55,29 +57,31 @@ class _SimClient:
         return _Resp({})
 
     def post(self, url, json=None, headers=None):
-        self.calls.append((url, json or {}))
-        if url.endswith("/api/estop"):
-            self.latched = True
-            return _Resp({"local_inhibit_asserted": True,
-                          "transport_dispatch_succeeded": self.estop_dispatches, "latched": True,
-                          "transport_result": {"initial_zero_sdk_send_succeeded": self.estop_dispatches,
-                                               "retry_count": 3, "sent_to_agora": self.estop_dispatches,
-                                               "dispatch_ts": 1.0, "completion_ts": 1.1}})
-        if url.endswith("/api/resume"):
-            self.latched = False
-            return _Resp({"ok": True, "resumed": True, "reconciled": True})
-        if url.endswith("/api/control"):
-            kind = (json or {}).get("kind")
-            if kind in ("move", "drive"):
-                if self.latched:
-                    return _Resp({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
-                self._cmd += 1
-                return _Resp({"ok": True, "sent_to_agora": True, "command_id": self._cmd})
+        with self._lock:
+            self.calls.append((url, json or {}))
+            if url.endswith("/api/estop"):
+                self.latched = True
+                return _Resp({"local_inhibit_asserted": True,
+                              "transport_dispatch_succeeded": self.estop_dispatches, "latched": True,
+                              "transport_result": {"initial_zero_sdk_send_succeeded": self.estop_dispatches,
+                                                   "retry_count": 3, "sent_to_agora": self.estop_dispatches,
+                                                   "dispatch_ts": 1.0, "completion_ts": 1.1}})
+            if url.endswith("/api/resume"):
+                self.latched = False
+                return _Resp({"ok": True, "resumed": True, "reconciled": True})
+            if url.endswith("/api/control"):
+                kind = (json or {}).get("kind")
+                if kind in ("move", "drive"):
+                    if self.latched:
+                        return _Resp({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
+                    self._cmd += 1
+                    return _Resp({"ok": True, "sent_to_agora": True, "command_id": self._cmd})
+                return _Resp({"ok": True})
             return _Resp({"ok": True})
-        return _Resp({"ok": True})
 
     def move_calls(self):
-        return [c for c in self.calls if c[0].endswith("/api/control") and c[1].get("kind") in ("move", "drive")]
+        with self._lock:
+            return [c for c in self.calls if c[0].endswith("/api/control") and c[1].get("kind") in ("move", "drive")]
 
 
 def _good_prompt(q: str) -> str:
@@ -110,9 +114,11 @@ def test_classify_consumes_nested_transport_result():
 
 
 def test_clamp_caps():
-    assert hs.clamp_caps(0.9, 0.9, 5.0) == (0.20, 0.18, 0.60)        # clamped to R4.0 caps
-    assert hs.clamp_caps(-0.9, -0.9, -1) == (-0.20, -0.18, 0.0)
+    # forward cap raised to 0.30 (above the Air 2 forward deadband 0.25); turn stays 0.18, duration 0.60.
+    assert hs.clamp_caps(0.9, 0.9, 5.0) == (0.30, 0.18, 0.60)
+    assert hs.clamp_caps(-0.9, -0.9, -1) == (-0.30, -0.18, 0.0)
     assert hs.clamp_caps(0.1, 0.1, 0.3) == (0.1, 0.1, 0.3)
+    assert hs.R4_0_CAPS["forward_mag"] == 0.30 and hs.R4_0_CAPS["forward_mag"] > 0.25   # above the deadband
 
 
 def test_percentile_and_gate():
@@ -237,6 +243,7 @@ def test_full_scripted_run_produces_counts_and_passes(monkeypatch, tmp_path):
     monkeypatch.setattr(hs, "EVID", tmp_path)
     client = _SimClient()
     h = _harness(client)
+    h._stop_settle = 0.02                                    # don't sleep 1.2s × 10 in the test
     assert h.arm() is True
     h.run_r4_0()
     manifest = h.save()
@@ -253,3 +260,32 @@ def test_full_scripted_run_produces_counts_and_passes(monkeypatch, tmp_path):
 def test_freshness_gate_refuses_stale_feeds():
     assert hs._freshness_ok({"video_age": 0.1, "telemetry_age": 0.1}) is True
     assert hs._freshness_ok({"video_age": 9.0}) is False
+
+
+def test_sustained_mover_drives_then_self_stops_on_latch():
+    # The mover keeps issuing capped pulses (so the robot is moving at STOP time), and self-stops the instant a
+    # pulse is refused (the STOP latched the robot).
+    client = _SimClient()
+    h = _harness(client)
+    mover = hs.SustainedMover(h._mover_post, 0.30, 0.0, pulse_s=0.5, gap_s=0.02).start()
+    import time as _t
+    _t.sleep(0.15)
+    assert mover.pulses >= 1                                 # the robot was actually being driven
+    client.latched = True                                   # simulate a STOP landing
+    _t.sleep(0.1)
+    mover.stop()
+    assert mover.refused is True                             # mover saw the refusal and stopped issuing motion
+
+
+def test_master_stop_trial_has_motion_in_flight(monkeypatch):
+    # The STOP-during-motion staging must put a move in flight before the master STOP (the agent_next_5 fix).
+    monkeypatch.setattr(hs, "tree_is_clean", lambda: True)
+    client = _SimClient()
+    h = _harness(client)
+    mover = h._start_scenario_motion("forward_pulse")
+    import time as _t
+    _t.sleep(0.15)
+    try:
+        assert mover.pulses >= 1 and client.move_calls()    # motion underway before the STOP
+    finally:
+        mover.stop()
