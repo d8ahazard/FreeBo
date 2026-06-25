@@ -1002,8 +1002,12 @@ async def api_overseer_act(req: Request):
         if tk is None:
             return JSONResponse({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
         # 'drive' = single sustained frame (deadman stops it); 'move'/'turn' = timed burst then auto-stop.
-        res = await (LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch) if kind == "drive"
-                     else LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch))
+        # agent_next_5 §1.1: pass the COMPLETE admitted ticket (epoch+generation+ticket_id) — the Air 2 link
+        # mandates ticket_id and fails closed on a partial ticket.
+        res = await (LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch, ticket_id=tk.ticket_id)
+                     if kind == "drive"
+                     else LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch,
+                                    ticket_id=tk.ticket_id))
         res = {**res, "clamped": {"ly": d.ly, "rx": d.rx, "duration": d.duration}}
     elif kind == "action":
         res = await LINK.action(str(body.get("name", "")), source="overseer")
@@ -1056,7 +1060,8 @@ async def api_overseer_probe(req: Request):
         tk = brain.safety.admit_motion()   # P0 §3: ticket the calibration probe move
         moved["admitted"] = tk is not None
         if tk is not None:
-            await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
+            await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch,
+                            ticket_id=tk.ticket_id)   # §1.1: complete ticket (Air 2 rejects a partial one)
     await asyncio.sleep(max(0.0, settle_ms / 1000.0))
     after, _ = await LINK.snapshot()
     from ..brain import visual_motion
@@ -1515,9 +1520,13 @@ async def api_control(req: Request):
         tk = brain.safety.admit_motion()
         if tk is None:
             return JSONResponse({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
+        # §1.1: manual motion must carry the COMPLETE ticket (epoch+generation+ticket_id) or the Air 2 link
+        # rejects it (missing_motion_ticket) and manual UI motion fails closed on the real robot.
         if kind == "drive":
-            return JSONResponse(await LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch))
-        return JSONResponse(await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch))
+            return JSONResponse(await LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch,
+                                                 ticket_id=tk.ticket_id))
+        return JSONResponse(await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch,
+                                            ticket_id=tk.ticket_id))
     if kind == "action":
         name = str(body.get("name", ""))
         return JSONResponse(await LINK.action(name))

@@ -140,8 +140,9 @@ async def calibrate(link: RobotLink, *, max_speed: float = 0.85, safety=None,
                     "frame_diff": None, "state": "blocked", "blocked": "motion not admitted (STOP/latched)"}
         gen = tk.generation if tk is not None else None
         ep = tk.epoch if tk is not None else None
+        tid = tk.ticket_id if tk is not None else None
         await link.move(min(ly, max_speed), max(-max_speed, min(max_speed, rx)), dur,
-                        generation=gen, epoch=ep)
+                        generation=gen, epoch=ep, ticket_id=tid)
         await asyncio.sleep(dur + _SETTLE)
         await link.stop()
         after = await _snap(link)

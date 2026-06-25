@@ -74,7 +74,7 @@ async def turn(*, link, safety, settings, profile: Optional[MotionProfile] = Non
         if tk is None:
             return {"ok": False, "blocked": "motion not admitted (STOP/latched)",
                     "measured_deg": round(accumulated, 1)}
-        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
+        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch, ticket_id=tk.ticket_id)
         await asyncio.sleep(d.duration + SETTLE)
         after = await _snap(link)
         meas = visual_motion.measure(before, after)
@@ -127,7 +127,7 @@ async def step(*, link, safety, settings, profile: Optional[MotionProfile] = Non
     tk = safety.admit_motion()   # P0 §3: ticket the step
     if tk is None:
         return {"ok": False, "blocked": "motion not admitted (STOP/latched)"}
-    await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
+    await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch, ticket_id=tk.ticket_id)
     await asyncio.sleep(d.duration + SETTLE)
     after = await _snap(link)
     await link.stop()
@@ -176,7 +176,7 @@ async def drive(*, link, safety, settings, profile: Optional[MotionProfile] = No
         tk = safety.admit_motion()   # P0 §3: ticket the reverse nudge
         if tk is None:
             return {"ok": False, "blocked": "motion not admitted (STOP/latched)"}
-        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
+        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch, ticket_id=tk.ticket_id)
         await link.stop()
         return {"ok": True, "state": "moved", "drove": {"ly": d.ly, "duration": d.duration}}
     res = await link.stop()

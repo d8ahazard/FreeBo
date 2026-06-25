@@ -66,3 +66,52 @@ async def test_resume_not_admissible_returns_409_when_not_stopped(server):
     assert resp.status_code == 409                           # reset not admissible
     import json
     assert json.loads(resp.body.decode()).get("ok") is False
+
+
+class _FakeRtm:
+    def __init__(self):
+        self.sent = []
+        self._process_instance_id = "P"
+        self._sidecar_instance_id = "S"
+
+    def send_acked(self, cmd, timeout=1.5):
+        self.sent.append(cmd)
+        return {"ok": True, "sent_to_agora": True, "command_id": 1, **cmd}
+
+
+async def test_manual_air2_motion_reaches_sidecar_with_full_ticket(server, monkeypatch):
+    # agent_next_5 §1.1: manual /api/control motion through the Air 2 link must reach the (fake) sidecar carrying
+    # the COMPLETE ticket — epoch + generation + ticket_id + effect_class=motion. A partial ticket fails closed.
+    _clear(server)
+    from autobot.robot.air2_native_link import Air2NativeLink
+    link = Air2NativeLink.__new__(Air2NativeLink)            # skip heavy __init__; we only exercise drive/move
+    fake = _FakeRtm()
+    link.rtm = fake
+    server.SETTINGS.update(setup_complete=True, asleep=False, allow_motion=True, max_speed=1.0)
+    monkeypatch.setattr(server, "LINK", link, raising=True)
+
+    resp = await server.api_control(_Req({"kind": "drive", "ly": 0.2, "rx": 0.0}))
+    import json
+    body = json.loads(resp.body.decode())
+    assert body.get("sent_to_agora") is True
+    assert fake.sent, "manual drive never reached the sidecar"
+    cmd = fake.sent[-1]
+    assert cmd["cmd"] == "drive" and cmd["effect_class"] == "motion"
+    for k in ("epoch", "generation", "ticket_id"):
+        assert cmd.get(k) is not None, f"manual motion dropped {k}"
+
+    fake.sent.clear()
+    resp2 = await server.api_control(_Req({"kind": "move", "ly": 0.2, "rx": 0.0, "duration": 0.3}))
+    cmd2 = fake.sent[-1]
+    assert cmd2.get("ticket_id") is not None and cmd2.get("epoch") is not None and cmd2.get("generation") is not None
+    _clear(server)
+
+
+async def test_air2_motion_without_ticket_fails_closed():
+    # The Air 2 link itself rejects a partial ticket (no fallback) — defense in depth behind the server fix.
+    from autobot.robot.air2_native_link import Air2NativeLink
+    link = Air2NativeLink.__new__(Air2NativeLink)
+    link.rtm = _FakeRtm()
+    res = await link.drive(0.2, 0.0, generation=1, epoch=1)   # ticket_id missing
+    assert res.get("error") == "missing_motion_ticket" and res.get("sent_to_agora") is False
+    assert not link.rtm.sent                                  # nothing reached the sidecar

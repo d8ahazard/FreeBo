@@ -75,6 +75,39 @@ def test_air2_motion_requires_a_ticket():
     assert "missing_motion_ticket" in src, "air2 move/drive must reject a missing ticket"
 
 
+def _balanced_arglist(text: str, open_idx: int) -> str:
+    """Return the substring inside the parens of a call starting at the '(' at open_idx (balanced)."""
+    depth = 0
+    for j in range(open_idx, len(text)):
+        ch = text[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:j]
+    return text[open_idx + 1:]
+
+
+def test_no_production_motion_call_supplies_a_partial_ticket():
+    # agent_next_5 §1.1: every production .drive()/.move() CALL that carries epoch/generation must ALSO carry
+    # ticket_id (a partial ticket fails closed on the Air 2 link). Definitions (`def drive`/`def move`) and the
+    # interface stubs are not calls and are skipped.
+    call_re = re.compile(r"\.(drive|move)\(")
+    offenders = []
+    for path, rel in _py_files():
+        text = path.read_text(encoding="utf-8")
+        for m in call_re.finditer(text):
+            args = _balanced_arglist(text, m.end() - 1)
+            has_auth = ("generation=" in args) or ("epoch=" in args)
+            if has_auth and "ticket_id=" not in args:
+                # locate line number for a useful message
+                line_no = text[:m.start()].count("\n") + 1
+                offenders.append(f"{rel}:{line_no}: .{m.group(1)}(...) has epoch/generation but no ticket_id")
+    assert not offenders, ("production motion calls must pass the COMPLETE ticket (epoch+generation+ticket_id):\n"
+                           + "\n".join(offenders))
+
+
 def test_sidecar_drive_uses_mandatory_ticket_validator():
     # agent_next_3 §A4: the JS `drive` authority contract must use the SAME mandatory validator as other effects,
     # and must not re-introduce optional identity/ticket fields.
