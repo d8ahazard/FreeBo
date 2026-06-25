@@ -1,13 +1,23 @@
 # Phase 0 — Acceptance
 
 Phase 0 has TWO separate gates (do NOT conflate them):
-- **Software safety gate: ACCEPTED FOR PHASE 1** (agent_next_3 Gate A) — the software safety architecture is
-  accepted and Phase 1 observability is authorized.
+- **Software safety gate: ACCEPTED, FROZEN** (agent_next_3 Gate A) — the software safety architecture is accepted
+  and frozen; the invariant list lives in `docs/ROADMAP.md`.
 - **Physical gate: PENDING — HARDWARE NOT RUN** — the supervised R4.0 smoke + R4.10 acceptance have not been
   executed on the live Air 2. Hardware eligibility = NO. Physical movement is disabled by policy.
 
+**Phase 1 observability: COMPLETE FOR R4.0** (agent_next_4). The journal is restart-aware + non-blocking; STOP→
+RESET is ONE causal incident; reason/tool/transport/speech/vision + sidecar/system categories are wired; retained
+history is queryable with a loopback-vs-owner-token access policy; the live timeline streams `journal_event` over
+WS (no full-window polling). The software-only R4.0 rehearsal (`python scripts/phase1_rehearsal.py`, mock link +
+real Node FAKE sidecar, NO hardware) passes all 12 scenarios → `ready_for_supervised_R4_0=true`. A `YES` for
+readiness is NOT authorization to run hardware. Phase 2/3 remain BLOCKED pending a supervised R4.0.
+
 Phase 0 is NOT "fully passed": software acceptance for Phase 1 and physical acceptance are distinct. The frozen
 Phase 0 software invariant list lives in `docs/ROADMAP.md`.
+
+The connect-time `set_control` is an assert-latch-only reconcile (it can never CLEAR a latch — only the two-phase
+prepare/commit release does). This remains the intended, tested design; not redesigned in Phase 1.
 
 Raw machine-readable evidence is stored under `data/test-evidence/` (immutable summary tied to the tested
 commit). Hardware runs are joint (operator + live Air 2).
