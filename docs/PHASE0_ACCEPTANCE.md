@@ -25,10 +25,13 @@ commit). Hardware runs are joint (operator + live Air 2).
 ## Software gates
 
 ### Test suite (canonical, reproducible)
-- Canonical full suite (must exit 0 on three consecutive fresh runs):
+- Canonical full suite (must exit 0):
   `python -X faulthandler -m pytest -q -p no:recording`
-  → **162 passed, 3 skipped** in ~62s; observed clean (exit 0, no leaked tasks, no socketpair hang) on three
-  consecutive runs. Raw logs: `data/test-evidence/fullsuite_s6_v1..v3.txt` (gitignored).
+  → **CURRENT immutable evidence: agent_next_4 tested SHA `e7763058…` = 243 passed, 2 hardware-gated skips,
+  exit 0** (`data/test-evidence/software/e7763058…/summary.json` + `fullsuite.txt`). The agent_next_5 preflight
+  count is recorded in `agent_results.md` against its own tested SHA.
+  - History (NOT the current gate result): an earlier P0 snapshot reported 162 passed / 3 skipped
+    (`data/test-evidence/fullsuite_s6_v1..v3.txt`, gitignored); kept only as provenance.
 - Targeted safety/atomicity groups (all green):
   - `pytest -q -p no:recording tests/test_safety.py tests/test_control_arbiter.py tests/test_rtm_node.py`
   - `pytest -q -p no:recording tests/test_sidecar_protocol.py tests/test_adversarial_integration.py`

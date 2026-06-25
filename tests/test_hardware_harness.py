@@ -1,10 +1,10 @@
-"""P0 §8 — scripted unit tests for the hardware evidence harness (NO robot, NO network).
+"""agent_next_5 §6 — scripted unit tests for the supervised R4.0 harness (NO robot, NO network).
 
-These prove the harness's HONESTY invariants with a fully mocked HTTP client:
+Prove the honesty + safety invariants with a fully simulated client + prompter:
   * evidence is never inferred from `ok` (absent facts are null);
-  * the physical effect is never auto-set, and `--auto` can never be a PASS;
-  * a dirty tree is diagnostics only;
-  * a failed STOP and a non-reconciled RESUME ABORT the run.
+  * arming refuses under --auto / wrong SHA / dirty tree / desync / unhealthy journal; no motion before arming;
+  * deterministic scenario counts; acceptance fails on any missing measurement;
+  * abort-on-unexpected-motion issues a priority E-STOP; a stale/latched effect must be rejected.
 """
 from __future__ import annotations
 
@@ -28,131 +28,228 @@ class _Resp:
         return self._b
 
 
-class _Client:
-    """Scripted client: POST pops the next queued response for a path; GET returns a fixed status body."""
+class _SimClient:
+    """Models the server's latch state so the stale-effect probe + STOP/RESUME behave realistically."""
 
-    def __init__(self, post_map: dict[str, list[dict]], status_body: dict | None = None):
-        self.post_map = {k: list(v) for k, v in post_map.items()}
-        self.status_body = status_body or {"readiness": {}}
+    def __init__(self, *, sha="SHA1", variant="AIR2", synchronized=True, journal_alive=True,
+                 estop_dispatches=True, video_age=0.1):
+        self.latched = False
         self.calls: list[tuple[str, dict]] = []
+        self._cmd = 0
+        self.sha, self.variant, self.synchronized = sha, variant, synchronized
+        self.journal_alive, self.estop_dispatches, self.video_age = journal_alive, estop_dispatches, video_age
 
-    def post(self, url: str, json: dict | None = None):
+    def _readiness(self):
+        return {"synchronized": self.synchronized, "video_age": self.video_age, "telemetry_age": 0.1}
+
+    def get(self, url, headers=None):
+        if url.endswith("/api/hardware_gate"):
+            return _Resp({"software_sha": self.sha, "hardware_run": False,
+                          "journal_health": {"writer_alive": self.journal_alive, "persist_ok": True},
+                          "readiness": self._readiness()})
+        if url.endswith("/api/events/health"):
+            return _Resp({"writer_alive": self.journal_alive, "persist_ok": True})
+        if url.endswith("/api/state") or url.endswith("/api/status"):
+            return _Resp({"settings": {"robot_variant": self.variant},
+                          "brain": {"readiness": self._readiness()}})
+        return _Resp({})
+
+    def post(self, url, json=None, headers=None):
         self.calls.append((url, json or {}))
-        path = url.split("8200", 1)[-1] if "8200" in url else url
-        for key, queue in self.post_map.items():
-            if url.endswith(key):
-                body = queue.pop(0) if queue else {"ok": True}
-                return _Resp(body)
+        if url.endswith("/api/estop"):
+            self.latched = True
+            return _Resp({"local_inhibit_asserted": True,
+                          "transport_dispatch_succeeded": self.estop_dispatches, "latched": True,
+                          "transport_result": {"initial_zero_sdk_send_succeeded": self.estop_dispatches,
+                                               "retry_count": 3, "sent_to_agora": self.estop_dispatches,
+                                               "dispatch_ts": 1.0, "completion_ts": 1.1}})
+        if url.endswith("/api/resume"):
+            self.latched = False
+            return _Resp({"ok": True, "resumed": True, "reconciled": True})
+        if url.endswith("/api/control"):
+            kind = (json or {}).get("kind")
+            if kind in ("move", "drive"):
+                if self.latched:
+                    return _Resp({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
+                self._cmd += 1
+                return _Resp({"ok": True, "sent_to_agora": True, "command_id": self._cmd})
+            return _Resp({"ok": True})
         return _Resp({"ok": True})
 
-    def get(self, url: str):
-        return _Resp(self.status_body)
+    def move_calls(self):
+        return [c for c in self.calls if c[0].endswith("/api/control") and c[1].get("kind") in ("move", "drive")]
 
 
+def _good_prompt(q: str) -> str:
+    ql = q.lower()
+    if "presence phrase" in ql or "type the presence" in ql:
+        return hs.PRESENCE_PHRASE
+    if "after the stop" in ql or "unexpected" in ql:
+        return "n"
+    return "y"
+
+
+def _harness(client, *, auto=False, armed_flag=True, expect_sha="SHA1", prompter=_good_prompt):
+    return hs.Harness("http://127.0.0.1:8200", auto=auto, armed_flag=armed_flag, expect_sha=expect_sha,
+                      client=client, prompter=prompter)
+
+
+# ---- classify / caps (pure) ----
 def test_classify_never_infers_from_ok():
-    # ok=True but none of the real fields present -> all evidence is null (not True), with reasons.
     c = hs.classify({"ok": True})
-    assert c["queued_to_sidecar"] is None
-    assert c["sdk_send_succeeded"] is None
-    assert c["transport_dispatch_succeeded"] is None
-    assert any("unknown" in r for r in c["reasons"])
-
-
-def test_classify_reads_explicit_fields():
-    c = hs.classify({"ok": True, "queued_to_sidecar": True, "sent_to_agora": False,
-                     "local_inhibit_asserted": True, "transport_dispatch_succeeded": False})
-    assert c["queued_to_sidecar"] is True
-    assert c["sdk_send_succeeded"] is False
-    assert c["local_inhibit_asserted"] is True
-    assert c["transport_dispatch_succeeded"] is False
-
-
-def test_auto_is_never_acceptance_eligible():
-    assert hs.acceptance_eligible(auto=True, clean_tree=True) is False
-    assert hs.acceptance_eligible(auto=False, clean_tree=False) is False   # dirty tree
-    assert hs.acceptance_eligible(auto=False, clean_tree=True) is True
-
-
-def test_auto_run_never_sets_effect_and_never_passes():
-    # Under --auto the operator is never asked, so robot_effect_observed stays null and the gate can't pass.
-    client = _Client({"/api/control": [], "/api/estop": [
-        {"local_inhibit_asserted": True, "transport_dispatch_succeeded": True, "latched": True}],
-        "/api/resume": [{"ok": True, "resumed": True}]})
-    h = hs.Harness("http://127.0.0.1:8200", auto=True, client=client)
-    row = h._master_stop("estop_0", "holding forward")
-    assert row["robot_effect_observed"] is None              # never auto-set
-    assert hs.estop_gate_pass(h.rows, eligible=False) is False
-
-
-def test_failed_stop_aborts():
-    # estop reports NO local inhibit / NO transport dispatch -> the run must abort.
-    client = _Client({"/api/estop": [{"ok": False, "local_inhibit_asserted": False,
-                                       "transport_dispatch_succeeded": False}]})
-    h = hs.Harness("http://127.0.0.1:8200", auto=True, client=client)
-    with pytest.raises(hs.HarnessAbort):
-        h._master_stop("estop_fail", "holding forward")
-
-
-def test_unreconciled_resume_aborts():
-    client = _Client({"/api/resume": [{"ok": False, "error": "still inhibited"}]})
-    h = hs.Harness("http://127.0.0.1:8200", auto=True, client=client)
-    with pytest.raises(hs.HarnessAbort):
-        h._resume("resume_0")
+    assert c["queued_to_sidecar"] is None and c["sdk_send_succeeded"] is None
+    assert c["transport_dispatch_succeeded"] is None and any("unknown" in r for r in c["reasons"])
 
 
 def test_classify_consumes_nested_transport_result():
-    # agent_next_2 §8.1: the /api/estop response nests SDK facts under transport_result; classify reads them
-    # WITHOUT substituting transport_dispatch_succeeded for the individual facts.
-    api = {"ok": True, "local_inhibit_asserted": True, "transport_dispatch_succeeded": True,
-           "transport_result": {"initial_zero_sdk_send_succeeded": True, "local_latch_set": True,
-                                "retry_count": 3, "sent_to_agora": True, "dispatch_ts": 1.0, "completion_ts": 1.1}}
-    c = hs.classify(api)
-    assert c["initial_zero_sdk_send_succeeded"] is True
-    assert c["local_sidecar_latch"] is True
-    assert c["retry_count"] == 3
-    assert c["sdk_send_succeeded"] is True
-    assert c["local_inhibit_asserted"] is True
-    assert c["sidecar_dispatch_ts"] == 1.0
+    c = hs.classify({"ok": True, "local_inhibit_asserted": True, "transport_dispatch_succeeded": True,
+                     "transport_result": {"initial_zero_sdk_send_succeeded": True, "retry_count": 3,
+                                          "sent_to_agora": True, "dispatch_ts": 1.0, "completion_ts": 1.1}})
+    assert c["initial_zero_sdk_send_succeeded"] is True and c["retry_count"] == 3
+    assert c["sdk_send_succeeded"] is True and c["sidecar_dispatch_ts"] == 1.0
 
 
-def test_percentile_nearest_rank():
-    assert hs.percentile([], 95) is None
-    assert hs.percentile([100], 95) == 100
-    assert hs.percentile([10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 95) == 100
-    assert hs.percentile([10, 20, 30, 40], 50) == 20
+def test_clamp_caps():
+    assert hs.clamp_caps(0.9, 0.9, 5.0) == (0.20, 0.18, 0.60)        # clamped to R4.0 caps
+    assert hs.clamp_caps(-0.9, -0.9, -1) == (-0.20, -0.18, 0.0)
+    assert hs.clamp_caps(0.1, 0.1, 0.3) == (0.1, 0.1, 0.3)
 
 
-def test_gate_missing_measurement_is_fail():
-    assert hs._gate(None, 600)["pass"] is False        # missing measurement is NOT a pass
-    assert hs._gate(599, 600)["pass"] is True
-    assert hs._gate(601, 600)["pass"] is False
+def test_percentile_and_gate():
+    assert hs.percentile([], 95) is None and hs.percentile([10, 20, 30, 40], 50) == 20
+    assert hs._gate(None, 600)["pass"] is False                      # missing measurement is NOT a pass
+    assert hs._gate(599, 600)["pass"] is True and hs._gate(601, 600)["pass"] is False
 
 
-def test_acceptance_report_fails_when_not_eligible_or_over_threshold():
-    rows = [
-        {"kind": "master_stop", "stop_latency_ms": 100, "robot_effect_observed": True,
-         "post_stop_motion_observed": False},
-        {"kind": "forward", "latency_ms": 100}, {"kind": "stale_effect", "rejected": True},
-    ]
-    assert hs.acceptance_report(rows, eligible=False)["pass"] is False      # never passes when ineligible
+# ---- §3.1 arming ----
+def _state(variant="AIR2", synchronized=True):
+    return {"settings": {"robot_variant": variant}, "brain": {"readiness": {"synchronized": synchronized}}}
+
+
+def _gate(sha="SHA1", alive=True):
+    return {"software_sha": sha, "journal_health": {"writer_alive": alive, "persist_ok": True}}
+
+
+def test_arming_never_under_auto():
+    c = hs.arming_conditions(_state(), _gate(), expect_sha="SHA1", auto=True, armed_flag=True,
+                             presence_ok=True, checklist_ok=True)
+    assert c["armed_ok"] is False
+
+
+def test_arming_requires_sha_match():
+    c = hs.arming_conditions(_state(), _gate(sha="OTHER"), expect_sha="SHA1", auto=False, armed_flag=True,
+                             presence_ok=True, checklist_ok=True)
+    assert c["app_sha_matches"] is False and c["armed_ok"] is False
+
+
+def test_arming_requires_synchronized_and_air2_and_journal():
+    desync = hs.arming_conditions(_state(synchronized=False), _gate(), expect_sha="SHA1", auto=False,
+                                  armed_flag=True, presence_ok=True, checklist_ok=True)
+    assert desync["control_synchronized"] is False and desync["armed_ok"] is False
+    notair2 = hs.arming_conditions(_state(variant="MOCK"), _gate(), expect_sha="SHA1", auto=False,
+                                   armed_flag=True, presence_ok=True, checklist_ok=True)
+    assert notair2["live_air2_link"] is False and notair2["armed_ok"] is False
+    badj = hs.arming_conditions(_state(), _gate(alive=False), expect_sha="SHA1", auto=False, armed_flag=True,
+                                presence_ok=True, checklist_ok=True)
+    assert badj["journal_writer_healthy"] is False and badj["armed_ok"] is False
+
+
+def test_arming_requires_presence_and_checklist():
+    no_phrase = hs.arming_conditions(_state(), _gate(), expect_sha="SHA1", auto=False, armed_flag=True,
+                                     presence_ok=False, checklist_ok=True)
+    assert no_phrase["armed_ok"] is False
+    no_check = hs.arming_conditions(_state(), _gate(), expect_sha="SHA1", auto=False, armed_flag=True,
+                                    presence_ok=True, checklist_ok=False)
+    assert no_check["armed_ok"] is False
+
+
+def test_auto_is_never_eligible():
+    assert hs.acceptance_eligible(auto=True, clean_tree=True, armed=True) is False
+    assert hs.acceptance_eligible(auto=False, clean_tree=False, armed=True) is False
+    assert hs.acceptance_eligible(auto=False, clean_tree=True, armed=False) is False
+
+
+# ---- no motion before arming ----
+def test_no_motion_before_arming():
+    client = _SimClient()
+    h = _harness(client)
+    h.armed = False                                                  # arming did not complete
+    with pytest.raises(hs.HarnessAbort):
+        h.run_r4_0()
+    assert client.move_calls() == []                                # ZERO motion issued before arming
+
+
+def test_auto_run_never_arms_and_issues_no_motion(monkeypatch):
+    monkeypatch.setattr(hs, "tree_is_clean", lambda: True)
+    client = _SimClient()
+    h = _harness(client, auto=True)
+    assert h.arm() is False                                          # --auto never arms
+    assert client.move_calls() == []
+
+
+# ---- abort behavior ----
+def test_abort_on_unexpected_motion_issues_priority_estop(monkeypatch):
+    monkeypatch.setattr(hs, "tree_is_clean", lambda: True)
+
+    def prompt(q):
+        ql = q.lower()
+        if "presence phrase" in ql or "type the presence" in ql:
+            return hs.PRESENCE_PHRASE
+        if "unexpected" in ql:
+            return "y"                                              # operator reports UNEXPECTED motion
+        if "after the stop" in ql:
+            return "n"
+        return "y"
+    client = _SimClient()
+    h = _harness(client, prompter=prompt)
+    assert h.arm() is True
+    with pytest.raises(hs.HarnessAbort):
+        h.run_r4_0()
+    assert any(u.endswith("/api/estop") for u, _ in client.calls)   # priority E-STOP was issued on abort
+
+
+def test_failed_stop_aborts(monkeypatch):
+    monkeypatch.setattr(hs, "tree_is_clean", lambda: True)
+    client = _SimClient(estop_dispatches=False)                     # STOP transport does not dispatch
+    h = _harness(client)
+    assert h.arm() is True
+    with pytest.raises(hs.HarnessAbort):
+        h.run_r4_0()
+
+
+# ---- acceptance report ----
+def test_acceptance_report_missing_measurement_fails():
+    # missing required counts -> fail; missing halt observation on a STOP -> fail.
+    rows = [{"kind": "master_stop", "latency_ms": 100, "latched": True,
+             "classify": {"local_inhibit_asserted": True, "transport_dispatch_succeeded": True},
+             "observations": {"halt_observed": None, "post_stop_motion_observed": False,
+                              "unexpected_motion_observed": False}}]
     rep = hs.acceptance_report(rows, eligible=True)
-    assert rep["gates"]["stop_p95"]["pass"] is True
-    # an over-threshold STOP fails the gate
-    rows2 = [{"kind": "master_stop", "stop_latency_ms": 999, "robot_effect_observed": True,
-              "post_stop_motion_observed": False}, {"kind": "forward", "latency_ms": 100},
-             {"kind": "stale_effect", "rejected": True}]
-    assert hs.acceptance_report(rows2, eligible=True)["gates"]["stop_p95"]["pass"] is False
-    assert hs.acceptance_report(rows2, eligible=True)["pass"] is False
+    assert rep["counts_ok"] is False                                # nowhere near the required trial counts
+    assert rep["stop_gates"]["every_stop_halt_observed"] is False   # unknown halt is not a pass
+    assert rep["pass"] is False
+    assert hs.acceptance_report(rows, eligible=False)["pass"] is False
 
 
-def test_estop_gate_pass_requires_observed_and_dispatched():
-    rows = [
-        {"kind": "master_stop", "robot_effect_observed": True,
-         "classify": {"transport_dispatch_succeeded": True}},
-        {"kind": "master_stop", "robot_effect_observed": None,    # operator unsure -> not a pass
-         "classify": {"transport_dispatch_succeeded": True}},
-    ]
-    assert hs.estop_gate_pass(rows, eligible=True) is False
-    rows[1]["robot_effect_observed"] = True
-    assert hs.estop_gate_pass(rows, eligible=True) is True
-    assert hs.estop_gate_pass(rows, eligible=False) is False      # eligibility still required
+def test_full_scripted_run_produces_counts_and_passes(monkeypatch, tmp_path):
+    monkeypatch.setattr(hs, "tree_is_clean", lambda: True)
+    monkeypatch.setattr(hs, "commit_sha", lambda: "SHA1")
+    monkeypatch.setattr(hs, "EVID", tmp_path)
+    client = _SimClient()
+    h = _harness(client)
+    assert h.arm() is True
+    h.run_r4_0()
+    manifest = h.save()
+    counts = manifest["acceptance_report"]["counts"]
+    assert counts["eyes"] >= 5 and counts["forward"] >= 5 and counts["turn"] >= 5
+    assert counts["master_stop"] >= 10
+    assert any(r["kind"] == "stale_effect" and r["rejected"] is True for r in h.rows)  # stale effect rejected
+    assert manifest["acceptance_report"]["pass"] is True
+    assert manifest["verdict"] == "PASS"
+    # evidence written under the SHA-scoped immutable directory
+    assert (tmp_path / "hardware" / "SHA1" / "r4_0").exists()
+
+
+def test_freshness_gate_refuses_stale_feeds():
+    assert hs._freshness_ok({"video_age": 0.1, "telemetry_age": 0.1}) is True
+    assert hs._freshness_ok({"video_age": 9.0}) is False
