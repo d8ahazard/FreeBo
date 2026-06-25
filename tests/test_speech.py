@@ -82,6 +82,7 @@ async def test_two_rapid_says_cancel_the_first(monkeypatch):
     assert link.queued == [1, 2]
     assert 1 in link.cancelled          # the first clip was cancelled before the second published
     assert svc.active_playback_id == 2
+    await svc.aclose()                  # drain clear-timers so no task leaks past the test (P0 §6)
 
 
 async def test_stop_while_first_clip_audible(monkeypatch):
@@ -92,6 +93,7 @@ async def test_stop_while_first_clip_audible(monkeypatch):
     assert ast.is_speaking() and link.queued == [1]
     ast.cancel()                        # barge-in STOP
     assert link.cancelled == [1] and not ast.is_speaking()
+    await svc.aclose()
 
 
 async def test_stale_completion_from_old_clip_does_not_clear_new(monkeypatch):
@@ -105,6 +107,7 @@ async def test_stale_completion_from_old_clip_does_not_clear_new(monkeypatch):
     ast.clear(gen_a)
     assert ast.is_speaking()
     assert "b" in ast.current_text().lower()   # still clip B's text
+    await svc.aclose()
 
 
 async def test_say_tool_clip_is_sanitized_and_cancellable(monkeypatch):
@@ -131,6 +134,7 @@ async def test_say_tool_clip_is_sanitized_and_cancellable(monkeypatch):
     ast.cancel()
     assert link.cancelled == [1]
     assert not ast.is_speaking()
+    await svc.aclose()
 
 
 async def test_say_tool_respects_talk_gate(monkeypatch):

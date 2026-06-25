@@ -69,6 +69,8 @@ Thumbs.db
 /tc_*.txt
 /checks_out.txt
 /checks_err.txt
+# raw test-evidence logs (summarized in agent_results.md; not committed as noise)
+/data/test-evidence/
 /tmp/
 
 # ---- FreeBo repo: big artifacts live in GitHub Releases, not git (see docs/REPRO.md) ----

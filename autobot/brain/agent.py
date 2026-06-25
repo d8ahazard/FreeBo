@@ -433,6 +433,11 @@ class AgentBrain:
 
     async def stop_loop(self):
         self._running = False
+        # P0 §6: also cancel an in-flight reason cycle and the background loops, then drain the SpeechService
+        # clear-timers + the registry's background tasks so nothing is left pending at interpreter teardown.
+        rt = self._reason_task
+        if rt is not None and not rt.done():
+            rt.cancel()
         for t in self._tasks:
             t.cancel()
         for t in self._tasks:
@@ -441,6 +446,14 @@ class AgentBrain:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._tasks = []
+        with contextlib.suppress(Exception):
+            await self.speech.aclose()
+        stop_bg = getattr(self.registry, "stop_background", None)
+        if callable(stop_bg):
+            with contextlib.suppress(Exception):
+                res = stop_bg()
+                if asyncio.iscoroutine(res):
+                    await res
 
     def _brain_ready(self, s: Settings) -> tuple[bool, str]:
         if not s.setup_complete:

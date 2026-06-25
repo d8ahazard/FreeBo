@@ -30,6 +30,7 @@ class SpeechService:
         self.active_playback_id = None
         self._gen = 0                      # AudioState generation of our current clip
         self._play_lock = asyncio.Lock()   # exactly ONE active robot utterance at a time
+        self._clear_tasks: set[asyncio.Task] = set()   # P0 §6: tracked so teardown cancels+awaits them
 
     async def _emit(self, ev: dict) -> None:
         if self.emit:
@@ -52,9 +53,22 @@ class SpeechService:
                 self.active_playback_id = None
             audio_state.clear(gen)   # no-op if a newer clip is already active
         try:
-            asyncio.create_task(_clr())
+            # P0 §6: TRACK the task so a teardown can cancel + await it (don't leak a pending task that the
+            # loop later destroys -> "Task was destroyed but it is pending!" + intermittent shutdown hangs).
+            t = asyncio.create_task(_clr())
+            self._clear_tasks.add(t)
+            t.add_done_callback(self._clear_tasks.discard)
         except RuntimeError:
             pass   # no running loop (non-async caller) — the gate timer still clears the speaking state
+
+    async def aclose(self) -> None:
+        """Cancel + await any in-flight clear timers (P0 §6 teardown hygiene). Idempotent."""
+        tasks = list(self._clear_tasks)
+        self._clear_tasks.clear()
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _cancel_active(self) -> None:
         """Stop any currently-active clip BEFORE publishing a new one (enforces one audible utterance)."""

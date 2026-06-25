@@ -11,6 +11,7 @@ thread parses stdout events; stderr (SDK logs) is drained separately so the pipe
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import os
@@ -88,6 +89,13 @@ class RtmNode:
     def stop(self) -> None:
         self._running = False
         self._kill()
+        # P0 §6: bounded join of the reader/manager thread so teardown doesn't leave a thread blocked on a
+        # now-dead pipe (daemon=True already prevents a hard hang; the join keeps shutdown deterministic).
+        t = self._thread
+        if t is not None and t.is_alive():
+            with contextlib.suppress(Exception):
+                t.join(timeout=2.0)
+        self._thread = None
 
     def _fail_pending(self, reason: str) -> None:
         """Release every blocked send_acked waiter immediately (P0-R4.4) so a sidecar exit/reconnect can't
