@@ -1659,6 +1659,18 @@ class AgentBrain:
         if behavior_stop:
             with contextlib.suppress(Exception):
                 self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
+        # Phase 1 observability (agent_next_3 §C3): one structured record per STOP dispatch, correlated by gen.
+        with contextlib.suppress(Exception):
+            from .. import observability as _obs
+            _obs.emit(_obs.CAT_SAFETY_TRANSITION, "master_stop" if master else ("motion_latch" if latch else "stop"),
+                      reason if isinstance(reason, str) else "stop",
+                      requested="stop", effective="inhibited" if master else "latched",
+                      outcome=("dispatched" if result.get("transport_dispatch_succeeded") else "degraded"),
+                      epoch=result.get("epoch"), generation=result.get("generation"),
+                      correlation_id=(f"stop-gen{result.get('generation')}" if result.get("generation") is not None else None),
+                      detail={"local_inhibit_asserted": result.get("local_inhibit_asserted"),
+                              "executor_preempted": result.get("executor_preempted"),
+                              "error": result.get("error")})
         return result
 
     def resume(self) -> None:

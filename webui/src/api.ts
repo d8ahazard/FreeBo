@@ -158,6 +158,28 @@ export const api = {
   overseerAct(body: Record<string, unknown>) {
     return jpost("/api/overseer/act", body);
   },
+  // --- Phase 1 observability (agent_next_3 Gate C): event journal timeline/inspector ---
+  async events(params: Record<string, string | number> = {}) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "") q.set(k, String(v));
+    const r = await fetch(`/api/events?${q.toString()}`);
+    if (!r.ok) throw new Error(`events ${r.status}`);
+    return r.json();
+  },
+  async eventsTrace(correlationId: string) {
+    const r = await fetch(`/api/events/trace/${encodeURIComponent(correlationId)}`);
+    if (!r.ok) throw new Error(`trace ${r.status}`);
+    return r.json();
+  },
+  async eventsSummary(sinceSeq = 0) {
+    const r = await fetch(`/api/events/summary?since_seq=${sinceSeq}`);
+    if (!r.ok) throw new Error(`summary ${r.status}`);
+    return r.json();
+  },
+  eventsExportUrl(correlationId?: string) {
+    return correlationId ? `/api/events/export?correlation_id=${encodeURIComponent(correlationId)}`
+                         : `/api/events/export`;
+  },
   async selftest(opts: { move?: boolean; talk?: boolean; only?: string } = {}) {
     const q = new URLSearchParams();
     if (opts.move) q.set("move", "1");

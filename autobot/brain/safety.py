@@ -365,7 +365,20 @@ class SafetyFloor:
                 return None
         # All other effect classes rely on the master-inhibit/latch/STOP gate in the arbiter (motion's extra
         # speed/scope/autonomy policy is applied by check_drive before admission).
-        return self.arb.admit_effect(effect_class)
+        ticket = self.arb.admit_effect(effect_class)
+        # Phase 1 observability (agent_next_3 §C3): record every effect admission decision (grant/deny).
+        try:
+            from .. import observability as _obs
+            if ticket is None:
+                _obs.emit(_obs.CAT_EFFECT, effect_class, source, requested="admit", effective="denied",
+                          reason="inhibited/latched/stop-in-flight")
+            else:
+                _obs.emit(_obs.CAT_EFFECT, effect_class, source, requested="admit", effective="admitted",
+                          outcome="ticket", epoch=ticket.epoch, generation=ticket.generation,
+                          ticket_id=ticket.ticket_id)
+        except Exception:  # noqa: BLE001 - observability never breaks admission
+            pass
+        return ticket
 
     def validate_ticket(self, ticket: EffectTicket) -> bool:
         return self.arb.validate_ticket(ticket)

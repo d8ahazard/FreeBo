@@ -194,6 +194,19 @@ class ActionExecutor:
             a.reason = reason
         if state in TERMINAL:
             a.ended_ts = time.monotonic()
+            # Phase 1 observability (agent_next_3 §C3): one structured motion-lifecycle record per terminal action.
+            try:
+                from .. import observability as _obs
+                tk = (a.params or {}).get("ticket") or {}
+                _obs.emit(_obs.CAT_MOTION, a.kind, a.source, requested="move",
+                          effective=a.state.value, outcome=a.result, reason=a.reason,
+                          correlation_id=a.id, ticket_id=tk.get("ticket_id") if isinstance(tk, dict) else None,
+                          epoch=tk.get("epoch") if isinstance(tk, dict) else None,
+                          generation=tk.get("generation") if isinstance(tk, dict) else None,
+                          latency_ms=(round((a.ended_ts - a.created_ts) * 1000.0, 1)),
+                          detail={"before_seq": a.before_seq, "after_seq": a.after_seq})
+            except Exception:  # noqa: BLE001
+                pass
         await self._emit({"type": "action", **a.to_dict(), "ts": time.time()})
 
     async def _sample(self):

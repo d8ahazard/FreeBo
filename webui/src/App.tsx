@@ -18,9 +18,10 @@ import MemoryPanel from "./components/MemoryPanel";
 import TasksPanel from "./components/TasksPanel";
 import CalibratePanel from "./components/CalibratePanel";
 import AudioCalibratePanel from "./components/AudioCalibratePanel";
+import TimelinePanel from "./components/TimelinePanel";
 import VoiceCommands from "./components/VoiceCommands";
 
-type Tab = "hud" | "memory" | "settings" | "calibrate";
+type Tab = "hud" | "memory" | "timeline" | "settings" | "calibrate";
 
 export default function App() {
   const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, save } = useAutobot();
@@ -140,7 +141,7 @@ export default function App() {
       ) : (
         <main className="max-w-[1320px] mx-auto px-4 py-4 relative z-[1]">
           <div className="flex gap-2 mb-4 max-w-[720px]">
-            {(["hud", "memory", "settings", "calibrate"] as Tab[]).map((tb) => (
+            {(["hud", "memory", "timeline", "settings", "calibrate"] as Tab[]).map((tb) => (
               <button
                 key={tb}
                 onClick={() => setTab(tb)}
@@ -148,7 +149,8 @@ export default function App() {
                   tab === tb ? "border-accent text-accent bg-accent/10 hud-glow" : "border-line bg-card2/50 text-mut"
                 }`}
               >
-                {tb === "hud" ? "◎ HUD" : tb === "memory" ? "✦ Memory" : tb === "settings" ? "⚙ Settings" : "◈ Calibrate"}
+                {tb === "hud" ? "◎ HUD" : tb === "memory" ? "✦ Memory" : tb === "timeline" ? "▤ Timeline"
+                  : tb === "settings" ? "⚙ Settings" : "◈ Calibrate"}
               </button>
             ))}
           </div>
@@ -157,6 +159,8 @@ export default function App() {
             <section className="max-w-[720px]">
               <AudioCalibratePanel />
             </section>
+          ) : tab === "timeline" ? (
+            <TimelinePanel />
           ) : tab === "settings" ? (
             <section className="hud-panel p-4 max-w-[560px]">
               <ConfigPanel settings={settings} tts={tts} onSave={save} />

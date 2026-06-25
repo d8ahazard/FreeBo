@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .. import observability as obs
 from ..brain import notify, summarizer, tts
 from ..brain.agent import AgentBrain
 from ..brain.identity import Identity
@@ -179,6 +180,10 @@ def _audio_in_sink(mulaw: bytes):
 async def _startup():
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
+    # Phase 1 observability (agent_next_3 §C2): configure the durable event journal before anything emits.
+    with contextlib.suppress(Exception):
+        obs.configure(str(Path(__file__).resolve().parents[2] / "data" / "events" / "events.jsonl"))
+        obs.emit(obs.CAT_SYSTEM, "startup", "server", outcome="ok")
     # Start subprocesses (native) off the event loop so a slow spawn never blocks startup.
     await asyncio.to_thread(LINK.start)
     # The Air 2 bridge link emits drive commands over the WS (the browser relays them to Agora RTM).
@@ -241,6 +246,12 @@ async def _shutdown():
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(worker.stop)
     await brain.stop_loop()
+    # Phase 1 observability: deterministic journal flush on shutdown.
+    with contextlib.suppress(Exception):
+        obs.emit(obs.CAT_SYSTEM, "shutdown", "server", outcome="ok")
+        j = obs.journal()
+        if j is not None:
+            j.flush_and_close()
     with contextlib.suppress(Exception):
         await asyncio.to_thread(LINK.close)
 
@@ -534,6 +545,86 @@ async def api_settings(req: Request):
     return JSONResponse({"ok": True, "changed": changed, **_state_payload()})
 
 
+def _software_sha() -> str:
+    import subprocess
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parents[2]),
+                              capture_output=True, text=True, timeout=5).stdout.strip() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+@app.get("/api/events")
+async def api_events(request: Request):
+    """Query the structured event journal (agent_next_3 §C4). Bounded; cursor-paginated. Filters: category, type,
+    source, outcome, correlation_id, epoch, generation, since_seq, limit."""
+    j = obs.journal()
+    if j is None:
+        return JSONResponse({"events": [], "next_cursor": 0, "returned": 0, "more": False})
+    q = request.query_params
+
+    def _int(name):
+        v = q.get(name)
+        try:
+            return int(v) if v is not None else None
+        except ValueError:
+            return None
+    return JSONResponse(j.query(
+        category=q.get("category"), type=q.get("type"), source=q.get("source"), outcome=q.get("outcome"),
+        correlation_id=q.get("correlation_id"), epoch=_int("epoch"), generation=_int("generation"),
+        since_seq=(_int("since_seq") or 0), limit=(_int("limit") or 200)))
+
+
+@app.get("/api/events/recent")
+async def api_events_recent(limit: int = 200):
+    j = obs.journal()
+    return JSONResponse({"events": (j.recent(limit) if j is not None else [])})
+
+
+@app.get("/api/events/trace/{correlation_id}")
+async def api_events_trace(correlation_id: str):
+    """One correlation trace (e.g. a STOP/RESUME incident grouped by `stop-genN` / `reset-genN`)."""
+    j = obs.journal()
+    return JSONResponse({"correlation_id": correlation_id,
+                         "events": (j.correlation_trace(correlation_id) if j is not None else [])})
+
+
+@app.get("/api/events/summary")
+async def api_events_summary(since_seq: int = 0):
+    j = obs.journal()
+    return JSONResponse(j.summary(since_seq=since_seq) if j is not None else {"total": 0})
+
+
+@app.get("/api/events/export")
+async def api_events_export(correlation_id: str | None = None, limit: int = 2000):
+    """Deterministic, redacted incident bundle (agent_next_3 §C6): redacted JSONL events + software SHA +
+    platform/version summary + readiness snapshot + metric summary. No credentials/audio/images/memory."""
+    import platform as _plat
+    import sys as _sys
+    j = obs.journal()
+    if correlation_id:
+        events = (j.correlation_trace(correlation_id, limit=limit) if j is not None else [])
+    else:
+        events = (j.recent(limit) if j is not None else [])
+    readiness = {}
+    with contextlib.suppress(Exception):
+        readiness = brain.status_dict().get("readiness", {}) or {}
+    metric_summary = {}
+    with contextlib.suppress(Exception):
+        metric_summary = j.summary() if j is not None else {}
+    bundle = {
+        "schema": "freebo.incident.v1",
+        "software_sha": _software_sha(),
+        "platform": {"system": _sys.platform, "python": _plat.python_version()},
+        "correlation_id": correlation_id,
+        "event_count": len(events),
+        "readiness": readiness,
+        "metric_summary": metric_summary,
+        "events": events,   # already redacted at the journal boundary
+    }
+    return JSONResponse(bundle)
+
+
 async def _emit_capabilities() -> None:
     """Broadcast the ONE authoritative capability-state event (P0-R4.6). Sourced from the kernel, with the
     agent's richer motion block reason folded in."""
@@ -543,6 +634,13 @@ async def _emit_capabilities() -> None:
         motion_reason = brain.status_dict().get("motion_block_reason", "") or ""
     snap = brain.safety.capability_snapshot(s, motion_reason=motion_reason)
     await emit({"type": "capabilities", **snap})
+    # Phase 1 observability (§C3): one faculty_decision record per capability whose effective state is reported.
+    with contextlib.suppress(Exception):
+        for cap, st in (snap.get("capabilities") or {}).items():
+            obs.emit(obs.CAT_FACULTY, cap, "kernel",
+                     requested=("on" if st.get("requested") else "off"),
+                     effective=("on" if st.get("effective") else "off"), reason=st.get("reason"),
+                     generation=snap.get("generation"))
 
 
 @app.post("/api/estop")
@@ -641,6 +739,10 @@ async def api_resume():
                              "error": "superseded by a newer STOP after sidecar commit; sidecar re-latched, "
                                       "still inhibited", "reassert_error": reassert_err}, status_code=409)
     brain.resume()                          # clear parked state (latch+inhibit released by finalize_reset)
+    with contextlib.suppress(Exception):
+        obs.emit(obs.CAT_SAFETY_TRANSITION, "resume", "api", requested="resume", effective="released",
+                 outcome="reconciled", epoch=token.release_epoch, generation=token.release_generation,
+                 correlation_id=f"reset-gen{token.release_generation}")
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})
     await _emit_capabilities()
