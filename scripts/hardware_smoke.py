@@ -45,28 +45,89 @@ def tree_is_clean() -> bool:
         return False
 
 
-def _tri(api: dict, *keys: str):
-    """Return a tri-state bool for the FIRST present key, else None (absent != False, and NEVER `ok`)."""
-    for k in keys:
-        if k in api and api[k] is not None:
-            return bool(api[k])
+def _tri(sources: list, *keys: str):
+    """Tri-state bool for the FIRST present key across `sources` (top-level then nested), else None. Absent !=
+    False, and NEVER inferred from `ok`."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            if k in src and src[k] is not None:
+                return bool(src[k])
     return None
 
 
 def classify(api: dict) -> dict:
-    """Pure evidence classification. NEVER infers anything from `ok`; absent facts are null + a reason."""
+    """Pure evidence classification (agent_next_2 §8.1). Consumes BOTH top-level and NESTED `transport_result`
+    facts WITHOUT inference; absent facts are null + a reason. Never substitutes transport_dispatch_succeeded for
+    the individual SDK facts."""
+    tr = api.get("transport_result") if isinstance(api.get("transport_result"), dict) else {}
+    src = [api, tr]
     c = {
-        "queued_to_sidecar": _tri(api, "queued_to_sidecar"),
-        "sdk_send_succeeded": _tri(api, "sent_to_agora", "sdk_send_succeeded", "initial_zero_sdk_send_succeeded"),
-        "local_inhibit_asserted": _tri(api, "local_inhibit_asserted"),
-        "transport_dispatch_succeeded": _tri(api, "transport_dispatch_succeeded"),
-        "reconciled": _tri(api, "reconciled", "resumed"),
+        "command_id": (api.get("command_id") if api.get("command_id") is not None else tr.get("command_id")),
+        "queued_to_sidecar": _tri(src, "queued_to_sidecar"),
+        "local_sidecar_latch": _tri(src, "local_latch_set", "latched"),
+        "sdk_send_attempted": _tri(src, "sdk_send_attempted"),
+        "initial_zero_sdk_send_succeeded": _tri(src, "initial_zero_sdk_send_succeeded"),
+        "sdk_send_succeeded": _tri(src, "sent_to_agora", "sdk_send_succeeded", "initial_zero_sdk_send_succeeded"),
+        "retry_count": (tr.get("retry_count") if tr.get("retry_count") is not None else api.get("retry_count")),
+        "local_inhibit_asserted": _tri(src, "local_inhibit_asserted"),
+        "transport_dispatch_succeeded": _tri(src, "transport_dispatch_succeeded"),
+        "reconciled": _tri(src, "reconciled", "resumed"),
+        "epoch": (api.get("epoch") if api.get("epoch") is not None else tr.get("epoch")),
+        "generation": (api.get("generation") if api.get("generation") is not None else tr.get("generation")),
+        "sidecar_dispatch_ts": tr.get("dispatch_ts"),
+        "sidecar_completion_ts": tr.get("completion_ts"),
         "reasons": [],
     }
-    for k in ("queued_to_sidecar", "sdk_send_succeeded"):
+    for k in ("queued_to_sidecar", "sdk_send_succeeded", "local_inhibit_asserted"):
         if c[k] is None:
             c["reasons"].append(f"{k}=unknown (API did not report it)")
     return c
+
+
+def percentile(values: list, p: float):
+    """Nearest-rank percentile (p in 0..100). None for an empty list."""
+    xs = sorted(v for v in values if isinstance(v, (int, float)))
+    if not xs:
+        return None
+    import math
+    rank = max(1, math.ceil((p / 100.0) * len(xs)))
+    return xs[min(rank, len(xs)) - 1]
+
+
+# Acceptance thresholds (agent_next_2 §8.3). All times in milliseconds.
+THRESHOLDS = {"stop_p95_ms": 600.0, "tts_cancel_p95_ms": 300.0, "ack_p95_ms": 1200.0, "motion_dispatch_p95_ms": 250.0}
+
+
+def acceptance_report(rows: list, eligible: bool, thresholds: dict | None = None) -> dict:
+    """Compute the acceptance gates from recorded rows (pure; no inference). Returns per-gate pass/fail + the
+    overall verdict. NEVER passes when not eligible. Latencies use endpoint->initial-zero-send where available."""
+    th = {**THRESHOLDS, **(thresholds or {})}
+    estops = [r for r in rows if r.get("kind") == "master_stop"]
+    stop_latencies = [r.get("stop_latency_ms") for r in estops if r.get("stop_latency_ms") is not None]
+    acks = [r.get("latency_ms") for r in rows if r.get("kind") in ("eyes", "forward", "turn", "stop")
+            and r.get("latency_ms") is not None]
+    motion = [r.get("latency_ms") for r in rows if r.get("kind") in ("forward", "turn")
+              and r.get("latency_ms") is not None]
+    tts = [r.get("tts_cancel_ms") for r in rows if r.get("tts_cancel_ms") is not None]
+    gates = {
+        "stop_p95": _gate(percentile(stop_latencies, 95), th["stop_p95_ms"]),
+        "ack_p95": _gate(percentile(acks, 95), th["ack_p95_ms"]),
+        "motion_dispatch_p95": _gate(percentile(motion, 95), th["motion_dispatch_p95_ms"]),
+        "tts_cancel_p95": _gate(percentile(tts, 95), th["tts_cancel_p95_ms"]),
+        "every_stop_observed_halt": all(r.get("robot_effect_observed") is True for r in estops) and bool(estops),
+        "no_post_stop_motion": all(r.get("post_stop_motion_observed") is False for r in estops) and bool(estops),
+        "stale_effect_rejected": any(r.get("kind") == "stale_effect" and r.get("rejected") is True for r in rows),
+    }
+    overall = eligible and all(g.get("pass") for g in gates.values() if isinstance(g, dict)) \
+        and all(v for k, v in gates.items() if not isinstance(v, dict))
+    return {"eligible": eligible, "gates": gates, "pass": bool(overall)}
+
+
+def _gate(observed, limit):
+    """A latency gate: pass only when we HAVE a measurement and it is within the limit (missing = fail, not pass)."""
+    return {"observed_ms": observed, "limit_ms": limit, "pass": (observed is not None and observed <= limit)}
 
 
 def acceptance_eligible(auto: bool, clean_tree: bool) -> bool:

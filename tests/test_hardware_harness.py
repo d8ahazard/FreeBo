@@ -100,6 +100,51 @@ def test_unreconciled_resume_aborts():
         h._resume("resume_0")
 
 
+def test_classify_consumes_nested_transport_result():
+    # agent_next_2 §8.1: the /api/estop response nests SDK facts under transport_result; classify reads them
+    # WITHOUT substituting transport_dispatch_succeeded for the individual facts.
+    api = {"ok": True, "local_inhibit_asserted": True, "transport_dispatch_succeeded": True,
+           "transport_result": {"initial_zero_sdk_send_succeeded": True, "local_latch_set": True,
+                                "retry_count": 3, "sent_to_agora": True, "dispatch_ts": 1.0, "completion_ts": 1.1}}
+    c = hs.classify(api)
+    assert c["initial_zero_sdk_send_succeeded"] is True
+    assert c["local_sidecar_latch"] is True
+    assert c["retry_count"] == 3
+    assert c["sdk_send_succeeded"] is True
+    assert c["local_inhibit_asserted"] is True
+    assert c["sidecar_dispatch_ts"] == 1.0
+
+
+def test_percentile_nearest_rank():
+    assert hs.percentile([], 95) is None
+    assert hs.percentile([100], 95) == 100
+    assert hs.percentile([10, 20, 30, 40, 50, 60, 70, 80, 90, 100], 95) == 100
+    assert hs.percentile([10, 20, 30, 40], 50) == 20
+
+
+def test_gate_missing_measurement_is_fail():
+    assert hs._gate(None, 600)["pass"] is False        # missing measurement is NOT a pass
+    assert hs._gate(599, 600)["pass"] is True
+    assert hs._gate(601, 600)["pass"] is False
+
+
+def test_acceptance_report_fails_when_not_eligible_or_over_threshold():
+    rows = [
+        {"kind": "master_stop", "stop_latency_ms": 100, "robot_effect_observed": True,
+         "post_stop_motion_observed": False},
+        {"kind": "forward", "latency_ms": 100}, {"kind": "stale_effect", "rejected": True},
+    ]
+    assert hs.acceptance_report(rows, eligible=False)["pass"] is False      # never passes when ineligible
+    rep = hs.acceptance_report(rows, eligible=True)
+    assert rep["gates"]["stop_p95"]["pass"] is True
+    # an over-threshold STOP fails the gate
+    rows2 = [{"kind": "master_stop", "stop_latency_ms": 999, "robot_effect_observed": True,
+              "post_stop_motion_observed": False}, {"kind": "forward", "latency_ms": 100},
+             {"kind": "stale_effect", "rejected": True}]
+    assert hs.acceptance_report(rows2, eligible=True)["gates"]["stop_p95"]["pass"] is False
+    assert hs.acceptance_report(rows2, eligible=True)["pass"] is False
+
+
 def test_estop_gate_pass_requires_observed_and_dispatched():
     rows = [
         {"kind": "master_stop", "robot_effect_observed": True,
