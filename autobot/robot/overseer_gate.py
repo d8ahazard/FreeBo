@@ -118,15 +118,17 @@ class OverseerGate(RobotLink):
         return await self._inner.connection(state)
 
     # --- effect verbs (intercepted while overseer is on) ---
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
         if self._on():
             return await self._intercept("drive", {"ly": ly, "rx": rx})
-        return await self._inner.drive(ly, rx)
+        return await self._inner.drive(ly, rx, generation=generation, epoch=epoch)
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
         if self._on():
             return await self._intercept("move", {"ly": ly, "rx": rx, "duration": duration})
-        return await self._inner.move(ly, rx, duration)
+        return await self._inner.move(ly, rx, duration, generation=generation, epoch=epoch)
 
     async def stop(self) -> dict[str, Any]:
         # Always let stop through (safe + keeps the robot halted between overseer commands); record intent.

@@ -493,11 +493,13 @@ class NativeRobotLink(RobotLink):
             return data, None
         return await asyncio.to_thread(_read)
 
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
         await asyncio.to_thread(self._do_drive, ly, rx)
         return {"ok": True}
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
         await asyncio.to_thread(self._do_move, ly, rx, duration)
         return {"ok": True}
 

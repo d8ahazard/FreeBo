@@ -50,8 +50,8 @@ async def test_contract_default_wrap_has_no_seq():
         async def info(self): return {}
         async def telemetry(self): return {"awake": True}
         async def snapshot(self): return b"jpegbytes", None
-        async def drive(self, ly, rx): return {"ok": True}
-        async def move(self, ly, rx, duration): return {"ok": True}
+        async def drive(self, ly, rx, *, generation=None, epoch=None): return {"ok": True}
+        async def move(self, ly, rx, duration, *, generation=None, epoch=None): return {"ok": True}
         async def stop(self): return {"ok": True}
         async def action(self, name): return {"ok": True}
         async def connection(self, state): return {"ok": True}

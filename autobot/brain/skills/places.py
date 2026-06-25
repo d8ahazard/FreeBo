@@ -230,8 +230,11 @@ class PlacesSkill(Skill):
         d = ctx.safety.check_drive(ctx.settings, ly, rx, dur, source="ai")
         if not d.allowed:
             return {"moved": False, "blocked": d.reason}
+        tk = ctx.safety.admit_motion()   # P0 §3: ticket go_to_place steps
+        if tk is None:
+            return {"moved": False, "blocked": "motion not admitted (STOP/latched)"}
         try:
-            await ctx.link.move(d.ly, d.rx, d.duration)
+            await ctx.link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
         except Exception as e:  # noqa: BLE001
             return {"moved": False, "error": str(e)}
         return {"moved": True, "desc": desc, "ly": round(d.ly, 2), "rx": round(d.rx, 2), "duration": d.duration}

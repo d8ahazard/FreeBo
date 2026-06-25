@@ -277,6 +277,15 @@ class ActionExecutor:
                 if not d.allowed:
                     await self._set_state(a, State.FAILED, f"blocked: {d.reason}")
                     return a
+                # P0 §3: ADMIT the motion — capture a MotionTicket bound to the CURRENT (epoch, generation).
+                # admit_motion() returns None when inhibited/latched/STOP-in-flight, so a master STOP between
+                # the clamp and here refuses motion. The ticket is carried to the link/sidecar and re-validated
+                # right before dispatch, so a drive admitted before a STOP cannot reach the robot after it.
+                ticket = self.safety.admit_motion()
+                if ticket is None:
+                    await self._set_state(a, State.FAILED, "blocked: motion not admitted (STOP/latched)")
+                    return a
+                a.params["ticket"] = {"epoch": ticket.epoch, "generation": ticket.generation}
                 await self._set_state(a, State.AUTHORIZED)
                 if token.cancelled:
                     await self._set_state(a, State.CANCELLED, "cancelled before execution")
@@ -284,9 +293,17 @@ class ActionExecutor:
 
                 # execute — bounded by an EXECUTION deadline so a HUNG move coroutine can't wedge the loop.
                 await self._set_state(a, State.EXECUTING)
+                # Re-validate the ticket IMMEDIATELY before the link call (a STOP may have landed during the
+                # state transitions above). Stale ticket => FAILED, never motion.
+                if not self.safety.validate_ticket(ticket):
+                    await self._set_state(a, State.FAILED, "blocked: motion ticket superseded by STOP")
+                    return a
                 move_deadline = float(d.duration) + self.execution_grace
                 try:
-                    res = await asyncio.wait_for(self.link.move(d.ly, d.rx, d.duration), timeout=move_deadline)
+                    res = await asyncio.wait_for(
+                        self.link.move(d.ly, d.rx, d.duration,
+                                       generation=ticket.generation, epoch=ticket.epoch),
+                        timeout=move_deadline)
                 except asyncio.TimeoutError:
                     await self._stop()
                     await self._set_state(a, State.FAILED,

@@ -111,10 +111,12 @@ async def _baseline(link: RobotLink, n: int = 5) -> tuple[float, Optional[bytes]
     return base, (frames[-1] if frames else None)
 
 
-async def calibrate(link: RobotLink, *, max_speed: float = 0.85,
+async def calibrate(link: RobotLink, *, max_speed: float = 0.85, safety=None,
                     emit: Optional[Callable[[dict], Awaitable[None]]] = None) -> dict:
     """Run the calibration grid and persist a MotionProfile. Returns the profile dict (or an error).
-    The robot DRIVES during this — run it in open space; the caller stops + restores afterward."""
+    The robot DRIVES during this — run it in open space; the caller stops + restores afterward.
+    `safety` (the SafetyFloor) is REQUIRED for ticketed motion (P0 §3): every trial admits a MotionTicket so a
+    STOP during calibration refuses further trial moves."""
     async def say(msg: str, **extra):
         if emit:
             try:
@@ -132,7 +134,14 @@ async def calibrate(link: RobotLink, *, max_speed: float = 0.85,
 
     async def trial(kind: str, ly: float, rx: float, dur: float) -> dict:
         before = await _snap(link)
-        await link.move(min(ly, max_speed), max(-max_speed, min(max_speed, rx)), dur)
+        tk = safety.admit_motion() if safety is not None else None
+        if safety is not None and tk is None:
+            return {"kind": kind, "ly": ly, "rx": rx, "duration": dur,
+                    "frame_diff": None, "state": "blocked", "blocked": "motion not admitted (STOP/latched)"}
+        gen = tk.generation if tk is not None else None
+        ep = tk.epoch if tk is not None else None
+        await link.move(min(ly, max_speed), max(-max_speed, min(max_speed, rx)), dur,
+                        generation=gen, epoch=ep)
         await asyncio.sleep(dur + _SETTLE)
         await link.stop()
         after = await _snap(link)

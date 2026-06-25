@@ -148,10 +148,12 @@ class Air2BridgeLink(RobotLink):
         return None, "no_frame_yet"
 
     # --- control (relayed to the browser, which sends Agora RTM) ---
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
         return await self._cmd(cmd="drive", ly=ly, rx=rx, duration=0.0)
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
         return await self._cmd(cmd="drive", ly=ly, rx=rx, duration=duration)
 
     async def stop(self) -> dict[str, Any]:

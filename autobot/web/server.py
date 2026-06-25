@@ -714,8 +714,13 @@ async def api_overseer_act(req: Request):
                                      body.get("duration", 0.6), source="overseer")
         if not d.allowed:
             return JSONResponse({"ok": False, "blocked": d.reason})
+        # P0 §3: ticket overseer motion too (the operator is not exempt from STOP/latch).
+        tk = brain.safety.admit_motion()
+        if tk is None:
+            return JSONResponse({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
         # 'drive' = single sustained frame (deadman stops it); 'move'/'turn' = timed burst then auto-stop.
-        res = await (LINK.drive(d.ly, d.rx) if kind == "drive" else LINK.move(d.ly, d.rx, d.duration))
+        res = await (LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch) if kind == "drive"
+                     else LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch))
         res = {**res, "clamped": {"ly": d.ly, "rx": d.rx, "duration": d.duration}}
     elif kind == "action":
         res = await LINK.action(str(body.get("name", "")))
@@ -725,16 +730,17 @@ async def api_overseer_act(req: Request):
         res = await LINK.connection(str(body.get("state", "start")))
     elif kind in ("move_mode", "move_speed"):
         # P0-R4 amendment E: the robot's movement gear is a TYPED command (raw 103011 is banned). Air 2 only.
+        # P0 §3: use the CORRELATED send (send_acked), never the fire-and-forget `_send`, so the result reflects
+        # real delivery + carries the sidecar identity.
         rtm = getattr(LINK, "rtm", None)
-        send = getattr(rtm, "_send", None)
-        if not callable(send):
+        send_acked = getattr(rtm, "send_acked", None)
+        if not callable(send_acked):
             return JSONResponse({"ok": False, "error": "typed RTM not available on this link"})
         if kind == "move_mode":
             cmd = {"cmd": "move_mode", "mode": int(body.get("mode", 0))}
         else:
             cmd = {"cmd": "move_speed", "speed": int(body.get("speed", 0))}
-        ok = await asyncio.to_thread(send, cmd)
-        res = {"ok": bool(ok), "sent": cmd}
+        res = await asyncio.to_thread(send_acked, cmd)
     elif kind == "say":
         if not s.talk_enabled:
             return JSONResponse({"ok": False, "blocked": "talk disabled (UI toggle off)"})
@@ -773,7 +779,10 @@ async def api_overseer_probe(req: Request):
                                  body.get("duration", 0.4), source="overseer")
     moved = {"ly": d.ly, "rx": d.rx, "duration": d.duration, "allowed": d.allowed}
     if d.allowed and (d.ly or d.rx) and d.duration > 0:
-        await LINK.move(d.ly, d.rx, d.duration)
+        tk = brain.safety.admit_motion()   # P0 §3: ticket the calibration probe move
+        moved["admitted"] = tk is not None
+        if tk is not None:
+            await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
     await asyncio.sleep(max(0.0, settle_ms / 1000.0))
     after, _ = await LINK.snapshot()
     from ..brain import visual_motion
@@ -827,7 +836,7 @@ async def api_calibrate():
     if not s.allow_motion:
         return JSONResponse({"ok": False, "error": "motion disabled (enable the Move ability)"})
     try:
-        res = await mp.calibrate(LINK, max_speed=s.max_speed or 0.85, emit=emit)
+        res = await mp.calibrate(LINK, max_speed=s.max_speed or 0.85, safety=brain.safety, emit=emit)
     finally:
         with contextlib.suppress(Exception):
             await LINK.stop()
@@ -1219,9 +1228,13 @@ async def api_control(req: Request):
                                      body.get("duration", 0.4), source="manual")
         if not d.allowed:
             return JSONResponse({"ok": False, "blocked": d.reason})
+        # P0 §3: ticket manual motion (manual is speed/duration-clamped AND honors STOP/latch via the ticket).
+        tk = brain.safety.admit_motion()
+        if tk is None:
+            return JSONResponse({"ok": False, "blocked": "motion not admitted (STOP/latched)"})
         if kind == "drive":
-            return JSONResponse(await LINK.drive(d.ly, d.rx))
-        return JSONResponse(await LINK.move(d.ly, d.rx, d.duration))
+            return JSONResponse(await LINK.drive(d.ly, d.rx, generation=tk.generation, epoch=tk.epoch))
+        return JSONResponse(await LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch))
     if kind == "action":
         name = str(body.get("name", ""))
         return JSONResponse(await LINK.action(name))

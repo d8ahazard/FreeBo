@@ -340,12 +340,14 @@ class X86RobotLink(RobotLink):
             return None, f"decode_error:{e}"
 
     # ------------- control -------------
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
         self._last_drive_ts = time.time()
         rc = self._send_mavlink(proto.mav_motor(ly=ly, rx=rx))
         return {"ok": rc >= 0}
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
         self._last_drive_ts = time.time()
         self._send_mavlink(proto.mav_motor(ly=ly, rx=rx))
         await _sleep(min(max(duration, 0.0), 2.0))

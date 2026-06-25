@@ -70,7 +70,11 @@ async def turn(*, link, safety, settings, profile: Optional[MotionProfile] = Non
             return {"ok": False, "blocked": d.reason, "measured_deg": round(accumulated, 1)}
         if abs(d.rx) < 1e-6:   # scope forced no rotation (shouldn't happen for turns, but be safe)
             return {"ok": False, "blocked": "turn not permitted by scope", "measured_deg": round(accumulated, 1)}
-        await link.move(d.ly, d.rx, d.duration)
+        tk = safety.admit_motion()   # P0 §3: ticket each pulse so a STOP mid-turn refuses the next move
+        if tk is None:
+            return {"ok": False, "blocked": "motion not admitted (STOP/latched)",
+                    "measured_deg": round(accumulated, 1)}
+        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
         await asyncio.sleep(d.duration + SETTLE)
         after = await _snap(link)
         meas = visual_motion.measure(before, after)
@@ -120,7 +124,10 @@ async def step(*, link, safety, settings, profile: Optional[MotionProfile] = Non
         return {"ok": False, "blocked": d.reason}
     if abs(d.ly) < 1e-6:   # scope is rotate-only (conversational/adjust) -> can't step forward
         return {"ok": False, "blocked": "forward not permitted right now (rotate-only scope)"}
-    await link.move(d.ly, d.rx, d.duration)
+    tk = safety.admit_motion()   # P0 §3: ticket the step
+    if tk is None:
+        return {"ok": False, "blocked": "motion not admitted (STOP/latched)"}
+    await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
     await asyncio.sleep(d.duration + SETTLE)
     after = await _snap(link)
     await link.stop()
@@ -166,7 +173,10 @@ async def drive(*, link, safety, settings, profile: Optional[MotionProfile] = No
         d = safety.check_drive(settings, back, 0.0, min(prof.forward_duration, 0.6), source=source)
         if not d.allowed:
             return {"ok": False, "blocked": d.reason}
-        await link.move(d.ly, d.rx, d.duration)
+        tk = safety.admit_motion()   # P0 §3: ticket the reverse nudge
+        if tk is None:
+            return {"ok": False, "blocked": "motion not admitted (STOP/latched)"}
+        await link.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch)
         await link.stop()
         return {"ok": True, "state": "moved", "drove": {"ly": d.ly, "duration": d.duration}}
     res = await link.stop()

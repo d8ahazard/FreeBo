@@ -108,14 +108,18 @@ class MockRobotLink(RobotLink):
                            age=0.0, valid=True)
 
     # --- control ---
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
         self.state["last_drive"] = (ly, rx)
-        print(f"[mock] drive ly={ly} rx={rx}", flush=True)
+        self.state["last_ticket"] = {"generation": generation, "epoch": epoch}
+        print(f"[mock] drive ly={ly} rx={rx} gen={generation} epoch={epoch}", flush=True)
         return {"ok": True}
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
         self.state["last_drive"] = (ly, rx)
-        print(f"[mock] move ly={ly} rx={rx} dur={duration}", flush=True)
+        self.state["last_ticket"] = {"generation": generation, "epoch": epoch}
+        print(f"[mock] move ly={ly} rx={rx} dur={duration} gen={generation} epoch={epoch}", flush=True)
         return {"ok": True}
 
     async def stop(self) -> dict[str, Any]:

@@ -259,15 +259,31 @@ class Air2NativeLink(RobotLink):
         return fs
 
     # --- control (native RTM) ---
-    async def drive(self, ly: float, rx: float) -> dict[str, Any]:
-        # ACKNOWLEDGED: ok reflects real Agora delivery (command_result), not a sidecar stdin write.
-        res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0})
+    async def drive(self, ly: float, rx: float, *, generation: int | None = None,
+                    epoch: int | None = None) -> dict[str, Any]:
+        # ACKNOWLEDGED: ok reflects real Agora delivery (command_result), not a sidecar stdin write. The motion
+        # ticket's {generation, epoch} (P0 §3) is carried so the sidecar rejects a drive whose ticket was
+        # superseded by a STOP between admission and the actual SDK send.
+        res = await asyncio.to_thread(self.rtm.send_acked, self._ticketed(
+            {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0}, generation, epoch))
         return {**res, "ly": ly, "rx": rx}
 
-    async def move(self, ly: float, rx: float, duration: float) -> dict[str, Any]:
-        res = await asyncio.to_thread(self.rtm.send_acked,
-                                      {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration})
+    async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
+                   epoch: int | None = None) -> dict[str, Any]:
+        res = await asyncio.to_thread(self.rtm.send_acked, self._ticketed(
+            {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration}, generation, epoch))
         return {**res, "ly": ly, "rx": rx, "duration": duration}
+
+    @staticmethod
+    def _ticketed(cmd: dict[str, Any], generation: int | None, epoch: int | None) -> dict[str, Any]:
+        """Stamp the admitted motion ticket onto a drive command. When the executor supplies the ticket the
+        sidecar enforces it EXACTLY (stale ticket -> rejected); when absent (legacy direct call) the RtmNode
+        falls back to its current authoritative generation/epoch."""
+        if generation is not None:
+            cmd["generation"] = int(generation)
+        if epoch is not None:
+            cmd["epoch"] = int(epoch)
+        return cmd
 
     async def stop(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "stop"})
