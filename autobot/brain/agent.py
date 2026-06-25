@@ -159,7 +159,9 @@ class AgentBrain:
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
         self._stopped = False        # master STOP parked state: reasoner/idle loops no-op until RESUME (P0-R4.2)
         self._reason_gen = 0          # reason generation: bumped on master STOP to invalidate in-flight cycles (P0-R4.6)
-        self._reason_task: Optional[asyncio.Task] = None   # the in-flight reason cycle task (cancelled on STOP)
+        # agent_next_2 §6.1: ALL active reason invocations (lock owner + any waiters), so a master STOP cancels
+        # every stale cycle — a waiter can never hide the provider-blocked lock owner. A single pointer could.
+        self._reason_tasks: set = set()
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
         # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
@@ -308,10 +310,20 @@ class AgentBrain:
             return
         if self.settings.snapshot().asleep:
             return   # go-dark: ignore all heard/typed speech until woken
+        # agent_next_2 §6.5: MIC (non-addressed) input requires LIVE Listen permission before it mutates any
+        # behavior/heard/transcript/queue state. The ONLY exception is a recognized critical STOP keyword (the
+        # safety detector), which still latches even with Listen off. Typed/addressed operator input is exempt
+        # (it is not mic listening).
         if not addressed:
             from . import audio_state
             if audio_state.is_speaking():
                 return   # echo gate: don't react to our own TTS bleeding into the mic
+            if not self.safety.check_listen(self.settings.snapshot()).effective_enabled:
+                if commands.match(text) == "STOP" and self._loop is not None:
+                    with contextlib.suppress(Exception):
+                        asyncio.run_coroutine_threadsafe(
+                            self.emergency_stop("voice STOP", cancel_tts=True, master=True), self._loop)
+                return   # Listen not permitted: ignore everything else (no state mutation)
         self.behavior.note_activity()   # someone interacted -> reset the idle-patrol timer
         self.ctx.heard.clear()
         self.ctx.heard.update({"text": text, "ts": time.time(), "speaker": speaker, "addressed": addressed})
@@ -433,11 +445,11 @@ class AgentBrain:
 
     async def stop_loop(self):
         self._running = False
-        # P0 §6: also cancel an in-flight reason cycle and the background loops, then drain the SpeechService
+        # P0 §6: also cancel in-flight reason cycles and the background loops, then drain the SpeechService
         # clear-timers + the registry's background tasks so nothing is left pending at interpreter teardown.
-        rt = self._reason_task
-        if rt is not None and not rt.done():
-            rt.cancel()
+        for rt in list(self._reason_tasks):
+            if not rt.done():
+                rt.cancel()
         for t in self._tasks:
             t.cancel()
         for t in self._tasks:
@@ -478,7 +490,11 @@ class AgentBrain:
                 s = self.settings.snapshot()
                 ready, _ = self._brain_ready(s)
                 if ready and not s.asleep:
-                    obs = await perceive(self.link, want_image=s.allow_video)
+                    # agent_next_2 §6.4: AI image intake is gated by the kernel (master STOP / See toggle). When
+                    # See is not effective we still perceive TELEMETRY (state events keep flowing) but pull NO
+                    # frame into the AI buffer. Operator preview video is a separate path and is unaffected.
+                    see_ok = self.safety.check_see(s).effective_enabled
+                    obs = await perceive(self.link, want_image=bool(s.allow_video) and see_ok)
                     self.buffer.obs = obs
                     self.buffer.telemetry = obs.telemetry
                     self.last_observation = obs
@@ -1090,9 +1106,11 @@ class AgentBrain:
         return token == self._reason_gen and not self.safety.is_master_inhibited()
 
     def _reason_guard(self, token: int, s: Settings) -> None:
-        """Raise ReasonCancelled at a side-effect boundary if the cycle is stale or Think is no longer
-        permitted (master STOP / Think toggle off / asleep). Call BEFORE every external effect."""
-        if not self._reason_alive(token) or not self.safety.check_think(s).effective_enabled:
+        """Raise ReasonCancelled at a side-effect boundary if the cycle is stale or Think is no longer permitted.
+        agent_next_2 §6.2: consult a FRESH settings snapshot (not the cycle-start one) so a Think toggle flipped
+        mid-cycle is honored immediately. Call BEFORE every external effect."""
+        live = self.settings.snapshot()
+        if not self._reason_alive(token) or not self.safety.check_think(live).effective_enabled:
             raise ReasonCancelled()
 
     async def _reason(self, trigger: str, s: Settings) -> dict:
@@ -1104,13 +1122,14 @@ class AgentBrain:
             return {"ok": False, "cancelled": True, "reason": "think inhibited (master STOP / toggle off / asleep)"}
         token = self._reason_gen
         t0 = time.perf_counter()
-        self._reason_task = asyncio.current_task()
+        task = asyncio.current_task()
+        self._reason_tasks.add(task)             # §6.1: track EVERY active invocation (owner + waiters)
         try:
             return await self._reason_inner(trigger, s, token)
         except (ReasonCancelled, asyncio.CancelledError):
             return {"ok": False, "cancelled": True, "reason": "reasoning cancelled by master STOP"}
         finally:
-            self._reason_task = None
+            self._reason_tasks.discard(task)
             self.metrics.record("reason", (time.perf_counter() - t0) * 1000.0)
 
     async def _reason_inner(self, trigger: str, s: Settings, token: int = 0) -> dict:
@@ -1597,10 +1616,10 @@ class AgentBrain:
             cur = None
             with contextlib.suppress(Exception):
                 cur = asyncio.current_task()
-            rt = self._reason_task
-            if rt is not None and rt is not cur and not rt.done():
-                with contextlib.suppress(Exception):
-                    rt.cancel()
+            for rt in list(self._reason_tasks):     # §6.1: cancel EVERY stale reason invocation, never the caller
+                if rt is not cur and not rt.done():
+                    with contextlib.suppress(Exception):
+                        rt.cancel()
             with contextlib.suppress(Exception):
                 self.settings.update(autonomy="manual")
         elif latch:

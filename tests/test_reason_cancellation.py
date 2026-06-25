@@ -66,7 +66,7 @@ async def test_master_stop_cancels_the_inflight_reason_task(tmp_path):
         await asyncio.sleep(30)
 
     task = asyncio.create_task(_long())
-    brain._reason_task = task
+    brain._reason_tasks.add(task)                    # registered like a live reason invocation
     await asyncio.sleep(0)                           # let it start
     g0 = brain._reason_gen
     await brain.emergency_stop("test", master=True)
@@ -96,17 +96,92 @@ async def test_stop_while_provider_blocked_yields_cancelled_no_drive(tmp_path, m
         raise AssertionError("provider should have been cancelled before returning")
 
     monkeypatch.setattr(agent_mod, "perceive", ready_perceive, raising=False)
+    # agent_next_2 §6.7: force the tool-calling cortex path deterministically (no VLM/omni/hybrid branch) so this
+    # test ALWAYS reaches the mocked provider — it is mandatory, never skipped.
+    monkeypatch.setattr(agent_mod, "vlm_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "omni_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "hybrid_enabled", lambda s=None: False, raising=False)
     monkeypatch.setattr(agent_mod.OpenAICompatibleClient, "chat", blocking_chat, raising=False)
 
     tick = asyncio.create_task(brain.tick(force=True))
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=10.0)  # cycle is now blocked in the provider
-    except asyncio.TimeoutError:
-        tick.cancel()
-        await asyncio.gather(tick, return_exceptions=True)     # _reason swallows the cancel -> returns a dict
-        pytest.skip("cortex provider path not reached in this configuration")
+    await asyncio.wait_for(entered.wait(), timeout=10.0)        # cycle is now blocked in the provider (mandatory)
     await brain.emergency_stop("barge-in", master=True)        # cancels the blocked task
     res = await asyncio.wait_for(tick, timeout=5.0)
     assert res.get("cancelled") is True
     # the robot never received a drive from the cancelled cycle
     assert brain.link.state.get("last_drive") in (None, (0.0, 0.0))
+
+
+class _ToolResult:
+    def __init__(self):
+        self.tool_calls = [{"id": "c1", "name": "drive", "arguments": {"direction": "forward", "duration": 0.3}}]
+        self.content = ""
+
+
+async def test_think_off_during_provider_await_cancels_before_tool(tmp_path, monkeypatch):
+    # agent_next_2 §6.2: a live Think-off mid-cycle (during the provider await) must cancel at the next boundary
+    # BEFORE the returned drive tool call executes.
+    brain, s = _brain(tmp_path)
+    import autobot.brain.agent as agent_mod
+    from autobot.brain.perception import Observation
+
+    s.update(allow_motion=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ready_perceive(link, want_image=True):
+        return Observation(telemetry={"ok": True, "connected": True, "awake": True})
+
+    async def chat(self, messages, tools=None):
+        entered.set()
+        await release.wait()
+        return _ToolResult()
+
+    monkeypatch.setattr(agent_mod, "perceive", ready_perceive, raising=False)
+    monkeypatch.setattr(agent_mod, "vlm_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "omni_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "hybrid_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod.OpenAICompatibleClient, "chat", chat, raising=False)
+
+    tick = asyncio.create_task(brain.tick(force=True))
+    await asyncio.wait_for(entered.wait(), timeout=10.0)
+    s.update(allow_think=False)          # flip Think off mid-await (no master STOP)
+    release.set()
+    res = await asyncio.wait_for(tick, timeout=5.0)
+    assert res.get("cancelled") is True
+    assert brain.link.state.get("last_drive") in (None, (0.0, 0.0))   # the drive tool never ran
+
+
+async def test_concurrent_running_and_waiting_reason_both_cancelled(tmp_path, monkeypatch):
+    # agent_next_2 §6.1: one running (provider-blocked) reason + one waiting on the lock; a master STOP cancels
+    # BOTH (a waiter must not hide the blocked owner).
+    brain, s = _brain(tmp_path)
+    import autobot.brain.agent as agent_mod
+    from autobot.brain.perception import Observation
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ready_perceive(link, want_image=True):
+        return Observation(telemetry={"ok": True, "connected": True, "awake": True})
+
+    async def blocking_chat(self, messages, tools=None):
+        entered.set()
+        await release.wait()
+        raise AssertionError("should be cancelled")
+
+    monkeypatch.setattr(agent_mod, "perceive", ready_perceive, raising=False)
+    monkeypatch.setattr(agent_mod, "vlm_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "omni_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod, "hybrid_enabled", lambda s=None: False, raising=False)
+    monkeypatch.setattr(agent_mod.OpenAICompatibleClient, "chat", blocking_chat, raising=False)
+
+    t1 = asyncio.create_task(brain.tick(force=True))     # becomes the lock owner, blocks in provider
+    await asyncio.wait_for(entered.wait(), timeout=10.0)
+    t2 = asyncio.create_task(brain.tick(force=True))     # waits on the reason lock
+    await asyncio.sleep(0.05)
+    assert len(brain._reason_tasks) >= 2                  # both tracked
+    await brain.emergency_stop("stop", master=True)
+    r1 = await asyncio.wait_for(t1, timeout=5.0)
+    r2 = await asyncio.wait_for(t2, timeout=5.0)
+    assert r1.get("cancelled") is True and r2.get("cancelled") is True

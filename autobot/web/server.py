@@ -766,16 +766,9 @@ async def api_overseer_act(req: Request):
             res = await fn(int(body.get("speed", 0)), source="overseer") if callable(fn) else \
                 {"ok": False, "error": "move_speed not supported on this link"}
     elif kind == "say":
-        if not s.talk_enabled:
-            return JSONResponse({"ok": False, "blocked": "talk disabled (UI toggle off)"})
-        text = str(body.get("text", ""))
-        pub = getattr(LINK, "publish_speech", None)
-        if pub:
-            wav = await asyncio.to_thread(tts.render_wav, text)
-            res = await pub(wav) if wav else {"ok": False, "error": "tts unavailable"}
-        else:
-            g711 = tts.render_mulaw(text)
-            res = await LINK.say_audio(g711) if g711 else await LINK.say_text(text)
+        # agent_next_2 §6.6: overseer speech goes through the unified SpeechService (check_say + cancellable on
+        # STOP/Speak-off), NOT a direct publish path.
+        res = await brain.speech.speak(str(body.get("text", "")), check_say=True, safety=brain.safety)
     else:
         return JSONResponse({"ok": False, "error": f"unknown kind '{kind}'"}, status_code=400)
     await emit({"type": "overseer_act", "kind": kind,
