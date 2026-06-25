@@ -56,6 +56,15 @@ class RtmNode:
         self.last_command_id: Optional[int] = None
         self.last_ack_ms: Optional[float] = None
         self.consecutive_send_failures = 0
+        # --- E-STOP generation reconciliation (P0-R4.4) ---
+        # AUTHORITATIVE (what Python/SafetyFloor commands): re-asserted to the sidecar on every (re)connect so a
+        # restarted sidecar can never accept motion under the wrong latch/generation. SIDECAR (echoed back in
+        # command_result) is what the Node side actually holds; a mismatch must block motion.
+        self._auth_gen = 0
+        self._auth_latched = False
+        self._sidecar_gen = 0
+        self._sidecar_latched = True   # unknown until the sidecar echoes its state -> assume NOT safe to move
+        self._last_reconcile_error: Optional[str] = None
 
     # --- lifecycle ---
     def start(self) -> None:
@@ -69,10 +78,22 @@ class RtmNode:
         self._running = False
         self._kill()
 
+    def _fail_pending(self, reason: str) -> None:
+        """Release every blocked send_acked waiter immediately (P0-R4.4) so a sidecar exit/reconnect can't
+        leave a caller hung until its timeout. The synthetic result reports a non-delivery."""
+        with self._pending_lock:
+            slots = list(self._pending.items())
+            self._pending.clear()
+        for _cid, slot in slots:
+            slot["result"] = {"ev": "command_result", "sent_to_agora": False, "error": reason}
+            slot["event"].set()
+
     def _kill(self) -> None:
         p = self._proc
         self._proc = None
         self.connected = False
+        self._sidecar_latched = True   # unknown sidecar -> assume NOT safe to move until reconciled
+        self._fail_pending("sidecar exited/reconnecting")
         if p:
             try:
                 if p.stdin:
@@ -184,10 +205,16 @@ class RtmNode:
             self.status["connected"] = True
             self._status_ts = time.monotonic()   # genuine source-update time (NOT a request time)
         elif t == "command_result":
+            # Learn the sidecar's authoritative latch/generation from every echo (P0-R4.4).
+            if ev.get("generation") is not None:
+                self._sidecar_gen = int(ev.get("generation"))
+            if ev.get("latched") is not None:
+                self._sidecar_latched = bool(ev.get("latched"))
             cid = ev.get("command_id")
             if cid is not None:
                 with self._pending_lock:
                     slot = self._pending.get(cid)
+                # Duplicate / out-of-order results find no slot (already popped) and are harmlessly ignored.
                 if slot is not None:
                     slot["result"] = ev
                     slot["event"].set()
@@ -215,6 +242,9 @@ class RtmNode:
             self.last_error = f"session not ok: {sess}"
             return
         self._send({"cmd": "connect", "session": sess})
+        # P0-R4.4: re-assert the authoritative latch+generation so a freshly (re)started sidecar — which
+        # defaults to motion-blocked — can only accept motion under the state Python actually commands.
+        self._send({"cmd": "set_control", "generation": self._auth_gen, "latched": self._auth_latched})
 
     # --- commands to the sidecar ---
     def _send(self, cmd: dict) -> bool:
@@ -247,6 +277,21 @@ class RtmNode:
     def raw(self, msg_id: int, data: dict | None = None) -> bool:
         return self._send({"cmd": "raw", "id": msg_id, "data": data or {}})
 
+    def set_control(self, generation: int, latched: bool) -> bool:
+        """Push the authoritative latch + generation to the sidecar (P0-R4.4). Stored so it is re-asserted on
+        every (re)connect."""
+        self._auth_gen = int(generation)
+        self._auth_latched = bool(latched)
+        return self._send({"cmd": "set_control", "generation": self._auth_gen, "latched": self._auth_latched})
+
+    def control_state(self) -> dict:
+        """Process vs sidecar latch/generation for the readiness surface (P0-R4.4). `synchronized` False means
+        the two disagree (e.g. a sidecar restart that hasn't been reconciled) — motion must be blocked."""
+        synced = (self._auth_gen == self._sidecar_gen) and (self._auth_latched == self._sidecar_latched)
+        return {"process_latched": self._auth_latched, "process_generation": self._auth_gen,
+                "sidecar_latched": self._sidecar_latched, "sidecar_generation": self._sidecar_gen,
+                "synchronized": synced, "last_reconcile_error": self._last_reconcile_error}
+
     # --- acknowledged commands (real Agora delivery, not pipe-write) ---
     def send_acked(self, cmd: dict, timeout: float = 1.5) -> dict:
         """Send a command and BLOCK (bounded) for the sidecar's correlated command_result, returning ACTUAL
@@ -255,6 +300,20 @@ class RtmNode:
         cid = next(self._cmd_ids)
         out = {"ok": False, "queued_to_sidecar": False, "sent_to_agora": False, "command_id": cid,
                "ack_ms": None, "rtm_connected": self.connected, "error": None}
+        # P0-R4.4: track the authoritative latch/generation as STOP/RESET flow through here, and stamp the
+        # current generation onto every drive so the sidecar can reject a STALE (pre-STOP) drive that arrives
+        # late. estop/estop_reset carry Python's authoritative generation so the sidecar adopts it.
+        kind = cmd.get("cmd")
+        if kind == "estop":
+            self._auth_latched = True
+            if cmd.get("generation") is not None:
+                self._auth_gen = int(cmd["generation"])
+        elif kind == "estop_reset":
+            self._auth_latched = False
+            if cmd.get("generation") is not None:
+                self._auth_gen = int(cmd["generation"])
+        elif kind == "drive" and "generation" not in cmd:
+            cmd = {**cmd, "generation": self._auth_gen}
         evt = threading.Event()
         with self._pending_lock:
             self._pending[cid] = {"event": evt, "result": None}
@@ -295,6 +354,7 @@ class RtmNode:
                 "last_command_id": self.last_command_id, "last_ack_ms": self.last_ack_ms,
                 "pending": pending, "consecutive_send_failures": self.consecutive_send_failures,
                 "last_ok_send": self.last_ok_send, "last_fail_send": self.last_fail_send,
+                "control_state": self.control_state(),
                 "status_age_s": round(self.status_age(), 2) if self._status_ts else None,
                 "recent_logs": list(self._logs)[-20:]}
 

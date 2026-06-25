@@ -1,109 +1,118 @@
 # FreeBo
 
-Give a configurable AI **full autonomous control** of an **Enabot EBO** robot over your LAN, with a
-lovely web UI that shows what the robot is *thinking* and *doing* in real time. Self-hosted, local-first,
-no subscription — clone it, run one script, and bring your robot alive.
+Give a configurable AI **autonomous control** of an **Enabot EBO** robot, with a web UI that shows what the
+robot is *thinking* and *doing* in real time — and a hardware-grade safety floor underneath it all.
+Self-hosted, local-first, no subscription. Bring your own robot and your own AI model.
 
 FreeBo can:
 
-- **See** — read the live camera feed (and grab still frames for the AI's vision model).
-- **Hear** — listen to the robot's microphone.
-- **Move** — drive the wheels (analog joystick, d-pad, or AI-chosen vectors).
-- **Speak** — talk through the robot's speaker (PC text-to-speech, toggleable in the UI).
-- **Emote** — control the eye lights / animations.
-- **Think** — an LLM "brain" perceives, decides, and acts in a loop, streaming its reasoning to the UI.
+- **See** — read the live camera feed and feed frames to a vision model (the EBO is camera-only — there is no
+  exposed depth/ToF, so navigation is vision-based).
+- **Hear** — listen on the robot's mic and transcribe speech (local `faster-whisper`).
+- **Move** — drive the treads (analog joystick or AI-chosen vectors), clamped by the safety floor.
+- **Speak** — talk through the robot's speaker (local Piper neural TTS, off by default, toggleable).
+- **Emote** — set the eye expressions / animations.
+- **Think** — an LLM/VLM "brain" perceives, decides, and acts in a loop, streaming its reasoning to the UI.
 
-You bring your own AI model (any **OpenAI-compatible** endpoint) and your own robot. FreeBo is provider-
-agnostic and self-hosted.
+You bring your own AI (any **OpenAI-compatible** endpoint, or a local VLM/omni model) and your own robot.
 
-> Not affiliated with Enabot or ThroughTek. See [docs/SAFETY.md](docs/SAFETY.md) and the legal note below.
+> Independent community project. **Not** affiliated with Enabot or ThroughTek. See the legal note below and
+> **[docs/SAFETY.md](docs/SAFETY.md)** before driving a real robot.
 
-## How it's put together
+## Supported robots — two very different transports
 
-FreeBo is **one app** (the `autobot/` package) that runs on a single ARM Linux box (a Raspberry Pi). The
-robot's native protocol libraries are 32-bit ARM/Android, so the app runs where they run and manages them
-as child processes — there's no separate "bridge" machine and no LAN hop between the robot link and the AI.
+FreeBo is **one app** (the `autobot/` package). Which robot you have determines how it connects:
+
+| Family | Transport | Where it runs | Link |
+|--------|-----------|---------------|------|
+| **EBO SE / Air** | **Fully local** — MAVLink over TUTK/Kalay P2P (DTLS-PSK). Needs the 32-bit ARM TUTK `.so`, so this path runs on an **ARM Linux box** (e.g. a Raspberry Pi). | Pi / ARM Linux | `NativeRobotLink` |
+| **EBO Air 2 / Max** | **Cloud** — Agora **RTM** (control) + **RTC** (media). No usable local TUTK. The `air2_native` link runs a headless Node Agora-RTM sidecar + a pure-Python `aiortc` receiver, so it needs **no proprietary `.so`** and runs on a normal **x86** box (Linux/Windows) too. | any PC | `Air2NativeLink` |
+| **none (dev)** | Fake robot, no hardware. | anywhere | `MockRobotLink` |
 
 ```
- EBO SE  ──Kalay P2P / DTLS──►  Autobot app (one Raspberry Pi)
- 192.168.1.42                   native TUTK link + agent loop + safety floor + React UI
+EBO SE / Air  ── Kalay P2P / DTLS (LAN) ─────────────┐
+                                                     ├─►  FreeBo app  ──►  web UI
+EBO Air 2     ── Agora RTM (control) + RTC (media) ──┘    agent loop + SafetyKernel
 ```
 
-| Internal layer | What it is |
-|----------------|------------|
-| [`autobot/robot/`](autobot/robot/) | The only robot-facing code. `RobotLink` contract + `NativeRobotLink` (native TUTK + ffmpeg/mediamtx + deadman) and `MockRobotLink` (hardware-free dev). |
-| [`autobot/brain/`](autobot/brain/) | The AI agent loop, provider-agnostic LLM client, the closed tool set, and the safety floor. |
+Pick the link with `AUTOBOT_ROBOT_LINK` (`native` | `native_x86` | `air2_native` | `mock`).
+
+## Internal layers
+
+| Layer | What it is |
+|-------|------------|
+| [`autobot/robot/`](autobot/robot/) | The only robot-facing code. `RobotLink` contract + `NativeRobotLink` (SE: TUTK + ffmpeg/mediamtx + deadman), `Air2NativeLink` (Air 2: Node RTM sidecar + aiortc), `MockRobotLink`. |
+| [`autobot/brain/`](autobot/brain/) | The agent loop, provider-agnostic LLM client (+ optional local VLM/omni), the curated tool set, persistent memory, and the **SafetyKernel** (central faculty authority). |
 | [`autobot/web/`](autobot/web/) + [`webui/`](webui/) | FastAPI REST + WebSocket + video proxy, serving a React + Vite + Tailwind dashboard. |
-| [`collector/`](collector/) | One-time wizard to capture your robot credentials (patched ROLA APK or PC Frida) into `.env` + `vendor/`. |
+| [`collector/`](collector/) | One-time wizard to capture robot credentials (TUTK secrets for SE, Agora cloud session for Air 2) into `.env` + `vendor/`. |
+
+## Safety (read this)
+
+This software drives a real motorized robot, so safety is **mechanical, not prompt-trust** — full reference in
+[docs/SAFETY.md](docs/SAFETY.md):
+
+- **One authority.** Every robot-affecting action passes through the SafetyKernel ([`autobot/brain/safety.py`](autobot/brain/safety.py)),
+  which decides each faculty (Think / Move / Speak / Listen / See) and clamps drive speed + duration.
+- **Master STOP / RESUME.** The big red STOP inhibits *all* autonomous faculties, latches motion, bumps a
+  control generation (so in-flight/stale drives are dropped), cancels speech, preempts the active action, and
+  drops to manual — while keeping operator video + telemetry alive. An explicit **RESUME** (`/api/resume`)
+  reconciles the link first and only then lifts the inhibit.
+- **Ability toggles** in the UI gate the live organs (turning *Move* off preempts motion; *Hear* off stops
+  STT; *Speak* off cancels TTS).
+- **Deadman, twice.** The brain only sends motion in short bursts; the link layer also stops the robot if
+  drive frames stop arriving.
 
 ## Quick start
 
-**Fastest (any OS, no robot needed yet):** clone, then run the one-command launcher — it sets up a venv,
-installs deps, builds the UI, and opens the dashboard. Off a robot box it auto-runs in mock mode.
+**No robot needed (any OS):** clone, then run the launcher — it makes a venv, installs deps, builds the UI,
+and opens the dashboard in mock mode.
 
 ```bash
-# Linux / macOS / Pi
-./start.sh
-# Windows (PowerShell)
-./start.ps1
+./start.sh      # Linux / macOS / Pi
+./start.ps1     # Windows (PowerShell)
 ```
 
-Then open `http://localhost:8200` and follow the first-run wizard.
+Open `http://localhost:8200` and follow the first-run wizard (pick your AI endpoint/key/model, set a goal).
 
-See **[docs/SETUP.md](docs/SETUP.md)** for the full guide. The short version for a real robot on a Pi:
-
-1. **Collect credentials** (once): run the collector to capture your robot's TUTK secrets. See [docs/COLLECTOR.md](docs/COLLECTOR.md).
-2. **Build + run** on the Pi:
-   ```bash
-   cp .env.example .env                       # fill in your secrets + AI key (collector can write this)
-   cp -r collector/bionic vendor/bionic
-   bash autobot/robot/native/build_bridge.sh  # build the native binary (needs the Android NDK)
-   cd webui && npm install && npm run build && cd ..
-   docker compose up -d --build
-   ```
-   Open `http://<pi-ip>:8200`, paste your AI endpoint/key/model, set a goal, and press Go.
-
-Want to try the UI and agent loop **without any hardware**? Run the same app in mock mode on any PC:
+Or run mock mode directly:
 
 ```bash
 pip install -r requirements.txt
-AUTOBOT_ROBOT_LINK=mock python -m autobot     # serves the UI + a fake robot on :8200
+AUTOBOT_ROBOT_LINK=mock python -m autobot      # UI + fake robot on :8200
 ```
 
-**Turnkey appliance image** (flash an SD card, boot, pick wifi from your phone, finish a web wizard): see
-[docs/DEPLOY.md](docs/DEPLOY.md) — built with pi-gen (via WSL2 on Windows) under [`deploy/pi-gen/`](deploy/pi-gen/).
-On first boot the wizard asks for your AI provider and suggests a **fast** model (interactions) plus a
-**heavy** model (once-a-day memory cleanup).
+### Real robot
 
-## Reproduce on another robot
+See **[docs/SETUP.md](docs/SETUP.md)** for the full guide.
 
-This repo is a lean, fully reproducible base (~1 MB, code only). To stand up FreeBo on another EBO — Air 2 in
-particular, which uses the **pure-Python** `air2_native` link (no proprietary `.so`) — follow
-**[docs/REPRO.md](docs/REPRO.md)**. In short: `pip install -r requirements.txt`, `npm install` in `webui/`,
-capture that robot's credentials with the collector (build the patched app via
-`scripts/build_collector_apk.sh` or fetch the prebuilt one with `scripts/fetch_release_assets.*`), fill
-`.env`, and run. Big binaries (the patched collector APK, optional wheelhouses) live in **GitHub Releases**,
-not git; models are fetched per-machine and never committed; secrets are per-robot.
+- **EBO Air 2 (cloud):** capture the robot's Agora cloud credentials with the onboarding/collector flow, set
+  `AUTOBOT_ROBOT_LINK=air2_native`, and ensure **Node.js** is installed (it runs the RTM sidecar). Details:
+  [docs/AIR2_CLOUD.md](docs/AIR2_CLOUD.md) + [docs/NATIVE_AIR2.md](docs/NATIVE_AIR2.md).
+- **EBO SE (LAN, on a Pi):** capture TUTK secrets ([docs/COLLECTOR.md](docs/COLLECTOR.md)), build the native
+  bridge, build the UI, then `docker compose up -d --build`. Set `AUTOBOT_ROBOT_LINK=native`.
+
+The brain uses two models: a **fast** one every tick + a **heavy** one for once-a-day memory cleanup. A
+**turnkey Raspberry Pi appliance image** (flash, boot, finish a web wizard) is in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Documentation
 
-Everything an agent (human or AI) needs to extend Autobot without re-asking is in [`docs/`](docs/) and
-[`.cursor/rules/`](.cursor/rules/):
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the full system, data flow, and component contracts.
-- [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md) — the wire protocol and bridge REST API.
-- [docs/AI_BRAIN.md](docs/AI_BRAIN.md) — the agent loop, tool/action contract, and provider config.
-- [docs/MATURITY.md](docs/MATURITY.md) — the maturity roadmap: hybrid golden path, latency/benchmark harness, durable run-state, voice routing, memory, navigation.
-- [docs/SAFETY.md](docs/SAFETY.md) — the safety floor that sits under the AI.
-- [docs/COLLECTOR.md](docs/COLLECTOR.md) — credential collection (phone + PC paths).
-- [docs/REPRO.md](docs/REPRO.md) — reproduce FreeBo on another robot (what's in git vs releases, step by step).
-- [docs/DEPLOY.md](docs/DEPLOY.md) — building + flashing the turnkey Raspberry Pi appliance image.
-- [docs/PROVENANCE.md](docs/PROVENANCE.md) — exactly what we borrowed/modified from each upstream project.
+- [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) — what exists right now (features, open blockers).
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) / [docs/ARCHITECTURE_DECISIONS.md](docs/ARCHITECTURE_DECISIONS.md) — system, data flow, key decisions.
+- [docs/SAFETY.md](docs/SAFETY.md) — the safety floor, master STOP/RESUME, faculty authority.
+- [docs/AI_BRAIN.md](docs/AI_BRAIN.md) — the agent loop, tool/action contract, provider + VLM/omni config.
+- [docs/AIR2_CLOUD.md](docs/AIR2_CLOUD.md) / [docs/NATIVE_AIR2.md](docs/NATIVE_AIR2.md) — the Air 2 cloud (Agora RTM/RTC) link.
+- [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md) — the SE wire protocol + control frames.
+- [docs/MOTION.md](docs/MOTION.md) / [docs/NAVIGATION.md](docs/NAVIGATION.md) — the measured motion model + vision-based navigation.
+- [docs/COLLECTOR.md](docs/COLLECTOR.md) / [docs/REPRO.md](docs/REPRO.md) — credential capture + reproducing on another robot.
+- [docs/DEPLOY.md](docs/DEPLOY.md) — the turnkey Raspberry Pi appliance image.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — what's next (observability → cognition → personality).
+- [docs/PROVENANCE.md](docs/PROVENANCE.md) — what was borrowed/modified from each upstream project.
 
 ## Legal & disclaimer
 
 Independent community project. **Not** affiliated with, authorized, or endorsed by Enabot or ThroughTek.
-*Enabot*, *EBO*, *ROLA*, *TUTK*, *Kalay* are trademarks of their respective owners, used nominatively only.
-No proprietary components are redistributed; you provide your own robot, credentials, and TUTK libraries
-(from a device you own and are licensed to use). Original Autobot code is MIT-licensed (see [LICENSE](LICENSE)).
-**Use at your own risk** — this software drives a real motorized robot. Read [docs/SAFETY.md](docs/SAFETY.md).
+*Enabot*, *EBO*, *ROLA*, *TUTK*, *Kalay*, *Agora* are trademarks of their respective owners, used
+nominatively only. No proprietary components are redistributed; you provide your own robot, credentials, and
+vendor libraries (from a device you own and are licensed to use). Original FreeBo code is MIT-licensed (see
+[LICENSE](LICENSE)). **Use at your own risk** — this software drives a real motorized robot. Read
+[docs/SAFETY.md](docs/SAFETY.md).

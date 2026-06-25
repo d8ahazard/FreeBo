@@ -79,14 +79,14 @@ export default function App() {
           {estopLatched ? (
             <div className="flex items-center gap-2">
               <span className="bg-bad/20 text-bad font-bold rounded-lg px-3 py-2 text-sm border border-bad animate-pulse">
-                ■ E-STOP LATCHED
+                ■ STOPPED (inhibited)
               </span>
               <button
-                onClick={() => api.estopReset()}
+                onClick={() => api.resume()}
                 className="bg-card2 border border-line text-fg rounded-lg px-3 py-2 text-sm active:scale-95 hover:border-accent/50"
-                title="Clear the latch (does NOT enable autonomy)"
+                title="RESUME: reconcile the link, lift the master inhibit, restore faculties (autonomy stays manual)"
               >
-                Reset
+                RESUME
               </button>
             </div>
           ) : (
@@ -148,7 +148,7 @@ export default function App() {
               <div className="flex flex-col gap-3">
                 <ModeBar settings={settings} save={save} />
                 <MotionReadiness brain={brain} settings={settings} t={telemetry} estopLatched={estopLatched} />
-                <AbilityToggles settings={settings} save={save} />
+                <AbilityToggles settings={settings} save={save} capabilities={brain?.capabilities} />
                 <OverseerPanel settings={settings} save={save} log={overseerLog} />
                 <HudTelemetry t={telemetry} />
                 <SlamMap />

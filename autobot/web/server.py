@@ -33,7 +33,58 @@ from . import onboarding as _onboarding
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEBUI_DIST = REPO_ROOT / "webui" / "dist"
+WEBUI_SRC = REPO_ROOT / "webui" / "src"
 FALLBACK_HTML = Path(__file__).parent / "static" / "fallback.html"
+
+
+def _git_commit() -> str:
+    """Short source commit from .git (no subprocess), for the build-provenance surface (P0-R4.8)."""
+    try:
+        head = (REPO_ROOT / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            return (REPO_ROOT / ".git" / ref).read_text(encoding="utf-8").strip()[:12]
+        return head[:12]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_BUILD_HASH_CACHE: dict = {"mtime": None, "asset": None, "sha256": None}
+
+
+def _frontend_build() -> dict:
+    """Build provenance for the served production frontend (P0-R4.8): the asset filename + a content hash of
+    the bytes we actually serve, the source commit, and a staleness flag (any webui/src file newer than the
+    built bundle). The hash is cached by index.html mtime so /api/state stays cheap."""
+    import hashlib
+    import re
+    info = {"dist_present": False, "asset": None, "asset_sha256": None,
+            "source_commit": _git_commit(), "stale": None}
+    idx = WEBUI_DIST / "index.html"
+    if not idx.exists():
+        return info
+    info["dist_present"] = True
+    try:
+        mt = idx.stat().st_mtime
+        if _BUILD_HASH_CACHE["mtime"] != mt:
+            html = idx.read_text(encoding="utf-8")
+            m = re.search(r"/assets/(index-[\w-]+\.js)", html)
+            asset = m.group(1) if m else None
+            sha = None
+            if asset:
+                p = WEBUI_DIST / "assets" / asset
+                if p.exists():
+                    sha = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+            _BUILD_HASH_CACHE.update(mtime=mt, asset=asset, sha256=sha)
+        info["asset"] = _BUILD_HASH_CACHE["asset"]
+        info["asset_sha256"] = _BUILD_HASH_CACHE["sha256"]
+        if WEBUI_SRC.exists():
+            newest = max((f.stat().st_mtime for f in WEBUI_SRC.rglob("*") if f.is_file()), default=0.0)
+            info["stale"] = newest > idx.stat().st_mtime
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
 
 app = FastAPI(title="FreeBo")
 
@@ -237,13 +288,28 @@ def _feed_imu_to_slam(t: dict) -> None:
 
 
 async def _telemetry_poller():
-    """Push telemetry to the UI ~every 1.5s, independent of the agent loop."""
+    """Push telemetry to the UI ~every 1.5s, independent of the agent loop. Also drives the capability-status
+    surface (P0-R4.6): emits the authoritative snapshot whenever it changes (a freshness threshold crossing,
+    HOLD/transport change, etc.) plus a low-rate heartbeat so a UI that missed a transition event recovers."""
+    last_caps = None
+    last_caps_emit = 0.0
     while True:
         try:
             t = await LINK.telemetry()
             await emit({"type": "telemetry", "telemetry": t})
             await _maybe_autodock(t)
             _feed_imu_to_slam(t)
+            with contextlib.suppress(Exception):
+                s = SETTINGS.snapshot()
+                motion_reason = brain.status_dict().get("motion_block_reason", "") or ""
+                snap = brain.safety.capability_snapshot(s, motion_reason=motion_reason)
+                caps = snap.get("capabilities", {})
+                key = (tuple((k, caps[k]["effective"], caps[k]["reason"]) for k in sorted(caps)),
+                       snap.get("master_inhibited"))
+                now = time.monotonic()
+                if key != last_caps or (now - last_caps_emit) >= 5.0:
+                    await emit({"type": "capabilities", **snap})
+                    last_caps, last_caps_emit = key, now
         except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(1.5)
@@ -305,6 +371,7 @@ def _state_payload() -> dict:
         },
         "setup": {"complete": s.setup_complete},
         "audio": (AUDIO_SINK.audio_status() if (AUDIO_SINK and hasattr(AUDIO_SINK, "audio_status")) else None),
+        "build": _frontend_build(),
     }
 
 
@@ -497,8 +564,14 @@ async def api_resume():
     then clears the process latch + master inhibit. Each faculty restores to its own requested toggle;
     autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
     res: dict = {}
-    with contextlib.suppress(Exception):
-        res = await LINK.estop_reset() or {}
+    gen = brain.safety.control_generation()
+    try:
+        res = await LINK.estop_reset(generation=gen) or {}
+    except TypeError:
+        with contextlib.suppress(Exception):
+            res = await LINK.estop_reset() or {}
+    except Exception:  # noqa: BLE001
+        res = {}
     acked = res.get("ok", True) if isinstance(res, dict) else True
     if not acked:
         await _emit_capabilities()
@@ -1286,6 +1359,18 @@ def _maybe_start_mqtt():
 
 def main():
     s = SETTINGS.snapshot()
+    # P0-R4.8: loudly warn when the production frontend is absent or stale (source newer than the built
+    # bundle) so we never silently serve an old UI. (Build-on-deploy lives in scripts/bootstrap.py.)
+    b = _frontend_build()
+    if not b.get("dist_present"):
+        print("[autobot] WARNING: webui/dist missing — UI not built. Run: cd webui && npm install && npm run build",
+              flush=True)
+    elif b.get("stale"):
+        print("[autobot] WARNING: webui/dist is STALE (source newer than the built bundle). Rebuild: "
+              "cd webui && npm run build", flush=True)
+    else:
+        print(f"[autobot] frontend: asset={b.get('asset')} sha256={b.get('asset_sha256')} "
+              f"src_commit={b.get('source_commit')}", flush=True)
     _maybe_start_mqtt()
     uvicorn.run(app, host=s.host, port=s.port, log_level="info")
 

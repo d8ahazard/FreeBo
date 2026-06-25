@@ -1517,8 +1517,12 @@ class AgentBrain:
         if latch or master:
             est = getattr(self.link, "estop", None)
             if est is not None:
+                gen = self.safety.control_generation()
                 try:
-                    await est()   # link-level latched hard stop (Air 2: refuse drives + zero-frame burst)
+                    await est(generation=gen)   # carry the authoritative generation (P0-R4.4)
+                except TypeError:
+                    with contextlib.suppress(Exception):
+                        await est()              # link whose estop() takes no generation kwarg
                 except Exception:  # noqa: BLE001
                     pass
         if behavior_stop:
@@ -1641,6 +1645,15 @@ class AgentBrain:
         v = self._video_age()
         if v is not None and v > getattr(s, "video_max_age_s", 2.0):
             return "stale video"
+        # P0-R4.4: a process/sidecar latch+generation mismatch (e.g. a sidecar restart not yet reconciled)
+        # must block motion until the link re-asserts the authoritative state.
+        rtm = getattr(self.link, "rtm", None)
+        if rtm is not None and hasattr(rtm, "control_state"):
+            cs = None
+            with contextlib.suppress(Exception):
+                cs = rtm.control_state()
+            if cs and not cs.get("synchronized", True):
+                return "control state reconciling (sidecar)"
         return ""
 
     def status_dict(self) -> dict:

@@ -86,8 +86,11 @@ let inst = null;        // RTM instance
 let sess = null;        // current session
 let timers = [];        // keepalive / controller refresh
 let connected = false;
-let latched = false;    // E-STOP latch: while true, ALL drive frames are refused (zero-stop still allowed)
-let generation = 0;     // control generation; bumped on E-STOP so stale in-flight drives are dropped
+// P0-R4.4: default-SAFE. A freshly (re)started sidecar refuses motion until Python re-asserts the
+// authoritative state via `set_control`/`estop_reset` on connect — so a restart can never silently re-enable
+// movement under the wrong latch/generation.
+let latched = true;     // E-STOP latch: while true, ALL drive frames are refused (zero-stop still allowed)
+let generation = 0;     // control generation; bumped on E-STOP; drives stamped with a stale generation are dropped
 
 function zeroFrame() { return { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }; }
 
@@ -121,9 +124,10 @@ async function sendRtm(id, data) {
 async function acked(c, id, data) {
   const dispatch_ts = Date.now();
   const r = await sendRtm(id, data);
+  // Every command_result echoes the sidecar's authoritative latch+generation so Python can reconcile (P0-R4.4).
   out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: c && c.cmd,
         rtm_id: id, sent_to_agora: r.ok, error: r.error, dispatch_ts, completion_ts: Date.now(),
-        rtm_connected: connected });
+        rtm_connected: connected, latched, generation });
   return r.ok;
 }
 
@@ -273,31 +277,57 @@ async function handle(c) {
     case "connect": return connect(c.session);
     case "logout": return teardown();
     case "ping": return out({ ev: "pong" });
+    case "set_control": {
+      // P0-R4.4: Python re-asserts the authoritative latch + generation (on connect / after reconcile).
+      if (c.generation != null) generation = c.generation;
+      if (c.latched != null) latched = !!c.latched;
+      if (latched) clearDrive();
+      out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "set_control",
+            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
+            rtm_connected: connected, latched, generation });
+      log("info", "control reconciled (gen " + generation + ", latched " + latched + ")");
+      return;
+    }
     case "estop": {
       // Latched emergency stop: refuse all future drive frames, kill repeat/timeout timers, and slam a burst
-      // of zero-motion frames (now + 50/100/200ms) so a stop lands even through transient send loss.
-      latched = true; generation++;
+      // of zero-motion frames (now + 50/100/200ms) so a stop lands even through transient send loss. Adopt
+      // Python's authoritative generation when supplied so the two sides stay aligned (P0-R4.4).
+      latched = true;
+      generation = (c.generation != null) ? c.generation : generation + 1;
       clearDrive();
       const z = zeroFrame();
       sendRtm(RTM_DRIVE, z);
       for (const d of [50, 100, 200]) setTimeout(() => sendRtm(RTM_DRIVE, z), d);
       out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "estop",
-            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
+            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
+            rtm_connected: connected, latched, generation });
       log("warn", "E-STOP LATCHED (gen " + generation + ")");
       return;
     }
     case "estop_reset": {
       latched = false;
+      if (c.generation != null) generation = c.generation;
       out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "estop_reset",
-            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
-      log("info", "E-STOP reset — motion permitted again");
+            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
+            rtm_connected: connected, latched, generation });
+      log("info", "E-STOP reset — motion permitted again (gen " + generation + ")");
       return;
     }
     case "drive": {
       // REFUSE motion while the E-STOP is latched (still report a correlated result so the caller learns it).
       if (latched) {
         out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
-              sent_to_agora: false, error: "estop_latched", dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected });
+              sent_to_agora: false, error: "estop_latched", dispatch_ts: Date.now(), completion_ts: Date.now(),
+              rtm_connected: connected, latched, generation });
+        return;
+      }
+      // P0-R4.4: reject a STALE drive — one stamped with a generation older than the current one (e.g. a
+      // joystick frame that was in flight across a STOP/RESET). Raw RTM 101007 cannot reach here (only `drive`
+      // does), so it cannot bypass the latch/generation either.
+      if (c.generation != null && c.generation !== generation) {
+        out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
+              sent_to_agora: false, error: "stale_generation", dispatch_ts: Date.now(), completion_ts: Date.now(),
+              rtm_connected: connected, latched, generation });
         return;
       }
       // robot frame: forward = negative ly; scale to -100..100. The robot has a drive deadman, so a single
@@ -308,7 +338,10 @@ async function handle(c) {
       // buttons:1 on EVERY frame (incl. the zero/stop frame) — confirmed by sniffing the EBO Home app: it is
       // the "controller actively engaged" flag and the robot ignores joystick frames sent with buttons:0.
       const frame = { lx: 0, ly, rx, ry: 0, buttons: 1 };
-      await acked(c, RTM_DRIVE, frame);   // ack the INITIAL frame (real Agora delivery)
+      const ok0 = await acked(c, RTM_DRIVE, frame);   // ack the INITIAL frame (real Agora delivery)
+      // P0-R4.4: if the INITIAL frame failed to send, do NOT start the 10 Hz repeat (don't sustain a stream
+      // the robot never received). A re-check of latch/generation also guards a STOP that raced the ack.
+      if (!ok0 || latched || myGen !== generation) { clearDrive(); return; }
       // Match the EBO app: it streams drive at ~10 Hz (every 100ms) while moving. 5 Hz was marginal. Each
       // repeat re-checks the latch + generation, so an E-STOP or a newer command kills this stale stream.
       driveRepeat = setInterval(() => {

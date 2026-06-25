@@ -272,13 +272,20 @@ class Air2NativeLink(RobotLink):
     async def stop(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "stop"})
 
-    async def estop(self) -> dict[str, Any]:
+    async def estop(self, generation: int | None = None) -> dict[str, Any]:
         """Latched hard stop: the sidecar refuses all further drive frames + slams a zero-frame burst, so an
-        in-flight sustained drive cannot resume. Short ack timeout (the burst is fire-and-forget regardless)."""
-        return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "estop"}, 0.8)
+        in-flight sustained drive cannot resume. Carries the authoritative generation (P0-R4.4) so the sidecar
+        adopts it and rejects stale drives. Short ack timeout (the burst is fire-and-forget regardless)."""
+        cmd: dict[str, Any] = {"cmd": "estop"}
+        if generation is not None:
+            cmd["generation"] = int(generation)
+        return await asyncio.to_thread(self.rtm.send_acked, cmd, 0.8)
 
-    async def estop_reset(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "estop_reset"}, 0.8)
+    async def estop_reset(self, generation: int | None = None) -> dict[str, Any]:
+        cmd: dict[str, Any] = {"cmd": "estop_reset"}
+        if generation is not None:
+            cmd["generation"] = int(generation)
+        return await asyncio.to_thread(self.rtm.send_acked, cmd, 0.8)
 
     async def action(self, name: str) -> dict[str, Any]:
         n = (name or "").lower()

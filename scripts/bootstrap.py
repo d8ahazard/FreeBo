@@ -62,11 +62,33 @@ def install_deps(py: str) -> None:
         pass
 
 
+def _ui_stale(dist: str) -> bool:
+    """P0-R4.8: True if any webui/src file is newer than the built bundle (a rebuild is required)."""
+    idx = os.path.join(dist, "index.html")
+    if not os.path.isfile(idx):
+        return True
+    src = os.path.join(REPO, "webui", "src")
+    if not os.path.isdir(src):
+        return False
+    built = os.path.getmtime(idx)
+    for root, _dirs, files in os.walk(src):
+        for f in files:
+            try:
+                if os.path.getmtime(os.path.join(root, f)) > built:
+                    return True
+            except OSError:
+                pass
+    return False
+
+
 def build_ui() -> None:
     dist = os.path.join(REPO, "webui", "dist")
-    if os.path.isdir(dist) and os.path.isfile(os.path.join(dist, "index.html")):
-        log("web UI already built (webui/dist).")
+    # P0-R4.8: rebuild when missing OR stale (source newer than the bundle), not only when absent.
+    if os.path.isdir(dist) and os.path.isfile(os.path.join(dist, "index.html")) and not _ui_stale(dist):
+        log("web UI already built + fresh (webui/dist).")
         return
+    if os.path.isdir(dist):
+        log("web UI is stale or incomplete — rebuilding ...")
     npm = shutil.which("npm")
     if not npm:
         log("npm not found — skipping UI build; the server will serve the fallback dashboard.")

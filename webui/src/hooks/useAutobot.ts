@@ -80,11 +80,18 @@ export function useAutobot() {
           break;
         case "estop":
           setEstopLatched(true);
-          pushFeed({ kind: "estop", text: "E-STOP LATCHED — motion blocked until reset", ts: Date.now() / 1000 });
+          setBrain((b) => (b ? { ...b, estop_latched: true, master_inhibited: true } : b));
+          pushFeed({ kind: "estop", text: "MASTER STOP — all autonomy inhibited until RESUME", ts: Date.now() / 1000 });
           break;
         case "estop_reset":
           setEstopLatched(false);
-          pushFeed({ kind: "estop", text: "E-STOP reset — motion permitted (still manual)", ts: Date.now() / 1000 });
+          setBrain((b) => (b ? { ...b, estop_latched: false, master_inhibited: false } : b));
+          pushFeed({ kind: "estop", text: "RESUMED — faculties restore to their toggles (still manual)", ts: Date.now() / 1000 });
+          break;
+        case "capabilities":
+          // P0-R4.6: fold the authoritative snapshot into brain so toggles/readiness show effective state.
+          setBrain((b) => (b ? { ...b, capabilities: e.capabilities, master_inhibited: e.master_inhibited,
+                                  control_generation: e.generation } : b));
           break;
         case "audio_status":
           setAudioStatus(e.audio);

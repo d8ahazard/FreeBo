@@ -23,6 +23,10 @@ export const api = {
   estopReset() {
     return jpost("/api/estop/reset", {});
   },
+  // P0-R4.2: the explicit operator RESUME that lifts the master STOP (reconciles the sidecar first).
+  resume() {
+    return jpost("/api/resume", {});
+  },
   sleep(on: boolean) {
     return jpost("/api/sleep", { on });
   },

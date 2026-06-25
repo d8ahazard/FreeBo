@@ -116,6 +116,14 @@ export interface SlamMap {
   frames: number;
 }
 
+export interface Capability {
+  requested: boolean;
+  effective: boolean;
+  reason: string;
+}
+// keyed by think | motion | speak | listen | ai_vision (P0-R4.6)
+export type Capabilities = Record<string, Capability>;
+
 export interface BrainStatus {
   status: string;
   error: string | null;
@@ -127,10 +135,12 @@ export interface BrainStatus {
   motion_state?: string | null;
   brain_mode?: string;
   vlm_ok?: boolean | null;
-  // motion readiness (P0-R3.2/R3.3)
+  // motion readiness (P0-R3.2/R3.3) + master inhibit + capability surface (P0-R4)
   estop_latched?: boolean;
+  master_inhibited?: boolean;
   control_generation?: number;
   hold?: boolean;
+  capabilities?: Capabilities;
   active_action?: { id: string; kind: string; state: string; result?: string | null } | null;
   video_age?: number | null;
   telemetry_age?: number | null;
@@ -168,8 +178,9 @@ export type AutobotEvent =
   | { type: "status"; status: string; error: string | null; ts: number }
   | { type: "speech"; text: string; b64: string; sr: number; ts: number }
   | { type: "error"; error: string; ts: number }
-  | { type: "estop"; ok: boolean; latched?: boolean; generation?: number }
-  | { type: "estop_reset"; ok: boolean; latched?: boolean }
+  | { type: "estop"; ok: boolean; latched?: boolean; master_inhibited?: boolean; generation?: number }
+  | { type: "estop_reset"; ok: boolean; latched?: boolean; master_inhibited?: boolean }
+  | { type: "capabilities"; master_inhibited: boolean; generation: number; capabilities: Capabilities; ts: number }
   | { type: "audio_status"; audio: AudioStatus; ts: number }
   | { type: "approval_request"; id: string; tool: string; args: Record<string, unknown>; requester: string; reason: string; ts: number }
   | { type: "approval_resolved"; id: string; approved: boolean; ts: number }
