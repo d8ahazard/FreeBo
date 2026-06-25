@@ -340,6 +340,12 @@ class RtmNode:
         out["sent_to_agora"] = bool(res.get("sent_to_agora"))
         out["ok"] = out["sent_to_agora"]
         out["error"] = res.get("error")
+        # Surface the sidecar's honest extra facts (P0-R4 item 2/4) when present, so callers report local
+        # safety vs transport independently and can validate a reset response.
+        for k in ("initial_zero_sdk_send_succeeded", "local_latch_set", "retry_count", "latched",
+                  "generation", "control_ready", "rtm_connected"):
+            if k in res:
+                out[k] = res[k]
         rec = {**out, "cmd": cmd.get("cmd")}
         if out["ok"]:
             self.last_ok_send = rec

@@ -700,22 +700,18 @@ async def api_overseer_act(req: Request):
         res = await LINK.action(f"eyes_{str(body.get('animation', 'neutral')).lower()}")
     elif kind == "connection":
         res = await LINK.connection(str(body.get("state", "start")))
-    elif kind in ("raw", "move_mode", "move_speed"):
-        # Direct RTM pokes for calibration: set the robot's own movement gear (moveMode/moveSpeed) or send an
-        # arbitrary RTM id+data. Air 2 (native RTM) only; lets us fine-tune the firmware speed instead of just
-        # the command magnitude. RTM_MOVE_MODE=103011 carries both moveMode and moveSpeed in the settings.
+    elif kind in ("move_mode", "move_speed"):
+        # P0-R4 amendment E: the robot's movement gear is a TYPED command (raw 103011 is banned). Air 2 only.
         rtm = getattr(LINK, "rtm", None)
-        raw = getattr(rtm, "raw", None)
-        if not callable(raw):
-            return JSONResponse({"ok": False, "error": "raw RTM not available on this link"})
+        send = getattr(rtm, "_send", None)
+        if not callable(send):
+            return JSONResponse({"ok": False, "error": "typed RTM not available on this link"})
         if kind == "move_mode":
-            rid, data = 103011, {"moveMode": int(body.get("mode", 0))}
-        elif kind == "move_speed":
-            rid, data = 103011, {"moveSpeed": int(body.get("speed", 0))}
+            cmd = {"cmd": "move_mode", "mode": int(body.get("mode", 0))}
         else:
-            rid, data = int(body.get("id", 0)), (body.get("data") or {})
-        ok = await asyncio.to_thread(raw, rid, data)
-        res = {"ok": bool(ok), "sent": {"id": rid, "data": data}}
+            cmd = {"cmd": "move_speed", "speed": int(body.get("speed", 0))}
+        ok = await asyncio.to_thread(send, cmd)
+        res = {"ok": bool(ok), "sent": cmd}
     elif kind == "say":
         if not s.talk_enabled:
             return JSONResponse({"ok": False, "blocked": "talk disabled (UI toggle off)"})

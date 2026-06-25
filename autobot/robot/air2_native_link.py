@@ -303,7 +303,7 @@ class Air2NativeLink(RobotLink):
             return {"ok": self.rtm.avoid(n != "avoid_off")}
         if n.startswith("laser"):
             on = n not in ("laser_off", "laser_0")
-            return {"ok": self.rtm.raw(103051, {"laser": on}), "laser": on}
+            return {"ok": self.rtm._send({"cmd": "laser", "on": on}), "laser": on}  # typed (raw 103051 banned)
         if n in ("release", "release_control"):
             return {"ok": self.rtm._send({"cmd": "release"}), "released": True}
         if n in ("resume", "resume_control"):
