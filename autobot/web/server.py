@@ -867,8 +867,12 @@ async def api_tick():
     """Run one decision cycle now (handy in manual/assist for single-stepping the AI)."""
     if SETTINGS.snapshot().asleep:
         return JSONResponse({"ok": False, "error": "asleep (wake first)"})
+    # agent_next_2 §11: while master-inhibited (STOP), Think is off — return 423 Locked, run no cycle.
+    if brain.safety.is_master_inhibited():
+        return JSONResponse({"ok": False, "inhibited": True, "error": "master STOP — reasoning inhibited"},
+                            status_code=423)
     res = await brain.tick(force=True)
-    return JSONResponse(res)
+    return JSONResponse(res, status_code=(423 if res.get("cancelled") else 200))
 
 
 @app.post("/api/chat")
@@ -882,12 +886,17 @@ async def api_chat(req: Request):
         return JSONResponse({"ok": False, "error": "empty"}, status_code=400)
     if brain.settings.snapshot().asleep:
         return JSONResponse({"ok": False, "error": "asleep (wake first)"})
+    # agent_next_2 §11: while master-inhibited, reasoning is inhibited — return 423 and mutate NO transcript/
+    # history (do not feed the message in). The operator must RESUME first.
+    if brain.safety.is_master_inhibited():
+        return JSONResponse({"ok": False, "inhibited": True, "queued": False,
+                             "error": "master STOP — reasoning inhibited; RESUME first"}, status_code=423)
     # Feed as a high-priority SPEECH event (addressed = bypasses the name gate). The event-driven reasoner
     # preempts idle wandering and replies promptly. In manual mode (no autonomous loop), run one cycle now.
     brain.feed_speech(text, speaker, addressed=True)
     if brain.settings.snapshot().autonomy != "auto":
         res = await brain.tick(force=True)
-        return JSONResponse(res)
+        return JSONResponse(res, status_code=(423 if res.get("cancelled") else 200))
     return JSONResponse({"ok": True, "queued": True})
 
 
