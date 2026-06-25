@@ -4,45 +4,65 @@ Snapshot of what exists right now. No history, no instructions — see ROADMAP.m
 PHASE0_ACCEPTANCE.md for the gates.
 
 ## Commit
-- Base: `59b7c66` ("Upgraaayd"), plus the **uncommitted P0-R4** working tree (central safety / live faculty
-  control). Run `git status` for the exact dirty set.
+- The Phase 0 software-gate work (`agent_next.md`) is COMMITTED in order: `c57b3f3` (evidence hygiene),
+  `22ed083`+`e9ae29f` (sidecar/RtmNode atomicity + identity + epoch + correlated set_control + hard-forbidden
+  raw), `eba3a5d` (motion ticket wired end-to-end), `9f04240` (reasoning cancellation), `10137a7` (readiness),
+  `8030cbd` (full-suite teardown fix), `e8c1f66` (adversarial integration tests), `38764d2` (hardware harness
+  rewrite), `6a11dda` (UI). Run `git log --oneline` for the exact set; `git status` should be clean.
 - Frontend build provenance (asset name + content sha + source commit + stale flag) is live at `GET /api/state`
-  under `build`, and printed at startup.
+  under `build`, and printed at startup. `webui/dist/` is gitignored (built on deploy).
 
-## Implemented (verified by unit tests; NOT yet hardware-validated)
-- **SafetyKernel** (`autobot/brain/safety.py`): single authority for the five faculties via
-  `check_think/check_motion/check_drive/check_say/check_listen/check_see` returning a unified
-  `FacultyDecision` (+ `capability_snapshot`). Master inhibit + E-STOP latch + control generation.
-- **Master STOP / RESUME** (`/api/estop`, `/api/resume`): STOP atomically inhibits all faculties, latches
-  motion, bumps generation, drops to manual, parks reasoning, cancels TTS, preempts the executor, and slams a
-  link-level zero burst — operator video/telemetry stay alive. RESUME reconciles the sidecar first and stays
-  inhibited if the reset is not acknowledged. Voice STOP uses the same master inhibit.
-- **Ability toggles act on live organs**: Move governs manual AND AI motion (no bypass; off preempts+stops);
-  Speak off cancels/flushes TTS; Hear off stops VAD/STT+barge-in via a kernel permission hook; Think routed
-  through the kernel.
-- **Generation reconciliation** (`rtm_node.py` + `scripts/rtm_sidecar.js`): drives carry a generation and the
-  sidecar rejects stale ones; estop/reset carry the authoritative generation; a (re)started sidecar defaults
-  motion-blocked and is re-asserted on connect; pending waiters fail on sidecar exit; a failed initial drive
-  does not start the repeat; process-vs-sidecar `control_state` is exposed and a mismatch blocks motion.
-- **Truthful motion readiness** (`agent._motion_block_reason`): blocks on master STOP, no telemetry, RTM
-  disconnected, no video frame, resting, not calibrated, HOLD, stale telemetry/video, control mismatch.
-- **Capability-status surface**: `GET /api/state` + WS `hello` + a `capabilities` WS event (change-triggered
-  + ~5s heartbeat). UI shows requested (lit toggle) vs effective (status dot + reason); header shows
-  STOP/RESUME.
-- **Truthful audio status** (`audio_sink.audio_status`): transport/requested/effective listening, vad/stt,
-  echo-gated, barge-in; `try/finally` STT, synchronized reads, OFF vs INHIBITED, no stale transcript.
-- **Overseer puppet mode** + locomotion/probe endpoints (from P0-R3): unchanged.
+## Robots / transport (explicit)
+- **EBO SE / EBO Air**: local LAN control via TUTK (Kalay P2P), MAVLink-over-RDT — `native_link.py`.
+- **EBO Air 2**: CLOUD control plane via Agora RTM/RTC through the headless Node sidecar — `air2_native_link.py`
+  + `scripts/rtm_sidecar.js`. **This path REQUIRES internet** (Agora). No verified local-only Air 2 control.
+- **EBO Max**: **unverified** — not validated against hardware.
 
-## Open blockers (Phase 0 NOT passed)
-- **Hardware not run**: the E-STOP smoke gate (R4.0) and full hardware acceptance (R4.10) have not been
-  executed on the live Air 2. Nothing here is hardware-validated.
-- **Test suite exit-hang**: the full `pytest` run still hits a cross-test asyncio/socketpair deadlock on exit
-  (a hard per-test timeout now bounds it; root cause not yet fixed). Run suites in groups for green results.
-- **R4.3 partial**: `See` off stops AI vision frame intake but explicit cancellation of in-flight vision +
-  formal operator/safety/AI frame-path separation are not done.
-- **Deterministic test matrix** (R4.9) is partially populated (`test_rtm_node.py` added); the full
-  STOP/toggle/frontend matrix is outstanding.
+## Implemented (verified by unit/integration tests; NOT hardware-validated)
+- **Central safety authority** (`autobot/brain/safety.py`): `SafetyFloor` owns a `ControlArbiter` (RLock) that
+  is the single source of truth for latch / master-inhibit / monotonic epoch+generation, tokenized STOP
+  dispatch, single-use compare-and-swap RESET admission, and motion-ticket admission/validation. Faculty
+  decisions (`check_think/check_motion/check_drive/check_say/check_listen/check_see` + `capability_snapshot`).
+  NOTE: a faculty/route audit confirms the physical DRIVE path is fully ticket-gated; non-drive effect
+  commands (dock/laser/move_mode/avoid/release/resume) carry identity but are not yet per-command
+  ticket-ENFORCED in the sidecar (tracked).
+- **Master STOP / RESUME** (`/api/estop`, `/api/resume`): STOP gets a `StopToken` (epoch,generation,dispatch
+  id), inhibits all faculties, latches motion, parks + CANCELS in-flight reasoning, cancels TTS, preempts the
+  executor, and dispatches a link-level latched E-STOP stamped with the token's own generation+epoch (honest
+  transport status). RESUME is admission-first + reconcile + single-use CAS; it stays inhibited (and re-latches
+  the sidecar) if the reset is not reconciled.
+- **Motion ticket end-to-end**: `ActionExecutor` admits a `MotionTicket` after the clamp, re-validates it
+  immediately before `link.move`, and carries {generation,epoch} to the sidecar, which rejects a drive whose
+  ticket was superseded by a STOP. Every physical drive route is ticketed (manual, overseer, calibration,
+  locomotion, go_to_place).
+- **Sidecar atomicity + identity** (`scripts/rtm_sidecar.js` + `rtm_node.py`): per-process + per-sidecar
+  instance ids; correlated, validated `set_control` (rejects stale epoch/gen; a stale set_control can never
+  unlatch after a newer STOP); `estop_reset` validates ALL preconditions before clearing the latch
+  (fail-closed); in-flight STOP blocks RESET; immutable hard-forbidden raw set (env can never widen);
+  `control_state().synchronized` requires bound instance + control_ready + matching epoch/gen/latch.
+- **Reasoning cancellation**: a per-cycle generation token + boundary guards at every side effect; the whole
+  cycle is gated on `check_think` (covers `/api/tick`, `/api/chat`, scheduled + command triggers); master STOP
+  cancels the in-flight reason task. AI captioning is gated by `check_see`.
+- **Truthful readiness** (`status_dict().readiness`): distinct fields (no generic `connected`) — rtm_connected,
+  rtc_video_connected, sidecar process/control ready, process/sidecar instance ids, process/sidecar
+  latched/epoch/generation, synchronized, stop_in_flight, reset_active, last_reconcile_error.
+- **Honest UI**: jpost surfaces HTTP status; RESUME stays stopped + shows the exact error unless reconciled;
+  STOP distinguishes inhibit vs degraded; capability heartbeat repairs the STOP banner; toggles never show an
+  ability effective before the kernel reports it.
+
+## Open blockers (Phase 0 = FAIL)
+- **Hardware not run**: the E-STOP smoke gate (R4.0) and full hardware acceptance (R4.10) have NOT been
+  executed on the live Air 2. Nothing here is hardware-validated. Hardware eligibility = NO.
+- **Non-drive effect-command ticket enforcement** in the sidecar (dock/laser/move_mode/avoid/release/resume)
+  is not complete (they carry identity + use the correlated path, but are not per-command ticket-rejected yet).
+- **Air 2 requires the Agora cloud** (internet); there is no verified local-only Air 2 control. EBO Max is
+  unverified.
+
+## Test gate
+The canonical suite `python -X faulthandler -m pytest -q -p no:recording` passes (162 passed, 3 skipped) and
+has been observed to exit 0 on three consecutive fresh runs (~62s each) with no leaked tasks / no socketpair
+hang. See PHASE0_ACCEPTANCE.md for the reproducible commands + counts and `agent_results.md` for the run log.
 
 ## How the UI is served
 `autobot/web/server.py` serves `webui/dist/index.html` + `/assets/*`. `webui/dist` is gitignored; build via
-`cd webui && npm run build` (bootstrap rebuilds when missing or stale).
+`cd webui && npm ci && npm run build` (bootstrap rebuilds when missing or stale).

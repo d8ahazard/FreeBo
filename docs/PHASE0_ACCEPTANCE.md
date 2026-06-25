@@ -1,25 +1,31 @@
 # Phase 0 — Acceptance
 
-Phase 0 passes ONLY when the physical evidence passes. Status today: **NOT PASSED** (software gates largely
-met + unit-verified; hardware gates not yet run).
+Phase 0 passes ONLY when the physical evidence passes. Status today: **FAIL** (software gates met +
+unit/integration-verified; hardware gates NOT run — hardware eligibility = NO).
 
 Raw machine-readable evidence is stored under `data/test-evidence/` (immutable summary tied to the tested
 commit). Hardware runs are joint (operator + live Air 2).
 
 ## Software gates
 
-### Test suite
-- Command (per-group, green today):
-  `python -m pytest tests/test_safety.py tests/test_rtm_node.py tests/test_action_executor.py tests/test_audio_sink.py tests/test_speech.py tests/test_bargein.py tests/test_motion.py tests/test_behavior.py tests/test_skills_core.py -q -p no:recording`
-  → 90 passed.
-- `tests/test_checks.py` (16) and `tests/test_motion.py` (10) pass individually.
-- Hard per-test timeout is wired (`pytest.ini`: `--timeout=60`, faulthandler 600s).
-- OPEN: the FULL-suite single invocation still hits a cross-test asyncio/socketpair exit-hang (now bounded by
-  the timeout, not yet root-caused). Result: PARTIAL.
+### Test suite (canonical, reproducible)
+- Canonical full suite (must exit 0 on three consecutive fresh runs):
+  `python -X faulthandler -m pytest -q -p no:recording`
+  → **162 passed, 3 skipped** in ~62s; observed clean (exit 0, no leaked tasks, no socketpair hang) on three
+  consecutive runs. Raw logs: `data/test-evidence/fullsuite_s6_v1..v3.txt` (gitignored).
+- Targeted safety/atomicity groups (all green):
+  - `pytest -q -p no:recording tests/test_safety.py tests/test_control_arbiter.py tests/test_rtm_node.py`
+  - `pytest -q -p no:recording tests/test_sidecar_protocol.py tests/test_adversarial_integration.py`
+  - `pytest -q -p no:recording tests/test_estop_endpoint.py tests/test_reason_cancellation.py tests/test_action_executor.py tests/test_hardware_harness.py`
+- Per-test timeout wired (`pytest.ini`: `--timeout=60`, faulthandler 600s).
+- The previous full-suite teardown leak (a pending `SpeechService._schedule_clear` task) is FIXED (§6,
+  `8030cbd`): tracked + cancelled on teardown; `brain.stop_loop` drains it; `RtmNode.stop` bounded-joins.
+  Result: PASS (software test gate).
 
-### Frontend deploy (R4.8)
+### Frontend deploy (R4.8 / §9)
 - `GET /api/state.build` reports asset + sha256 + source commit + stale flag; startup warns if missing/stale.
-- Verified the served bundle contains the new strings (RESUME / STOPPED (inhibited) / MASTER STOP / BLOCKED).
+- Built with `npm ci && npm run build` (tsc clean). Served entry bundle + content sha + source commit recorded
+  in `agent_results.md`.
 - Result: PASS (software).
 
 ## Hardware gates (NOT yet run — joint)
