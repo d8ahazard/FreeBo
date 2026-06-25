@@ -21,7 +21,7 @@ import os
 import time
 from collections import deque
 from dataclasses import dataclass, field as dfield
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from ..config import Settings
 from ..robot.link import RobotLink
@@ -42,6 +42,11 @@ from .safety import SafetyFloor
 from .skills import SkillContext, SkillRegistry, build_default_skills
 
 EmitFn = Callable[[dict], Awaitable[None]]
+
+class ReasonCancelled(Exception):
+    """Raised at a reason-cycle side-effect boundary when the cycle is stale (a master STOP bumped the reason
+    generation / inhibited Think) so the cycle unwinds with NO further side effects (P0 §4)."""
+
 
 MAX_TOOL_ROUNDS = 3      # model<->tool rounds allowed within a single reason cycle
 HEARD_TTL = 15.0         # ignore heard speech older than this (s)
@@ -154,6 +159,7 @@ class AgentBrain:
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
         self._stopped = False        # master STOP parked state: reasoner/idle loops no-op until RESUME (P0-R4.2)
         self._reason_gen = 0          # reason generation: bumped on master STOP to invalidate in-flight cycles (P0-R4.6)
+        self._reason_task: Optional[asyncio.Task] = None   # the in-flight reason cycle task (cancelled on STOP)
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
         # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
@@ -501,7 +507,10 @@ class AgentBrain:
             try:
                 s = self.settings.snapshot()
                 obs = self.buffer.obs
-                fresh = (not s.asleep and obs is not None and obs.has_image and s.allow_video
+                # P0 §4: AI captioning ("See" organ) is governed by the kernel — a master STOP / See toggle off
+                # halts AI vision. (Operator preview video is a separate path and is NOT gated here.)
+                see_ok = self.safety.check_see(s).effective_enabled
+                fresh = (see_ok and not s.asleep and obs is not None and obs.has_image and s.allow_video
                          and self.buffer.frame_ts > self.buffer.caption_ts)
                 if hybrid_enabled(s):
                     # Hybrid brain: the VLM is the eyes — perceive the scene for the cortex to reason over.
@@ -1062,16 +1071,38 @@ class AgentBrain:
             return {"ok": False, "error": f"brain not configured — {why}"}
         return await self._reason("manual", s)
 
+    def _reason_alive(self, token: int) -> bool:
+        """True while THIS reason cycle (identified by its captured generation token) is still the current,
+        non-inhibited cycle. False once a master STOP bumped the generation or asserted the master inhibit."""
+        return token == self._reason_gen and not self.safety.is_master_inhibited()
+
+    def _reason_guard(self, token: int, s: Settings) -> None:
+        """Raise ReasonCancelled at a side-effect boundary if the cycle is stale or Think is no longer
+        permitted (master STOP / Think toggle off / asleep). Call BEFORE every external effect."""
+        if not self._reason_alive(token) or not self.safety.check_think(s).effective_enabled:
+            raise ReasonCancelled()
+
     async def _reason(self, trigger: str, s: Settings) -> dict:
-        """Time one full reason cycle (incl. lock wait) and delegate to the real loop. See docs/MATURITY.md §2."""
+        """Time one full reason cycle (incl. lock wait) and delegate to the real loop. See docs/MATURITY.md §2.
+        Tracks the active task so a master STOP can cancel it, and turns a cancellation/staleness into a clean
+        cancelled result with no side effects (P0 §4)."""
+        # Gate the whole cycle on Think up front (covers /api/tick, /api/chat, scheduled + command triggers).
+        if not self.safety.check_think(s).effective_enabled:
+            return {"ok": False, "cancelled": True, "reason": "think inhibited (master STOP / toggle off / asleep)"}
+        token = self._reason_gen
         t0 = time.perf_counter()
+        self._reason_task = asyncio.current_task()
         try:
-            return await self._reason_inner(trigger, s)
+            return await self._reason_inner(trigger, s, token)
+        except (ReasonCancelled, asyncio.CancelledError):
+            return {"ok": False, "cancelled": True, "reason": "reasoning cancelled by master STOP"}
         finally:
+            self._reason_task = None
             self.metrics.record("reason", (time.perf_counter() - t0) * 1000.0)
 
-    async def _reason_inner(self, trigger: str, s: Settings) -> dict:
+    async def _reason_inner(self, trigger: str, s: Settings, token: int = 0) -> dict:
         async with self._reason_lock:
+            self._reason_guard(token, s)   # a STOP may have landed while we waited for the lock
             self.safety.begin_tick()
             self.ctx.flags.clear()
             self.last_tick_ts = time.time()
@@ -1081,6 +1112,7 @@ class AgentBrain:
                 self.last_observation = obs
                 self._apply_pose(obs)
                 await self.registry.on_observe(obs)
+            self._reason_guard(token, s)   # boundary: after perception + registry observe hooks
             eye_anims = obs.telemetry.get("eye_animations", [])
             await self.emit({"type": "observation", "summary": obs.text_summary(),
                              "telemetry": obs.telemetry, "ts": obs.ts})
@@ -1113,6 +1145,7 @@ class AgentBrain:
             # The modular vision brain: a light VLM sees the frame + decides a move; hearing (Whisper) and
             # speech (Piper) are handled here in the app. No monolithic model, no tool-calling LLM.
             if vlm_enabled(s):
+                self._reason_guard(token, s)   # boundary: before the VLM brain
                 try:
                     res = await self._reason_vlm(trigger, s, obs, resting)
                     self.last_error = None
@@ -1126,6 +1159,7 @@ class AgentBrain:
             # The omni brain (MiniCPM-o) path: it sees the frame, (optionally) hears, decides a move, and
             # speaks — all in one model call. No tool-calling LLM.
             if omni_enabled(s):
+                self._reason_guard(token, s)   # boundary: before the omni brain
                 try:
                     res = await self._reason_omni(trigger, s, obs, resting)
                     self.last_error = None
@@ -1151,6 +1185,7 @@ class AgentBrain:
             if roam_motion:
                 self._nav_cycle += 1
                 if self._nav_cycle % CORTEX_EVERY != 0:
+                    self._reason_guard(token, s)   # boundary: before the deterministic roam move
                     return await self._navigate_roam(trigger, s, obs)
 
             provider = OpenAICompatibleClient(s.ai_base_url, s.ai_api_key, s.ai_model)
@@ -1166,8 +1201,10 @@ class AgentBrain:
             #                 clip -> an interrupt-cascade. One say per turn = one coherent spoken line.)
             try:
                 for _round in range(MAX_TOOL_ROUNDS):
+                    self._reason_guard(token, s)   # boundary: before each provider round
                     with self.metrics.timer("provider"):
                         result = await provider.chat(messages, tools=tools)
+                    self._reason_guard(token, s)   # boundary: after the provider await (STOP may have landed)
                     # Recover tool calls from prose if the model didn't emit structured ones (small local
                     # models often do), and speak a plain-chat reply when answering speech.
                     tool_calls = result.tool_calls
@@ -1202,6 +1239,7 @@ class AgentBrain:
                         cid = tc["id"] or f"call_{i}"
                         await self.emit({"type": "tool_call", "name": tc["name"],
                                          "args": tc["arguments"], "ts": time.time()})
+                        self._reason_guard(token, s)   # boundary: before EACH tool side effect
                         if tc["name"] == "say" and spoke:
                             # Already spoke this turn — skip extra/revised says (don't cut off the playing clip).
                             res = {"ok": False, "skipped": "already spoke once this turn — do not repeat"}
@@ -1539,7 +1577,13 @@ class AgentBrain:
             tok = self.safety.begin_master_stop()
             result["epoch"], result["generation"], result["dispatch_id"] = tok.epoch, tok.generation, tok.dispatch_id
             self._stopped = True            # park: reasoner/idle loops no-op until RESUME
-            self._reason_gen += 1           # invalidate any in-flight reason cycle (P0-R4 item 9)
+            self._reason_gen += 1           # invalidate any in-flight reason cycle (P0 §4)
+            # P0 §4: actively CANCEL the in-flight reason task so a cycle blocked in a provider/VLM await is torn
+            # down promptly (the generation bump also makes it fail its next boundary guard if cancellation races).
+            rt = self._reason_task
+            if rt is not None and not rt.done():
+                with contextlib.suppress(Exception):
+                    rt.cancel()
             with contextlib.suppress(Exception):
                 self.settings.update(autonomy="manual")
         elif latch:
