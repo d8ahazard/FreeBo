@@ -1,0 +1,31 @@
+﻿{
+    "tested_code_sha":  "b445a0dca436afaddf8e6b58abaee82fe50ccefa",
+    "clean_tree_before_run":  true,
+    "command":  "python -X faulthandler -m pytest -q -p no:recording",
+    "platform":  "win32",
+    "node_version":  "v22.16.0",
+    "python_version":  "Python 3.10.11",
+    "result":  "210 passed, 2 skipped",
+    "exit_codes":  [
+                       0,
+                       0,
+                       0
+                   ],
+    "consecutive_clean_runs":  3,
+    "node_child_process_tests":  "executed (Node v22.16 present)",
+    "skipped":  [
+                    "tests/test_hardware.py::needs --hardware (x2)"
+                ],
+    "frontend":  {
+                     "entry_js":  "assets/index-BH4iPHqj.js",
+                     "entry_js_sha256":  "AE369BD48C8477647BAC95D6D2341FDB99DB396D9C666CF476DFBCBE6C3A75EC",
+                     "entry_css":  "assets/index-gSsarUf9.css",
+                     "entry_css_sha256":  "78ACDB5059F2208F7291DEA7F659759484D0BA0F4FC1D0C89459508B037F7FB5",
+                     "index_html_sha256":  "C03E887A9132F251C22F882D6C8753AAE8C442BF6F560F799D37C5C1DBE5F137"
+                 },
+    "raw_outputs":  {
+                        "fullsuite_run1.txt":  "F694421502097314344D928C265C541148E3CD927F73579E43DAA8B0CFA8F88D",
+                        "fullsuite_run2.txt":  "1C8DED289DC28DB0A04A0704CEC5405457A739E2E2D13F58E23929F855912B84",
+                        "fullsuite_run3.txt":  "340F06EEF83262DD5844FF8058C506E1549B91B67B9C15DD428D1F8B40A49570"
+                    }
+}

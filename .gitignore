@@ -10,7 +10,8 @@ collector/captured/
 **/captured_secrets.json
 
 # ---- Runtime data: memory + enrolled faces + downloaded voices (personal/large; keep local) ----
-data/
+# Ignore data/ CONTENTS (not the dir itself) so committed software test-evidence under it can be re-included.
+/data/*
 
 # ---- Large binaries / app packages (never publish; user supplies their own) ----
 *.apk
@@ -69,8 +70,9 @@ Thumbs.db
 /tc_*.txt
 /checks_out.txt
 /checks_err.txt
-# raw test-evidence logs (summarized in agent_results.md). Committed software-run evidence lives under
-# data/test-evidence/software/<sha>/ (NOT ignored); transient root-run logs elsewhere are ignored.
+# Committed software-run evidence lives under data/test-evidence/software/<sha>/ — re-include the parent chain
+# (git can't re-include a child if a parent dir stays excluded), then ignore everything else under it.
+!/data/test-evidence/
 /data/test-evidence/*
 !/data/test-evidence/software/
 /tmp/
