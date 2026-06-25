@@ -342,17 +342,22 @@ class AgentBrain:
             pass
 
     async def _handle_critical_async(self, intent: str) -> None:
-        """Apply a barge-in command immediately: cancel our own TTS, preempt + stop the robot, then run the
-        command. The clock for this started at the detected keyword (in the worker), not at utterance endpoint."""
-        # P0-R4 item 5: barge-in STOP is the SAME master STOP path; barge-in QUIET only hushes (cancel TTS,
-        # not a master inhibit).
-        is_stop = str(intent).lower() == "stop"
-        await self.emergency_stop(f"barge-in {intent}", cancel_tts=True, master=is_stop)
-        try:
-            s = self.settings.snapshot()
-            await self._apply_command(intent, "", s)   # STOP -> hold position; QUIET -> hush window
-        except Exception:  # noqa: BLE001
-            pass
+        """Apply a barge-in command immediately. The clock started at the detected keyword (in the worker).
+        P0-R4 item 8: call the master STOP EXACTLY ONCE for STOP (do NOT also route through _apply_command,
+        which would re-enter the stop). QUIET is speech-only — cancel TTS + open a hush window, and never call
+        emergency_stop (it would needlessly preempt the motion executor)."""
+        if str(intent).lower() == "stop":
+            await self.emergency_stop("barge-in STOP", cancel_tts=True, master=True)   # ONCE
+            with contextlib.suppress(Exception):
+                await self.emit({"type": "thought", "text": "(barge-in STOP — inhibited until RESUME)",
+                                 "ts": time.time()})
+            return
+        # QUIET: hush only.
+        from . import audio_state
+        with contextlib.suppress(Exception):
+            audio_state.cancel()
+        with contextlib.suppress(Exception):
+            await self._apply_command(intent, "", self.settings.snapshot())
 
     def on_visual_loom(self, stages: dict) -> None:
         """Called from the VisualReflex WORKER thread when the camera shows something looming. Thread-safe
@@ -1522,18 +1527,22 @@ class AgentBrain:
         Returns a STRUCTURED result (never swallowed) so callers can report local safety state and transport
         dispatch INDEPENDENTLY (P0-R4 item 1 + amendment A): `local_inhibit_asserted`, `local_motion_latched`,
         `executor_preempted`, `transport_dispatch_succeeded`, `transport_result`, `generation`, `error`."""
-        result = {"reason": reason, "master": master, "latch": latch,
+        result = {"reason": reason, "master": master, "latch": latch, "epoch": None,
                   "local_inhibit_asserted": False, "local_motion_latched": False,
                   "executor_preempted": False, "transport_dispatch_succeeded": False,
                   "transport_result": None, "generation": self.safety.control_generation(), "error": None}
         if master:
-            self.safety.master_inhibit()    # inhibit all faculties + latch motion + bump generation
+            # P0-R4 atomicity item 1: ONE synchronous begin_master_stop() asserts inhibit+latch and ALWAYS
+            # advances epoch+generation. The endpoint must NOT also call master_inhibit() — this is the single
+            # transition. estop_in_flight is set here and cleared after the transport dispatch below.
+            tok = self.safety.begin_master_stop()
+            result["epoch"] = tok["epoch"]
             self._stopped = True            # park: reasoner/idle loops no-op until RESUME
-            self._reason_gen += 1           # invalidate any in-flight reason cycle (P0-R4 item 6)
+            self._reason_gen += 1           # invalidate any in-flight reason cycle (P0-R4 item 9)
             with contextlib.suppress(Exception):
                 self.settings.update(autonomy="manual")
         elif latch:
-            self.safety.estop_latch()       # sync; sets the gate immediately (server also latches before await)
+            self.safety.estop_latch()       # motion-only latch (reflex/barge-in); monotonic
         result["local_inhibit_asserted"] = (self.safety.is_master_inhibited() if master
                                             else self.safety.is_latched())
         result["local_motion_latched"] = self.safety.is_latched()
@@ -1555,16 +1564,23 @@ class AgentBrain:
                 result["transport_dispatch_succeeded"] = _link_transport_ok(tr)
             except Exception as e:  # noqa: BLE001
                 result["error"] = f"estop: {type(e).__name__}: {e}"
+            finally:
+                if master:
+                    # Dispatch recorded -> clear the in-flight flag so a subsequent RESET CAS can proceed
+                    # (a NEW stop in the meantime advanced the epoch and will still fail the old reset).
+                    self.safety.end_estop_dispatch()
         if behavior_stop:
             with contextlib.suppress(Exception):
                 self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
         return result
 
     def resume(self) -> None:
-        """RESUME (operator): clear the master faculty inhibit + parked state. The caller (server) MUST have
-        reconciled the link/sidecar latch+generation first and cleared the motion latch via estop_reset()."""
+        """RESUME (operator): clear the parked state. The caller MUST have already committed the reconciled
+        reset (safety.commit_reset succeeded), which is what released the master inhibit + motion latch."""
         self._stopped = False
-        self.safety.master_release()
+        self._reason_gen += 1   # ensure any cycle parked during STOP cannot resurface post-RESUME
+        # NOTE: the master inhibit + motion latch were already released by safety.commit_reset() (the CAS).
+        # resume() does NOT unconditionally release — that would bypass the reconciliation.
 
     # --- always-respected voice commands ---
     async def _apply_command(self, intent: str, text: str, s: Settings) -> None:

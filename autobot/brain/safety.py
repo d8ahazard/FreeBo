@@ -6,8 +6,10 @@ bypass or change. See docs/SAFETY.md and .cursor/rules/30-safety.mdc.
 from __future__ import annotations
 
 import math
+import threading
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 from ..config import Settings
 
@@ -28,6 +30,86 @@ class Decision:
     ly: float = 0.0
     rx: float = 0.0
     duration: float = 0.0
+
+
+@dataclass
+class ResetToken:
+    """A compare-and-swap snapshot captured when a RESET begins (P0-R4 atomicity). The reset may commit only
+    if the arbiter's (epoch, generation) are STILL these values when the sidecar response arrives — so a newer
+    STOP (which advanced the epoch) makes the old reset fail, even if the system was already inhibited."""
+    reset_attempt_id: int
+    epoch: int
+    generation: int
+
+
+class ControlArbiter:
+    """The ONE process-side control-transition authority (P0-R4 atomicity amendment). Every STOP / RESET /
+    reconnect / drive-admission consults this single RLock-protected object so latch + generation + epoch
+    transitions are atomic and monotonic. STOP always advances the transition epoch AND generation (idempotent
+    STATE is fine; idempotent transition IDENTITY is not). Observed-sidecar state lives in the link layer
+    (RtmNode); the arbiter owns the DESIRED state + the instance check is done link-side."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.transition_epoch = 0
+        self.desired_generation = 0
+        self.desired_latched = False
+        self.master_inhibited = False
+        self.estop_in_flight = False
+        self._reset_attempt = 0
+
+    def begin_master_stop(self) -> dict:
+        """STOP: assert local inhibit + motion latch, ALWAYS advance epoch + generation (even if already
+        inhibited), mark an E-STOP dispatch in flight. Returns the exact {generation, epoch} the caller must
+        stamp on the transport command. The single synchronous entry for every STOP source."""
+        with self._lock:
+            self.transition_epoch += 1
+            self.desired_generation += 1
+            self.desired_latched = True
+            self.master_inhibited = True
+            self.estop_in_flight = True
+            return {"generation": self.desired_generation, "epoch": self.transition_epoch}
+
+    def latch_motion(self) -> dict:
+        """Motion-only latch (non-master reflex/barge-in). Still monotonic in epoch + generation."""
+        with self._lock:
+            self.transition_epoch += 1
+            self.desired_generation += 1
+            self.desired_latched = True
+            return {"generation": self.desired_generation, "epoch": self.transition_epoch}
+
+    def end_estop_dispatch(self) -> None:
+        with self._lock:
+            self.estop_in_flight = False
+
+    def begin_reset(self) -> ResetToken:
+        with self._lock:
+            self._reset_attempt += 1
+            return ResetToken(self._reset_attempt, self.transition_epoch, self.desired_generation)
+
+    def commit_reset(self, token: ResetToken) -> bool:
+        """CAS: clear the desired latch/inhibit ONLY if no transition happened since the reset began and no
+        E-STOP dispatch is in flight. A newer STOP (advanced epoch) makes this fail."""
+        with self._lock:
+            if self.estop_in_flight:
+                return False
+            if token.epoch != self.transition_epoch or token.generation != self.desired_generation:
+                return False
+            self.desired_latched = False
+            self.master_inhibited = False
+            return True
+
+    def force_clear(self) -> None:
+        """Unconditional unlatch/release (simple links / mock with no sidecar to reconcile)."""
+        with self._lock:
+            self.desired_latched = False
+            self.master_inhibited = False
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"transition_epoch": self.transition_epoch, "desired_generation": self.desired_generation,
+                    "desired_latched": self.desired_latched, "master_inhibited": self.master_inhibited,
+                    "estop_in_flight": self.estop_in_flight}
 
 
 @dataclass
@@ -55,12 +137,9 @@ class SafetyFloor:
         # Latched emergency stop (P0-R3.2): a STATE, not a one-shot. While latched, EVERY motion source is
         # rejected (ai/recovery/manual/overseer) until an explicit reset. Bumping the control generation on
         # latch lets the sidecar drop any in-flight/stale drive frames from before the stop.
-        self._estop_latched = False
-        self._control_generation = 0
-        # Master autonomous-faculty inhibit (P0-R4.2): set by STOP, cleared by RESUME. While set, EVERY
-        # autonomous faculty (think/motion/speak/listen/see) is denied. Distinct from the motion latch (which
-        # STOP also sets): RESUME clears this only after the link/sidecar latch+generation are reconciled.
-        self._master_inhibited = False
+        # The single control-transition authority (P0-R4 atomicity). All latch/inhibit/generation/epoch state
+        # lives here so STOP/RESET/drive-admission transitions are atomic + monotonic.
+        self.arb = ControlArbiter()
 
     def begin_tick(self):
         self._tick_start = time.monotonic()
@@ -85,10 +164,10 @@ class SafetyFloor:
         they bypass the AI motion/autonomy/rate gates but still cannot exceed the speed/duration caps (the
         speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
         # Master STOP inhibit + latched E-STOP are the hardest gates — they block EVERY source
-        # (manual/overseer included). Nothing moves until RESUME reconciles + /api/estop/reset clears it.
-        if self._master_inhibited:
+        # (manual/overseer included). Nothing moves until RESUME reconciles + clears it.
+        if self.arb.master_inhibited:
             return Decision(False, "master_inhibited (STOP)")
-        if self._estop_latched:
+        if self.arb.desired_latched:
             return Decision(False, "estop_latched")
         ai = source in ("ai", "recovery")
         if ai and not getattr(s, "allow_motion", True):
@@ -114,46 +193,57 @@ class SafetyFloor:
 
     # --- latched emergency stop ---
     def estop_latch(self) -> int:
-        """Latch the emergency stop (blocks all motion) and bump the control generation. Returns the new
-        generation so the caller can invalidate older in-flight drive commands."""
-        self._estop_latched = True
-        self._control_generation += 1
-        return self._control_generation
+        """Motion-only latch (reflex/barge-in). Bumps generation + epoch via the arbiter. Returns generation."""
+        return self.arb.latch_motion()["generation"]
+
+    # --- the single STOP/RESET transition entries (P0-R4 atomicity) ---
+    def begin_master_stop(self) -> dict:
+        """The ONE synchronous master-STOP transition: assert inhibit+latch, advance epoch+generation ALWAYS,
+        mark dispatch in flight. Returns {generation, epoch} to stamp on the transport command."""
+        return self.arb.begin_master_stop()
+
+    def end_estop_dispatch(self) -> None:
+        self.arb.end_estop_dispatch()
+
+    def begin_reset(self) -> ResetToken:
+        return self.arb.begin_reset()
+
+    def commit_reset(self, token: ResetToken) -> bool:
+        return self.arb.commit_reset(token)
+
+    def transition_epoch(self) -> int:
+        return self.arb.transition_epoch
 
     def estop_reset(self) -> None:
-        """Clear the latch so motion is PERMITTED again (does NOT, by itself, enable autonomous movement)."""
-        self._estop_latched = False
+        """Unconditional unlatch/release (simple links / mock). The reconciled CAS path is begin_reset/
+        commit_reset; use that with a sidecar."""
+        self.arb.force_clear()
 
     def is_latched(self) -> bool:
-        return self._estop_latched
+        return self.arb.desired_latched
 
     def control_generation(self) -> int:
-        return self._control_generation
+        return self.arb.desired_generation
 
     # --- master autonomous-faculty inhibit (STOP/RESUME) ---
     def master_inhibit(self) -> int:
-        """STOP: inhibit ALL autonomous faculties, latch motion, and bump the control generation so the
-        sidecar drops any stale in-flight drives. Returns the new generation. Idempotent: the generation
-        bumps once per STOP event (on the transition into inhibited), so calling it twice in one STOP is safe."""
-        if not self._master_inhibited:
-            self._control_generation += 1
-        self._master_inhibited = True
-        self._estop_latched = True
-        return self._control_generation
+        """Back-compat alias for begin_master_stop(); returns the new generation. Prefer begin_master_stop()
+        which returns the epoch too. STOP always advances epoch + generation (one transition identity)."""
+        return self.arb.begin_master_stop()["generation"]
 
     def master_release(self) -> None:
-        """RESUME: clear the master faculty inhibit. The caller MUST have reconciled the link/sidecar
-        latch+generation first; the motion latch is cleared separately via estop_reset()."""
-        self._master_inhibited = False
+        """RESUME: clear the master faculty inhibit. Callers should prefer commit_reset() (CAS); this is the
+        unconditional release used after a validated reconciliation."""
+        self.arb.force_clear()
 
     def is_master_inhibited(self) -> bool:
-        return self._master_inhibited
+        return self.arb.master_inhibited
 
     # --- central faculty authority (P0-R4.1) ---
     def _faculty(self, capability: str, requested: bool, s: Settings,
                  extra_reason: str = "") -> FacultyDecision:
         """Common faculty decision: master inhibit > asleep > requested toggle > faculty-specific extra."""
-        if self._master_inhibited:
+        if self.arb.master_inhibited:
             eff, reason = False, "master STOP"
         elif getattr(s, "asleep", False):
             eff, reason = False, "asleep"
@@ -164,8 +254,8 @@ class SafetyFloor:
         else:
             eff, reason = True, ""
         return FacultyDecision(allowed=eff, capability=capability, reason=reason,
-                               master_inhibited=self._master_inhibited, requested_enabled=requested,
-                               effective_enabled=eff, generation=self._control_generation, ts=time.time())
+                               master_inhibited=self.arb.master_inhibited, requested_enabled=requested,
+                               effective_enabled=eff, generation=self.arb.desired_generation, ts=time.time())
 
     def check_think(self, s: Settings) -> FacultyDecision:
         return self._faculty(CAP_THINK, bool(getattr(s, "allow_think", True)), s)
@@ -186,8 +276,8 @@ class SafetyFloor:
         means: requested + not master/asleep/latched + autonomy permits AI motion + scope not hold."""
         requested = bool(getattr(s, "allow_motion", True))
         extra = ""
-        if not self._master_inhibited and not getattr(s, "asleep", False) and requested:
-            if self._estop_latched:
+        if not self.arb.master_inhibited and not getattr(s, "asleep", False) and requested:
+            if self.arb.desired_latched:
                 extra = "estop_latched"
             elif not self.autonomy_allows_motion(s):
                 extra = f"autonomy '{s.autonomy}'"
@@ -209,8 +299,8 @@ class SafetyFloor:
             # The faculty view says OK but the agent found a richer blocker (stale telem/video, etc.).
             caps[CAP_MOTION]["effective"] = False
             caps[CAP_MOTION]["reason"] = motion_reason
-        return {"master_inhibited": self._master_inhibited, "generation": self._control_generation,
-                "capabilities": caps, "ts": time.time()}
+        return {"master_inhibited": self.arb.master_inhibited, "generation": self.arb.desired_generation,
+                "transition_epoch": self.arb.transition_epoch, "capabilities": caps, "ts": time.time()}
 
     def set_quiet(self, seconds: float) -> None:
         """'Shut up' — drop `say` for this many seconds (a temporary hush, distinct from the talk toggle)."""
@@ -220,7 +310,7 @@ class SafetyFloor:
         return time.time() < self._quiet_until
 
     def check_say(self, s: Settings) -> Decision:
-        if self._master_inhibited:
+        if self.arb.master_inhibited:
             return Decision(False, "master_inhibited (STOP)")
         if getattr(s, "asleep", False):
             return Decision(False, "asleep")

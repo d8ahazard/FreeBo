@@ -550,8 +550,9 @@ async def api_estop():
     Returns INDEPENDENT facts (never overloading `ok`): `ok` is the success of the whole requested operation
     (i.e. transport actually dispatched). Local inhibit/latch are reported separately and remain set on EVERY
     failure. The response is degraded (HTTP 503) when the link E-STOP did not dispatch."""
-    gen = brain.safety.master_inhibit()     # set the gate NOW, before awaiting anything (local, synchronous)
-    SETTINGS.update(autonomy="manual")
+    # P0-R4 atomicity item 1: a SINGLE master-STOP transition lives inside emergency_stop()'s begin_master_stop;
+    # the endpoint must NOT separately call master_inhibit() (that would double-advance the epoch). The gate is
+    # asserted synchronously at the top of emergency_stop before its first await.
     res = await brain.emergency_stop("estop", cancel_tts=True, master=True)
     local_inhibit = brain.safety.is_master_inhibited()
     local_latched = brain.safety.is_latched()
@@ -561,7 +562,11 @@ async def api_estop():
         "local_inhibit_asserted": local_inhibit,
         "local_motion_latched": local_latched,
         "transport_dispatch_succeeded": transport_ok,
-        "generation": gen,
+        "generation": res.get("generation"),
+        "transition_epoch": res.get("epoch"),
+        # P0-R4 item 10: preserve the FULL nested transport result (command id, timestamps, initial-zero send,
+        # retry count, rtm state, sidecar instance, generation, epoch, error) — a Boolean can't prove delivery.
+        "transport_result": res.get("transport_result"),
         "error": None if transport_ok else (res.get("error") or "link E-STOP not dispatched"),
     }
     await emit({"type": "estop", **payload, "latched": local_latched, "master_inhibited": local_inhibit})
@@ -578,21 +583,22 @@ async def api_resume():
     then clears the process latch + master inhibit. Each faculty restores to its own requested toggle;
     autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
     res: dict = {}
-    gen = brain.safety.control_generation()
-    # The contract is normalized: every link's estop_reset accepts `generation`. Any exception fails CLOSED.
+    # P0-R4 atomicity item 2: RESET is a compare-and-swap. Capture (epoch, generation) NOW; reconcile the
+    # link/sidecar; then commit the desired unlatch ONLY if no transition happened meanwhile (a newer STOP
+    # advances the epoch and makes this reset fail, even if the system was already inhibited).
+    token = brain.safety.begin_reset()
     try:
-        res = await LINK.estop_reset(generation=gen) or {}
+        res = await LINK.estop_reset(generation=token.generation) or {}
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    # P0-R4 item 4: fail CLOSED — default False if `ok` is missing/malformed. Process state stays latched +
-    # inhibited unless the link reported a fully-validated reconciliation.
-    acked = bool(res.get("ok", False)) if isinstance(res, dict) else False
-    if not acked:
+    link_ok = bool(res.get("ok", False)) if isinstance(res, dict) else False
+    committed = link_ok and brain.safety.commit_reset(token)   # CAS: fails if a newer STOP intervened
+    if not committed:
         await _emit_capabilities()
-        return JSONResponse({"ok": False, "error": res.get("error") or "reset not reconciled; still inhibited",
-                             "reconcile": res}, status_code=409)
-    brain.safety.estop_reset()              # clear motion latch only after link reconciliation succeeded
-    brain.resume()                          # clear master inhibit + parked state
+        reason = (res.get("error") if not link_ok else "superseded by a newer STOP (epoch advanced)") \
+            or "reset not reconciled; still inhibited"
+        return JSONResponse({"ok": False, "error": reason, "reconcile": res}, status_code=409)
+    brain.resume()                          # clear parked state (latch+inhibit already released by the CAS)
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})
     await _emit_capabilities()
