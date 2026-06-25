@@ -1,0 +1,165 @@
+{
+  "schema": "freebo.rehearsal_report",
+  "schema_version": 1,
+  "software_sha": "48396440a58bc22ad68e01b5427ad730e095a932",
+  "generated_utc": "2026-06-25T22:39:04.238454+00:00",
+  "components": "mock link + real Node FAKE sidecar only (no cloud, no hardware)",
+  "node_available": true,
+  "scenario_count": 12,
+  "passed": 12,
+  "hardware_run": false,
+  "physical_acceptance": false,
+  "ready_for_supervised_R4_0": true,
+  "reasons_not_ready": [],
+  "scenarios": [
+    {
+      "scenario": "01 startup + sidecar bind/sync",
+      "ok": true,
+      "events": [
+        "sidecar_ready"
+      ],
+      "reconciled": true
+    },
+    {
+      "scenario": "02 admitted motion via fake transport",
+      "ok": true,
+      "events": [
+        "acknowledgement_received",
+        "command_result",
+        "queued_to_sidecar",
+        "acknowledgement_received",
+        "command_result",
+        "queued_to_sidecar"
+      ],
+      "sent_to_agora": true
+    },
+    {
+      "scenario": "03 master STOP during active drive",
+      "ok": true,
+      "events": [
+        "estop"
+      ],
+      "latched": true
+    },
+    {
+      "scenario": "04 failed initial E-STOP send",
+      "ok": true,
+      "events": [
+        "estop(degraded)"
+      ],
+      "initial_zero_sdk_send_succeeded": false
+    },
+    {
+      "scenario": "10 sidecar replacement/reconnect",
+      "ok": true,
+      "events": [
+        "sidecar_shutdown",
+        "sidecar_ready"
+      ],
+      "rebound": true
+    },
+    {
+      "scenario": "05 stop then two-phase resume",
+      "ok": true,
+      "events": [
+        "master_stop",
+        "estop_dispatch",
+        "resume",
+        "resume",
+        "resume"
+      ],
+      "missing": [],
+      "ordered": true,
+      "terminal_ok": true,
+      "correlation_id": null,
+      "incident_id": "0a197e6254104d28bcf2567e6dcf594c",
+      "event_count": 5
+    },
+    {
+      "scenario": "06 reset invalidated by newer stop",
+      "ok": true,
+      "events": [
+        "master_stop",
+        "estop_dispatch",
+        "reset_invalidated"
+      ],
+      "missing": [],
+      "ordered": true,
+      "terminal_ok": true,
+      "correlation_id": null,
+      "incident_id": "3dc2f994fa9b422aa12ca89eb274a0ad",
+      "event_count": 3,
+      "finalize_rejected": true
+    },
+    {
+      "scenario": "07 reason cancelled during provider wait",
+      "ok": true,
+      "events": [
+        "lock_wait_started",
+        "started",
+        "provider_wait_started",
+        "cancelled"
+      ],
+      "missing": [],
+      "ordered": true,
+      "terminal_ok": true,
+      "correlation_id": "reason-gen3",
+      "incident_id": null,
+      "event_count": 4,
+      "no_completed": true
+    },
+    {
+      "scenario": "08 speech render/publish then cancelled",
+      "ok": true,
+      "events": [
+        "requested",
+        "render_started",
+        "render_completed",
+        "publish_started",
+        "publish_completed",
+        "playback_started"
+      ],
+      "missing": [],
+      "ordered": true,
+      "terminal_ok": true,
+      "correlation_id": "speech-1",
+      "incident_id": null,
+      "event_count": 6,
+      "cancel_seen": false
+    },
+    {
+      "scenario": "09 vision stale result discarded",
+      "ok": true,
+      "events": [
+        "frame_selected",
+        "request_started",
+        "stale_result_discarded"
+      ],
+      "missing": [],
+      "ordered": true,
+      "terminal_ok": true,
+      "correlation_id": "vision-1",
+      "incident_id": null,
+      "event_count": 3,
+      "discarded_returned_empty": true
+    },
+    {
+      "scenario": "11 journal queue pressure + persistence failure",
+      "ok": true,
+      "events": [
+        "queue_dropped",
+        "persist_failed"
+      ],
+      "queue_dropped": 36,
+      "persist_failed": 1
+    },
+    {
+      "scenario": "12 clean shutdown + restart recovery",
+      "ok": true,
+      "events": [
+        "journal_recovered"
+      ],
+      "recovered": 21
+    }
+  ]
+}

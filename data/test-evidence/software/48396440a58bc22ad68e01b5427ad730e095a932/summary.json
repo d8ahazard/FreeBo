@@ -1,0 +1,55 @@
+{
+  "directive": "agent_next_5 (preflight gate, S2)",
+  "tested_code_sha": "48396440a58bc22ad68e01b5427ad730e095a932",
+  "environment": {
+    "os": "win32 (Windows 10.0.26200)",
+    "python": "3.10.11",
+    "node": "v22.16.0"
+  },
+  "focused_groups": {
+    "command": "pytest -q -p no:recording test_authority_audit test_api_contract test_observability test_observability_api test_hardware_harness test_rtm_node test_sidecar_protocol",
+    "passed": 92,
+    "exit_code": 0,
+    "real_node_child_tests_ran": true
+  },
+  "full_suite": {
+    "command": "python -X faulthandler -m pytest -q -p no:recording",
+    "passed": 260,
+    "skipped": 2,
+    "failed": 0,
+    "exit_code": 0,
+    "duration_s": 87.61,
+    "skipped_tests": [
+      "tests/test_hardware.py::(needs --hardware + a running app) [1]",
+      "tests/test_hardware.py::(needs --hardware + a running app) [2]"
+    ],
+    "raw_log": "fullsuite.txt"
+  },
+  "rehearsal": {
+    "command": "python scripts/phase1_rehearsal.py",
+    "components": "mock link + real Node FAKE sidecar only (no cloud, no hardware)",
+    "scenarios": 12,
+    "passed": 12,
+    "hardware_run": false,
+    "ready_for_supervised_R4_0": true,
+    "report": "rehearsal/rehearsal_report.json"
+  },
+  "frontend_build": {
+    "command": "npm ci && npm run build",
+    "tsc_clean": true,
+    "exit_code": 0,
+    "note": "byte-identical to agent_next_4 (no webui changes in agent_next_5)",
+    "entry_js": "assets/index-BR_lsTOm.js",
+    "entry_js_sha256": "FA856A1B887E068076E8ECF4A1D4FEE7671F18D164215D5759AA9497FADEE91B",
+    "css": "assets/index-BfsfA-T8.css",
+    "css_sha256": "85C8A1DB3716BA29103596CF06CEE1ABBC9C350D3D1EF95DBBEF5EB50CE03AE7",
+    "index_html_sha256": "BBF1B84DA0B6EEE1D3E52F79F477C6051697AD4AAD5590DCE95C992E3B5F65E4"
+  },
+  "preflight_defects_corrected": ["1.1 manual ticket", "1.2 cursor order", "1.3 newest-tail recovery",
+    "1.4 writer shutdown", "1.5 reverse-proxy access", "1.6 R4.0 runner", "1.7 docs counts"],
+  "hardware": {
+    "r4_0_run": false,
+    "reason": "supervised R4.0 (S4) requires a physically-present operator + interactive arming; the agent does not arm or infer presence",
+    "phase2": "BLOCKED pending an R4.0 PASS"
+  }
+}
