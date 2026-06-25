@@ -86,6 +86,21 @@ class Sidecar:
     def result(self, cid, timeout: float = 5.0) -> dict:
         return self.wait(lambda e: e.get("ev") == "command_result" and e.get("command_id") == cid, timeout)
 
+    def diag(self, cid: int, timeout: float = 2.0) -> dict:
+        self.send(cmd="__diag", command_id=cid)
+        return self.wait(lambda e: e.get("ev") == "diag" and e.get("command_id") == cid, timeout)
+
+    def poll_drive_inactive(self, deadline_s: float = 3.0) -> bool:
+        """Poll __diag (bounded, deterministic) until the repeating drive has cleared. Returns True once
+        drive_active is False, False on timeout."""
+        end = time.monotonic() + deadline_s
+        cid = 90000
+        while time.monotonic() < end:
+            cid += 1
+            if self.diag(cid).get("drive_active") is False:
+                return True
+        return False
+
     def close(self) -> None:
         try:
             self.p.stdin.close()   # type: ignore[union-attr]
@@ -200,8 +215,73 @@ def test_same_generation_newer_epoch_drive_rejected():
     # §9 case 9: a drive with the matching generation but a NEWER epoch is stale and rejected.
     sc = _reconciled()
     try:
-        sc.send(cmd="drive", command_id=1, generation=1, epoch=2, ly=0.2, duration=0.1)
+        sc.send(cmd="drive", command_id=1, process_instance_id="P1", sidecar_instance_id=sc.sid,
+                generation=1, epoch=2, ticket_id=1, ly=0.2, duration=0.1)
         assert sc.result(1)["error"] == "stale_epoch"
+    finally:
+        sc.close()
+
+
+def _drive(sc, cid, **over):
+    base = dict(process_instance_id="P1", sidecar_instance_id=sc.sid, epoch=1, generation=1,
+                ticket_id=cid, effect_class="motion", ly=0.3, duration=5.0)
+    base.update(over)
+    sc.send(cmd="drive", command_id=cid, **base)
+
+
+def test_repeating_drive_killed_by_newer_epoch_same_generation():
+    # agent_next_3 §A5(9): an active drive repeat must die when a NEWER epoch is installed even if generation is
+    # unchanged. Forced via __diag polling (no arbitrary sleep as the proof).
+    sc = _reconciled()                          # unlatched epoch1/gen1
+    try:
+        _drive(sc, 1)                           # long-running repeat at epoch1/gen1
+        assert sc.diag(2).get("drive_active") is True
+        # install a newer epoch with the SAME generation (set_control adopts a higher epoch)
+        sc.send(cmd="set_control", command_id=3, process_instance_id="P1", epoch=2, generation=1, latched=True)
+        sc.result(3)
+        assert sc.poll_drive_inactive() is True   # repeat terminated by the epoch change
+    finally:
+        sc.close()
+
+
+def test_repeating_drive_killed_immediately_by_stop():
+    # §A5(10): STOP clears the repeat synchronously (doEstop clearDrive before any await).
+    sc = _reconciled()
+    try:
+        _drive(sc, 1)
+        assert sc.diag(2).get("drive_active") is True
+        sc.send(cmd="estop", command_id=3, epoch=5, generation=5)
+        sc.result(3)
+        assert sc.diag(4).get("drive_active") is False
+    finally:
+        sc.close()
+
+
+def test_queued_stale_drive_never_reaches_sdk():
+    # §A5(11): a queued drive whose ticket goes stale before dequeue is rejected by the queue and never sends.
+    sc = _reconciled()
+    try:
+        sc.send(cmd="__pause_pump")
+        _drive(sc, 10, duration=0.2)            # sits in the paused queue
+        sc.send(cmd="estop", command_id=11, epoch=2, generation=2)   # bypasses the queue -> latched, gen2
+        sc.result(11)
+        sc.send(cmd="__resume_pump")
+        r = sc.result(10)                        # the queued drive is now dequeued + rejected
+        assert r["sent_to_agora"] is False and r["error"] in ("estop_latched", "stale_generation", "stale_epoch")
+    finally:
+        sc.close()
+
+
+def test_stale_stop_timer_from_drive_a_cannot_terminate_drive_b():
+    # §A5(12): drive A's delayed stop timer (short duration) must not clear the newer drive B.
+    sc = _reconciled()
+    try:
+        _drive(sc, 1, duration=0.15)            # A: short delayed-stop
+        sc.result(1)
+        _drive(sc, 2, duration=5.0)             # B: long-running, supersedes A
+        sc.result(2)
+        time.sleep(0.6)                          # bounded wait past A's 0.15s timer; the PROOF is the diag below
+        assert sc.diag(3).get("drive_active") is True   # B not killed by A's stale timer
     finally:
         sc.close()
 

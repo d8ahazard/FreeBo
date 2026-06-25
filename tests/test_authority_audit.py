@@ -73,3 +73,21 @@ def test_air2_motion_requires_a_ticket():
     src = (PKG / "robot" / "air2_native_link.py").read_text(encoding="utf-8")
     assert "_ticketed(" not in src, "the un-ticketed motion fallback (_ticketed) must be removed"
     assert "missing_motion_ticket" in src, "air2 move/drive must reject a missing ticket"
+
+
+def test_sidecar_drive_uses_mandatory_ticket_validator():
+    # agent_next_3 §A4: the JS `drive` authority contract must use the SAME mandatory validator as other effects,
+    # and must not re-introduce optional identity/ticket fields.
+    src = (PKG.parent / "scripts" / "rtm_sidecar.js").read_text(encoding="utf-8")
+    assert "function driveTicketError(c)" in src, "the shared drive/effect validator must exist"
+    assert "const e = driveTicketError(c);" in src, "the drive handler must route through driveTicketError"
+    # the shared validator requires identity + a ticket (mandatory, not optional)
+    assert 'return "missing_identity"' in src and 'return "missing_ticket"' in src
+    # the old lax/optional drive checks must be GONE (these tolerated a missing/absent field)
+    assert "c.epoch != null && c.epoch !== epoch" not in src, "drive must not treat epoch as optional"
+    assert "c.sidecar_instance_id != null && c.sidecar_instance_id !== SIDECAR_ID" not in src, \
+        "drive must not treat sidecar identity as optional"
+    assert 'error: "missing_generation"' not in src, "drive must not use the bespoke generation-only admission"
+    # the queue pre-check must use the full validator too (not a bare generation compare)
+    assert 'c.generation != null && c.generation !== generation' not in src, \
+        "the queue must reject stale drives via the full ticket validator, not a generation compare"

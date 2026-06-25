@@ -109,17 +109,17 @@ class MockRobotLink(RobotLink):
 
     # --- control ---
     async def drive(self, ly: float, rx: float, *, generation: int | None = None,
-                    epoch: int | None = None) -> dict[str, Any]:
+                    epoch: int | None = None, ticket_id: int | None = None) -> dict[str, Any]:
         self.state["last_drive"] = (ly, rx)
-        self.state["last_ticket"] = {"generation": generation, "epoch": epoch}
-        print(f"[mock] drive ly={ly} rx={rx} gen={generation} epoch={epoch}", flush=True)
+        self.state["last_ticket"] = {"generation": generation, "epoch": epoch, "ticket_id": ticket_id}
+        print(f"[mock] drive ly={ly} rx={rx} gen={generation} epoch={epoch} tid={ticket_id}", flush=True)
         return {"ok": True}
 
     async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
-                   epoch: int | None = None) -> dict[str, Any]:
+                   epoch: int | None = None, ticket_id: int | None = None) -> dict[str, Any]:
         self.state["last_drive"] = (ly, rx)
-        self.state["last_ticket"] = {"generation": generation, "epoch": epoch}
-        print(f"[mock] move ly={ly} rx={rx} dur={duration} gen={generation} epoch={epoch}", flush=True)
+        self.state["last_ticket"] = {"generation": generation, "epoch": epoch, "ticket_id": ticket_id}
+        print(f"[mock] move ly={ly} rx={rx} dur={duration} gen={generation} epoch={epoch} tid={ticket_id}", flush=True)
         return {"ok": True}
 
     async def stop(self) -> dict[str, Any]:

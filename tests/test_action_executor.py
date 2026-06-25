@@ -64,7 +64,7 @@ async def test_stuck_is_failed_not_succeeded():
 
 async def test_execution_timeout_is_failed():
     class _HangLink(MockRobotLink):
-        async def move(self, ly, rx, duration, *, generation=None, epoch=None):
+        async def move(self, ly, rx, duration, *, generation=None, epoch=None, ticket_id=None):
             await asyncio.sleep(10.0)            # hung move coroutine
             return {"ok": True}
     ex = _ex(_HangLink(), execution_grace=0.1)   # deadline = duration + 0.1s
@@ -90,7 +90,7 @@ async def test_safety_block_is_failed():
 
 async def test_link_rejection_is_failed():
     class _Reject(MockRobotLink):
-        async def move(self, ly, rx, duration, *, generation=None, epoch=None):
+        async def move(self, ly, rx, duration, *, generation=None, epoch=None, ticket_id=None):
             return {"ok": False, "error": "drive_rejected"}
     a = await _ex(_Reject()).run_drive(0.5, 0.0, 0.3, settings=_auto(), source="ai")
     assert a.state == State.FAILED and "link rejected" in a.reason
@@ -217,9 +217,9 @@ async def test_stale_video_refuses_motion():
             super().__init__()
             self.moves = 0
 
-        async def move(self, ly, rx, duration, *, generation=None, epoch=None):
+        async def move(self, ly, rx, duration, *, generation=None, epoch=None, ticket_id=None):
             self.moves += 1
-            return await super().move(ly, rx, duration, generation=generation, epoch=epoch)
+            return await super().move(ly, rx, duration, generation=generation, epoch=epoch, ticket_id=ticket_id)
 
         async def snapshot_sample(self):
             return FrameSample(jpeg=b"x", seq=1, wall_ts=_t.monotonic(), age=99.0, valid=True)

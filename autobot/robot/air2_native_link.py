@@ -267,24 +267,27 @@ class Air2NativeLink(RobotLink):
 
     # --- control (native RTM) ---
     async def drive(self, ly: float, rx: float, *, generation: int | None = None,
-                    epoch: int | None = None) -> dict[str, Any]:
-        # agent_next_2 §4.1: a physical drive REQUIRES an admitted motion ticket (epoch+generation). There is NO
-        # fallback to current RtmNode state — an un-ticketed production drive is a protocol failure, rejected here.
-        if generation is None or epoch is None:
+                    epoch: int | None = None, ticket_id: int | None = None) -> dict[str, Any]:
+        # agent_next_2 §4.1 + agent_next_3 §A1: a physical drive REQUIRES the FULL admitted motion ticket
+        # (epoch+generation+ticket_id). There is NO fallback to current RtmNode state — an un-ticketed production
+        # drive is a protocol failure, rejected here before transport.
+        if generation is None or epoch is None or ticket_id is None:
             return {"ok": False, "sent_to_agora": False, "error": "missing_motion_ticket", "ly": ly, "rx": rx}
         res = await asyncio.to_thread(self.rtm.send_acked,
                                       {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0,
-                                       "generation": int(generation), "epoch": int(epoch)})
+                                       "generation": int(generation), "epoch": int(epoch),
+                                       "ticket_id": int(ticket_id), "effect_class": "motion"})
         return {**res, "ly": ly, "rx": rx}
 
     async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
-                   epoch: int | None = None) -> dict[str, Any]:
-        if generation is None or epoch is None:
+                   epoch: int | None = None, ticket_id: int | None = None) -> dict[str, Any]:
+        if generation is None or epoch is None or ticket_id is None:
             return {"ok": False, "sent_to_agora": False, "error": "missing_motion_ticket",
                     "ly": ly, "rx": rx, "duration": duration}
         res = await asyncio.to_thread(self.rtm.send_acked,
                                       {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration,
-                                       "generation": int(generation), "epoch": int(epoch)})
+                                       "generation": int(generation), "epoch": int(epoch),
+                                       "ticket_id": int(ticket_id), "effect_class": "motion"})
         return {**res, "ly": ly, "rx": rx, "duration": duration}
 
     # --- ticketed effect dispatch (agent_next_2 §4) ---

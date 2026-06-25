@@ -309,8 +309,8 @@ class ActionExecutor:
                 move_deadline = float(d.duration) + self.execution_grace
                 try:
                     res = await asyncio.wait_for(
-                        self.link.move(d.ly, d.rx, d.duration,
-                                       generation=ticket.generation, epoch=ticket.epoch),
+                        self.link.move(d.ly, d.rx, d.duration, generation=ticket.generation,
+                                       epoch=ticket.epoch, ticket_id=ticket.ticket_id),
                         timeout=move_deadline)
                 except asyncio.TimeoutError:
                     await self._stop()

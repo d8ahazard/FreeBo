@@ -116,20 +116,23 @@ def test_unknown_raw_id_is_not_allowed_distinct_from_forbidden(sc):
     assert r["ok"] is False and r["error"].startswith("raw_id_not_allowed")
 
 
-def test_drive_without_generation_is_rejected(sc):
-    sc.send(cmd="drive", command_id=2, ly=0.3, rx=0.0)   # no generation
+def test_drive_without_ticket_fields_is_rejected(sc):
+    # full identity but no generation/ticket -> missing_ticket (agent_next_3 strict contract)
+    sc.send(cmd="drive", command_id=2, process_instance_id="P1", sidecar_instance_id=sc.sid, epoch=1, ly=0.3)
     r = sc.result(2)
-    assert r["sent_to_agora"] is False and r["error"] == "missing_generation"
+    assert r["sent_to_agora"] is False and r["error"] == "missing_ticket"
 
 
 def test_stale_generation_drive_is_rejected(sc):
-    sc.send(cmd="drive", command_id=3, ly=0.3, rx=0.0, generation=0)   # current is 1
+    sc.send(cmd="drive", command_id=3, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=0, ticket_id=1, ly=0.3)   # current gen is 1
     r = sc.result(3)
     assert r["sent_to_agora"] is False and r["error"] == "stale_generation"
 
 
-def test_matching_generation_drive_is_sent(sc):
-    sc.send(cmd="drive", command_id=4, ly=0.2, rx=0.0, generation=1)
+def test_matching_full_ticket_drive_is_sent(sc):
+    sc.send(cmd="drive", command_id=4, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=1, ticket_id=1, ly=0.2, duration=0.1)
     r = sc.result(4)
     assert r["sent_to_agora"] is True and r.get("error") in (None, "")
 
@@ -198,8 +201,9 @@ def test_two_phase_release_clears_latch_and_permits_drive(sc):
             prepare_nonce=nonce)
     r = sc.result(12)
     assert r["ok"] is True and r["latched"] is False and r["control_ready"] is True and r["generation"] == 4
-    # drive at the new release generation/epoch now succeeds
-    sc.send(cmd="drive", command_id=13, ly=0.2, rx=0.0, generation=4, epoch=4)
+    # drive at the new release generation/epoch now succeeds (full ticket)
+    sc.send(cmd="drive", command_id=13, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=4, generation=4, ticket_id=1, ly=0.2, duration=0.1)
     assert sc.result(13)["sent_to_agora"] is True
 
 
@@ -260,6 +264,38 @@ def test_release_refused_while_latched_but_ownership_resume_allowed(sc):
     assert sc.result(91)["error"] == "estop_latched"
     sc.send(cmd="resume", command_id=92, process_instance_id="P1", sidecar_instance_id=sc.sid)
     assert sc.result(92)["resumed"] is True
+
+
+def test_drive_admission_full_ticket_contract(sc):
+    # agent_next_3 §A1/§A5(1-8): a non-zero drive must satisfy the SAME mandatory ticket validator as every other
+    # effect (identity + epoch + generation + ticket_id + motion class). sc is unlatched at epoch1/gen1, P1.
+    full = dict(process_instance_id="P1", sidecar_instance_id=sc.sid, epoch=1, generation=1, ticket_id=7, ly=0.2)
+    # (1) no identity
+    sc.send(cmd="drive", command_id=2, generation=1, epoch=1, ticket_id=7, ly=0.2)
+    assert sc.result(2)["error"] == "missing_identity"
+    # (2) identity but no ticket id
+    sc.send(cmd="drive", command_id=3, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=1, ly=0.2)
+    assert sc.result(3)["error"] == "missing_ticket"
+    # (3) ticket id but no epoch
+    sc.send(cmd="drive", command_id=4, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            generation=1, ticket_id=7, ly=0.2)
+    assert sc.result(4)["error"] == "missing_ticket"
+    # (5) correct generation but stale epoch
+    sc.send(cmd="drive", command_id=5, **{**full, "epoch": 0})
+    assert sc.result(5)["error"] == "stale_epoch"
+    # (6) wrong process id
+    sc.send(cmd="drive", command_id=6, **{**full, "process_instance_id": "WRONG"})
+    assert sc.result(6)["error"] == "wrong_process_instance"
+    # (7) wrong sidecar id
+    sc.send(cmd="drive", command_id=7, **{**full, "sidecar_instance_id": "WRONG-SID"})
+    assert sc.result(7)["error"] == "wrong_sidecar_instance"
+    # (8) explicit non-motion effect class
+    sc.send(cmd="drive", command_id=8, effect_class="laser", **full)
+    assert sc.result(8)["error"] == "wrong_effect_class"
+    # (4) the complete current ticket succeeds
+    sc.send(cmd="drive", command_id=9, effect_class="motion", duration=0.1, **full)
+    assert sc.result(9)["sent_to_agora"] is True
 
 
 def test_parent_death_latches_and_new_instance_starts_latched():

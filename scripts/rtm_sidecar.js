@@ -147,6 +147,17 @@ function effectOk(c) {
   return null;
 }
 
+// agent_next_3 §A1: a `drive` is the MOTION effect — it MUST satisfy the same mandatory ticket contract as every
+// other physical effect (full identity + epoch + generation + ticket_id), plus, if an explicit effect_class is
+// carried, it must be "motion". One shared validator is used by BOTH the queue pre-check and the command handler
+// so the admission logic can never drift apart. Zero/deadman + E-STOP do not flow through here.
+function driveTicketError(c) {
+  const e = effectOk(c);
+  if (e) return e;
+  if (c.effect_class != null && c.effect_class !== "motion") return "wrong_effect_class";
+  return null;
+}
+
 function clearTimers() { for (const t of timers) clearInterval(t); timers = []; }
 
 let _lastNeed = 0;
@@ -335,6 +346,7 @@ async function teardown() {
 
 let driveStopTimer = null;
 let driveRepeat = null;
+let _driveSeq = 0;       // agent_next_3 §A2: per-drive instance id so a stale timer/repeat can't touch a newer drive
 function clearDrive() { if (driveStopTimer) { clearTimeout(driveStopTimer); driveStopTimer = null; } if (driveRepeat) { clearInterval(driveRepeat); driveRepeat = null; } }
 async function handle(c) {
   switch (c.cmd) {
@@ -429,36 +441,38 @@ async function handle(c) {
       return;
     }
     case "drive": {
-      // REFUSE motion while the E-STOP is latched or any STOP dispatch is in flight (correlated result so the
-      // caller learns it).
-      if (latched || activeStops > 0) { result(c, { sent_to_agora: false, error: latched ? "estop_latched" : "estop_in_flight" }); return; }
-      // P0 §2.6/§3: a drive is a TICKETED effect — generation AND epoch are mandatory and must match the
-      // accepted control state exactly (a joystick frame in flight across a STOP/RESET is stale on both axes).
-      // Raw RTM 101007 cannot reach here (only `drive` does).
-      if (c.generation == null) { result(c, { sent_to_agora: false, error: "missing_generation" }); return; }
-      if (c.generation !== generation) { result(c, { sent_to_agora: false, error: "stale_generation" }); return; }
-      if (c.epoch != null && c.epoch !== epoch) { result(c, { sent_to_agora: false, error: "stale_epoch" }); return; }
-      if (c.sidecar_instance_id != null && c.sidecar_instance_id !== SIDECAR_ID) { result(c, { sent_to_agora: false, error: "wrong_sidecar_instance" }); return; }
-      // robot frame: forward = negative ly; scale to -100..100. The robot has a drive deadman, so a single
-      // frame barely twitches — we SUSTAIN by resending the frame ~every 200ms until duration, then stop.
-      const myGen = generation;
+      // agent_next_3 §A1: a non-zero drive MUST pass the full mandatory ticket validator (identity + epoch +
+      // generation + ticket_id + motion class) — the SAME contract as every other effect. Missing fields are
+      // rejected, not just stale ones. Raw RTM 101007 cannot reach here (only `drive` does).
+      const e = driveTicketError(c);
+      if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      // §A2: capture the FULL accepted authority tuple + a per-drive instance id. The repeat + delayed-stop are
+      // bound to ALL of it — a same-generation/new-epoch transition, an instance change, or a newer drive kills
+      // this stream; a stale stop timer from an older drive can never touch a newer one.
+      _driveSeq++;
+      const myEpoch = epoch, myGen = generation, myProc = acceptedProcessId, mySid = SIDECAR_ID;
+      const myTicket = c.ticket_id, mySeq = _driveSeq;
+      const stillMine = () => (!latched && activeStops === 0 && mySeq === _driveSeq
+        && myGen === generation && myEpoch === epoch && myProc === acceptedProcessId && mySid === SIDECAR_ID);
       const ly = -Math.round((c.ly || 0) * 100), rx = Math.round((c.rx || 0) * 100);
       clearDrive();
       // buttons:1 on EVERY frame (incl. the zero/stop frame) — confirmed by sniffing the EBO Home app: it is
       // the "controller actively engaged" flag and the robot ignores joystick frames sent with buttons:0.
       const frame = { lx: 0, ly, rx, ry: 0, buttons: 1 };
       const ok0 = await acked(c, RTM_DRIVE, frame);   // ack the INITIAL frame (real Agora delivery)
-      // P0-R4.4: if the INITIAL frame failed to send, do NOT start the 10 Hz repeat (don't sustain a stream
-      // the robot never received). A re-check of latch/generation also guards a STOP that raced the ack.
-      if (!ok0 || latched || myGen !== generation) { clearDrive(); return; }
-      // Match the EBO app: it streams drive at ~10 Hz (every 100ms) while moving. 5 Hz was marginal. Each
-      // repeat re-checks the latch + generation, so an E-STOP or a newer command kills this stale stream.
+      // If the INITIAL frame failed to send, OR this drive was superseded during the await (STOP / newer drive /
+      // epoch-gen / instance change), do NOT start the repeat. Only clear if WE still own the stream.
+      if (!ok0 || !stillMine()) { if (mySeq === _driveSeq) clearDrive(); return; }
       driveRepeat = setInterval(() => {
-        if (latched || myGen !== generation) { clearDrive(); return; }
+        if (!stillMine()) { if (mySeq === _driveSeq) clearDrive(); return; }
         sendRtm(RTM_DRIVE, frame);
       }, 100);
       const dur = c.duration > 0 ? c.duration : 1.0; // never run forever without an explicit stop
-      driveStopTimer = setTimeout(() => { clearDrive(); sendRtm(RTM_DRIVE, zeroFrame()); }, dur * 1000);
+      driveStopTimer = setTimeout(() => {
+        if (mySeq !== _driveSeq) return;             // a newer drive owns the stream; stale timer must not touch it
+        clearDrive(); sendRtm(RTM_DRIVE, zeroFrame());
+      }, dur * 1000);
+      void myTicket;                                  // captured for parity with the accepted tuple (identity proof)
       return;
     }
     case "stop": { clearDrive(); return acked(c, RTM_DRIVE, zeroFrame()); }
@@ -507,8 +521,11 @@ async function handle(c) {
     case "__fake": { if (FAKE) _fakeFail = !!c.fail; return; }   // test-only: toggle send failure
     case "__block": { if (FAKE && !_blockGate) { _blockGate = new Promise((res) => { _blockRelease = res; }); } return; }
     case "__release": { if (FAKE && _blockRelease) { _blockRelease(); _blockGate = null; _blockRelease = null; } return; }
+    case "__pause_pump": { if (FAKE) _pumpPaused = true; return; }
+    case "__resume_pump": { if (FAKE) { _pumpPaused = false; _pump(); } return; }
     case "__diag": { out({ ev: "diag", command_id: c.command_id ?? null, active_stops: activeStops,
                            prepared_reset: !!preparedReset, latched, epoch, generation,
+                           drive_active: !!driveRepeat, drive_seq: _driveSeq,
                            sidecar_instance_id: SIDECAR_ID }); return; }
     case "raw": {
       // P0 §2.7: IMMUTABLE hard-forbidden set (movement/dock/ownership/speed/avoid/actuator) can never travel
@@ -565,15 +582,18 @@ async function doEstop(c) {
 // immediately, ahead of the queue. Queued drives from an older generation are rejected when finally examined.
 const _queue = [];
 let _pumping = false;
+let _pumpPaused = false;   // test seam (§A5): hold the queue so a queued drive can be made stale before dequeue
 async function _pump() {
-  if (_pumping) return;
+  if (_pumping || _pumpPaused) return;
   _pumping = true;
   try {
-    while (_queue.length) {
+    while (_queue.length && !_pumpPaused) {
       const c = _queue.shift();
-      if (c.cmd === "drive" && c.generation != null && c.generation !== generation) {
-        result(c, { sent_to_agora: false, error: "stale_generation" });
-        continue;
+      // §A3: reject a stale queued drive using the FULL ticket authority (not just a generation compare). The
+      // command handler re-validates as the final authority; this is an early rejection only.
+      if (c.cmd === "drive") {
+        const e = driveTicketError(c);
+        if (e) { result(c, { sent_to_agora: false, error: e }); continue; }
       }
       try { await handle(c); } catch (e) { log("error", "cmd " + c.cmd + ": " + (e && (e.message || e))); }
     }
@@ -592,6 +612,11 @@ process.stdin.on("data", (chunk) => {
     if (c.cmd === "estop") {
       // Priority: do not wait behind the queue. Latch synchronously, then dispatch.
       Promise.resolve(doEstop(c)).catch((e) => log("error", "estop: " + (e && (e.message || e))));
+    } else if (FAKE && (c.cmd === "__pause_pump" || c.cmd === "__resume_pump"
+                        || c.cmd === "__block" || c.cmd === "__release")) {
+      // queue-CONTROL seams must bypass the (possibly paused) queue. __diag/__fake stay ORDERED through the
+      // queue so a diag issued after a queued drive observes that drive's applied effects.
+      Promise.resolve(handle(c)).catch((e) => log("error", "seam: " + (e && (e.message || e))));
     } else {
       _queue.push(c);
       _pump();
