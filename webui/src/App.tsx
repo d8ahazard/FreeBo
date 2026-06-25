@@ -24,7 +24,7 @@ import VoiceCommands from "./components/VoiceCommands";
 type Tab = "hud" | "memory" | "timeline" | "settings" | "calibrate";
 
 export default function App() {
-  const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, save } = useAutobot();
+  const { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, journalEvents, save } = useAutobot();
   const [tab, setTab] = useState<Tab>("hud");
   const [chat, setChat] = useState("");
   const [setupDone, setSetupDone] = useState(false);
@@ -160,7 +160,7 @@ export default function App() {
               <AudioCalibratePanel />
             </section>
           ) : tab === "timeline" ? (
-            <TimelinePanel />
+            <TimelinePanel journalEvents={journalEvents} connected={connected} />
           ) : tab === "settings" ? (
             <section className="hud-panel p-4 max-w-[560px]">
               <ConfigPanel settings={settings} tts={tts} onSave={save} />

@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, connectWs } from "../api";
-import type { AudioStatus, AutobotEvent, BrainStatus, FeedItem, Identity, OverseerLogItem, PendingApproval, Settings, Telemetry, TtsState } from "../types";
+import type { AudioStatus, AutobotEvent, BrainStatus, EventRow, FeedItem, Identity, OverseerLogItem, PendingApproval, Settings, Telemetry, TtsState } from "../types";
+
+// Bounded client-side journal buffer: the /ws channel seeds a catch-up window then streams live events.
+// Cap keeps browser memory bounded; dedup by event id suppresses overlap between catch-up and live.
+const JOURNAL_CAP = 800;
 
 let _feedId = 0;
 let _overseerId = 0;
@@ -17,6 +21,23 @@ export function useAutobot() {
   const [connected, setConnected] = useState(false);
   const [estopLatched, setEstopLatched] = useState(false);
   const [audioStatus, setAudioStatus] = useState<AudioStatus | null>(null);
+  const [journalEvents, setJournalEvents] = useState<EventRow[]>([]);
+  const journalIds = useRef<Set<string>>(new Set());
+
+  const pushJournal = useCallback((ev: EventRow) => {
+    if (!ev || !ev.id || journalIds.current.has(ev.id)) return;
+    journalIds.current.add(ev.id);
+    setJournalEvents((arr) => {
+      // keep chronological by seq; events usually arrive in order, so this stays cheap.
+      let next = arr.length && arr[arr.length - 1].seq <= ev.seq ? [...arr, ev] : [...arr, ev].sort((a, b) => a.seq - b.seq);
+      if (next.length > JOURNAL_CAP) {
+        const dropped = next.slice(0, next.length - JOURNAL_CAP);
+        for (const d of dropped) journalIds.current.delete(d.id);
+        next = next.slice(next.length - JOURNAL_CAP);
+      }
+      return next;
+    });
+  }, []);
 
   const pushFeed = useCallback((item: Omit<FeedItem, "id">) => {
     setFeed((f) => {
@@ -114,9 +135,12 @@ export function useAutobot() {
         case "overseer_act":
           pushOverseer({ kind: "act", verb: e.kind, args: e.args, result: e.result, ts: e.ts });
           break;
+        case "journal_event":
+          pushJournal(e.event);
+          break;
       }
     },
-    [pushFeed, pushOverseer]
+    [pushFeed, pushOverseer, pushJournal]
   );
 
   useEffect(() => {
@@ -141,5 +165,5 @@ export function useAutobot() {
     return res;
   }, []);
 
-  return { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, save, pushFeed };
+  return { settings, telemetry, brain, tts, feed, identity, approvals, overseerLog, connected, estopLatched, audioStatus, journalEvents, save, pushFeed };
 }

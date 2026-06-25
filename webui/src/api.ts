@@ -158,27 +158,49 @@ export const api = {
   overseerAct(body: Record<string, unknown>) {
     return jpost("/api/overseer/act", body);
   },
-  // --- Phase 1 observability (agent_next_3 Gate C): event journal timeline/inspector ---
-  async events(params: Record<string, string | number> = {}) {
+  // --- Phase 1 observability (agent_next_4 §6): live event journal timeline/inspector ---
+  // Query the persistent journal window. Accepts any of: category, type, source, outcome, incident_id,
+  // correlation_id, process_session_id, command_id, event_id, epoch, generation, ticket_id, start, end,
+  // order ("asc"|"desc"), persistent, cursor, limit. Pass a signal to abort/serialize overlapping requests.
+  async events(params: Record<string, string | number> = {}, signal?: AbortSignal) {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "") q.set(k, String(v));
-    const r = await fetch(`/api/events?${q.toString()}`);
+    const r = await fetch(`/api/events?${q.toString()}`, { signal });
     if (!r.ok) throw new Error(`events ${r.status}`);
     return r.json();
   },
-  async eventsTrace(correlationId: string) {
-    const r = await fetch(`/api/events/trace/${encodeURIComponent(correlationId)}`);
-    if (!r.ok) throw new Error(`trace ${r.status}`);
+  // Full ordered trace of one STOP→RESET (or other) incident, chronological.
+  async eventsIncident(incidentId: string) {
+    const r = await fetch(`/api/events/incident/${encodeURIComponent(incidentId)}`);
+    if (!r.ok) throw new Error(`incident ${r.status}`);
     return r.json();
   },
-  async eventsSummary(sinceSeq = 0) {
-    const r = await fetch(`/api/events/summary?since_seq=${sinceSeq}`);
+  // Recent incidents with start/end/outcome/severity for the incident list.
+  async eventsIncidents(limit?: number) {
+    const q = limit ? `?limit=${limit}` : "";
+    const r = await fetch(`/api/events/incidents${q}`);
+    if (!r.ok) throw new Error(`incidents ${r.status}`);
+    return r.json();
+  },
+  // Journal-health snapshot: writer_alive, queue depth/capacity, persisted/dropped/failed counters, etc.
+  async eventsHealth() {
+    const r = await fetch(`/api/events/health`);
+    if (!r.ok) throw new Error(`health ${r.status}`);
+    return r.json();
+  },
+  async eventsSummary(cursor?: string) {
+    const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    const r = await fetch(`/api/events/summary${q}`);
     if (!r.ok) throw new Error(`summary ${r.status}`);
     return r.json();
   },
-  eventsExportUrl(correlationId?: string) {
-    return correlationId ? `/api/events/export?correlation_id=${encodeURIComponent(correlationId)}`
-                         : `/api/events/export`;
+  // Downloadable JSON bundle href (used directly as an <a download> target).
+  eventsExportUrl({ incidentId, correlationId }: { incidentId?: string; correlationId?: string } = {}) {
+    const q = new URLSearchParams();
+    if (incidentId) q.set("incident_id", incidentId);
+    if (correlationId) q.set("correlation_id", correlationId);
+    const s = q.toString();
+    return s ? `/api/events/export?${s}` : `/api/events/export`;
   },
   async selftest(opts: { move?: boolean; talk?: boolean; only?: string } = {}) {
     const q = new URLSearchParams();

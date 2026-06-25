@@ -167,6 +167,35 @@ export interface AudioStatus {
   error: string | null;
 }
 
+// Phase 1 observability: one row of the structured event journal — the exact shape of the server's
+// Event.to_dict() (snake_case). Free-text fields are server-redacted; `detail` is a redacted object.
+export interface EventRow {
+  id: string;
+  seq: number;
+  process_session_id: string;
+  ts_utc: string;
+  ts_monotonic: number;
+  category: string;
+  type: string;
+  source: string;
+  requested?: string | null;
+  effective?: string | null;
+  reason?: string | null;
+  outcome?: string | null;
+  incident_id?: string | null;
+  parent_event_id?: string | null;
+  phase?: string | null;
+  correlation_id?: string | null;
+  command_id?: string | null;
+  ticket_id?: number | null;
+  process_instance_id?: string | null;
+  sidecar_instance_id?: string | null;
+  epoch?: number | null;
+  generation?: number | null;
+  latency_ms?: number | null;
+  detail?: Record<string, unknown>;
+}
+
 export type AutobotEvent =
   | { type: "hello"; settings: Settings; brain: BrainStatus; tts: TtsState; identity?: Identity; audio?: AudioStatus }
   | { type: "settings"; changed: string[]; settings: Settings }
@@ -185,7 +214,8 @@ export type AutobotEvent =
   | { type: "approval_request"; id: string; tool: string; args: Record<string, unknown>; requester: string; reason: string; ts: number }
   | { type: "approval_resolved"; id: string; approved: boolean; ts: number }
   | { type: "proposal"; seq: number; verb: string; args: Record<string, unknown>; ts: number }
-  | { type: "overseer_act"; kind: string; args: Record<string, unknown>; result: Record<string, unknown>; ts: number };
+  | { type: "overseer_act"; kind: string; args: Record<string, unknown>; result: Record<string, unknown>; ts: number }
+  | { type: "journal_event"; event: EventRow; cursor?: string };
 
 export interface OverseerLogItem {
   id: number;
