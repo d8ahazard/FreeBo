@@ -65,6 +65,10 @@ collector/apk_patch/*.apk
 Thumbs.db
 *.log
 *.err
+# scratch test capture (never commit at repo root; results go in agent_results.md)
+/tc_*.txt
+/checks_out.txt
+/checks_err.txt
 /tmp/
 
 # ---- FreeBo repo: big artifacts live in GitHub Releases, not git (see docs/REPRO.md) ----
