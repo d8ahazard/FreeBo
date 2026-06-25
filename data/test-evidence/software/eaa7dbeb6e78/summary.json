@@ -1,0 +1,21 @@
+﻿{
+    "tested_code_sha":  "eaa7dbeb6e787bf80a3d17e1b0633f272a1e4db7",
+    "command":  "python -X faulthandler -m pytest -q -p no:recording",
+    "platform":  "win32",
+    "node_version":  "v22.16.0",
+    "python_version":  "Python 3.10.11",
+    "result":  "231 passed, 2 skipped",
+    "exit_code":  0,
+    "skipped":  [
+                    "tests/test_hardware.py (x2, --hardware gated)"
+                ],
+    "node_child_process_tests":  "executed (Node v22.16 present)",
+    "full_suite_raw_sha256":  "30A92F45327621805E4EA86BDBC3E8D0238B629AFD1C40D97C6B9D822F05C331",
+    "frontend":  {
+                     "entry_js":  "assets/index-D6LAEPyi.js",
+                     "entry_js_sha256":  "83408B20469910CEABE6D5AC400BAAF5E2159D561454E65DD00CE9CE058001FA",
+                     "entry_css":  "assets/index-BJvTM9Ud.css",
+                     "entry_css_sha256":  "34A62A8935F70BD7E670B4C52F5AB90CE6504B3B49C1D78E33371736E4F271E6",
+                     "index_html_sha256":  "E460F2BD8AE770B0AD0B80D100CFE3DB2B19D0B0F2CE1683E53A17ADB5781074"
+                 }
+}
