@@ -56,10 +56,36 @@ teardown, E-STOP API local-vs-transport distinction, UI not treating every respo
 refusing to invent `robot_effect_observed`.
 
 ## Implemented transitions
-(Pending — §1.)
+§1 (commit `dd2d6d2`): one strict control protocol. Closed `EFFECT_*` class set (motion/dock/release/resume/
+move_mode/move_speed/avoid/laser/eyes/speech/calibration); `EffectTicket{epoch,generation,effect_class,
+ticket_id}` (MotionTicket = the motion alias). `ControlArbiter.admit_effect(class)` issues a unique non-zero
+ticket id snapshotting the current transition, gated on not-inhibited/latched/STOP-in-flight; `validate_ticket`
+requires exact epoch+gen + permitted. `SafetyFloor.admit_effect(class, source, settings)` is the single policy
+authority (speech additionally gated by talk toggle + quiet). Evidence:
+`pytest tests/test_control_arbiter.py` → 11 passed (incl. effect tickets classed/unique/invalidated-by-STOP).
+Command-result semantics (protocol_valid / queued_to_sidecar / control_state_applied / sdk_send_* split) are
+enforced at the sidecar + RtmNode boundary (§2/§3).
 
 ## Two-phase RESET evidence
-(Pending — §2.)
+§2 (commit `7c86e93`): single-phase remote unlatch REPLACED by a prepared two-phase release (no split-state
+interval). `ResetToken` reserves a strictly-newer (release_epoch, release_generation); `arbiter.finalize_reset`
+atomically installs it only if no STOP raced (`begin_reset` reserves, releases nothing). Sidecar `prepare_reset`
+(validate identity+exact state+release-newer+control-ready; store one record + nonce; STAY latched; no SDK send)
++ `commit_reset` (re-validate same prepared reset, no STOP after prepare, atomically install + clear latch +
+consume nonce). `set_control` can only ASSERT/preserve a latch, never clear it. `RtmNode.reset_reconcile`
+(prepare→commit, fail-closed). `/api/resume`: sync-preflight + admission + link reconcile + finalize; a
+post-commit STOP race stays inhibited and re-latches (degraded-critical). Sidecar STOP invalidates a prepared
+reset; parent-pipe end / SIGTERM fail-safe latches + invalidates + zero-sends before exit. Evidence (forced
+ordering, not sleeps): `pytest tests/test_control_arbiter.py tests/test_rtm_node.py tests/test_sidecar_protocol.py
+tests/test_adversarial_integration.py tests/test_safety.py` → 57 passed; `tests/test_estop_endpoint.py` → 3
+passed. Sidecar barrier cases proven: prepare-cannot-match-newer-STOP, STOP-after-prepare-invalidates-commit,
+reused-nonce-rejected, set_control-cannot-unlatch, parent-death→new-instance-starts-latched.
+
+## Remaining sections (in progress)
+§3 RtmNode state machine, §4 effect-ticket enforcement on ALL routes + static audit, §5 priority-first STOP,
+§6 reasoning/faculty cancellation, §7 dark/wake lifecycle, §8 harness acceptance calcs, §9 the 20 forced-race
+tests, §10 authority audit, §11 UI/API contract, §12 evidence gate, §13 final report — NOT yet complete. This
+report stays WORK IN PROGRESS and Phase 0 stays FAIL until they land + the canonical suite runs 3x clean.
 
 ## Priority STOP evidence
 (Pending — §5.)
