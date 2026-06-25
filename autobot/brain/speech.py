@@ -165,14 +165,26 @@ class SpeechService:
                     return self._as_dict(res)
                 if self.link.prefers_text_tts():
                     return self._as_dict(await self.link.say_text(text))
+                _t = time.perf_counter()
+                self._obs("render_started", "speech", corr=corr, detail={"engine": "mulaw"})
                 g711 = tts.render_mulaw(text)
                 if not g711:
+                    self._obs("render_failed", "speech", corr=corr, outcome="failed", reason="empty render")
                     return self._as_dict(await self.link.say_text(text))
-                self._gen = audio_state.begin_playback(text, len(g711) / 8000.0)   # G.711 @ 8 kHz
+                dur = len(g711) / 8000.0   # G.711 @ 8 kHz
+                self._obs("render_completed", "speech", corr=corr, outcome="ok",
+                          latency_ms=(time.perf_counter() - _t) * 1000.0,
+                          detail={"audio_bytes": len(g711), "duration_s": round(dur, 3)})
+                self._gen = audio_state.begin_playback(text, dur)
+                self._obs("publish_started", "speech", corr=corr)
                 res = await self.link.say_audio(g711, codec="mulaw")
                 if isinstance(res, dict) and res.get("ok") is False:
                     audio_state.clear(self._gen)
+                    self._obs("publish_failed", "speech", corr=corr, outcome="failed", reason="say_audio ok=false")
                     return {"ok": False, "error": "say_audio ok=false"}
+                self._obs("publish_completed", "speech", corr=corr, outcome="ok")
+                self._obs("playback_started", "speech", corr=corr, outcome="ok",
+                          detail={"duration_s": round(dur, 3), "char_count": len(text)})
                 return self._as_dict(res)
             except Exception as e:  # noqa: BLE001
                 audio_state.clear(self._gen)   # clear THIS clip's speaking state on failure
