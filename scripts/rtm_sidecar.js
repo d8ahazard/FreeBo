@@ -511,9 +511,15 @@ async function handle(c) {
 async function doEstop(c) {
   activeStops++;                                             // (0) mark a STOP dispatch in flight (RESET refused)
   try {
-    latched = true;                                          // (1) latch BEFORE any await
-    generation = (c.generation != null) ? c.generation : generation + 1;  // (2) invalidate generation
-    if (c.epoch != null) epoch = c.epoch;                    //     adopt the arbiter's transition epoch
+    latched = true;                                          // (1) latch BEFORE any await — ALWAYS, even if stale
+    // agent_next_2 §5.2: a STOP NEVER lowers accepted epoch/generation. Adopt the incoming transition only when
+    // it is newer; a stale STOP still latches + zeros but does not regress state. Report token current/stale.
+    const inGen = (c.generation != null) ? c.generation : generation + 1;
+    const inEpoch = (c.epoch != null) ? c.epoch : epoch + 1;
+    const tokenStatus = (inGen > generation || inEpoch > epoch) ? "newer"
+      : (inGen === generation && inEpoch === epoch) ? "current" : "stale";
+    if (inGen > generation) generation = inGen;
+    if (inEpoch > epoch) epoch = inEpoch;
     preparedReset = null;                                    //     a STOP invalidates any prepared RESET (§2)
     clearDrive();                                            // (3) clear repeat/timeout timers
     const z = zeroFrame();
@@ -524,6 +530,7 @@ async function doEstop(c) {
     result(c, {                                              // honest ack: ok == transport, not local safety
       cmd: "estop", ok: !!r0.ok, local_latch_set: true, initial_zero_sdk_send_succeeded: !!r0.ok,
       sent_to_agora: !!r0.ok, retry_count: retries.length, error: r0.error || null, dispatch_ts,
+      token_status: tokenStatus,                             // current | newer | stale (§5.2 — never regressed)
     });
     log("warn", "E-STOP LATCHED (epoch " + epoch + ", gen " + generation + ", initial_send=" + r0.ok + ")");
   } finally { activeStops--; }                               // (6) dispatch complete; clear in-flight

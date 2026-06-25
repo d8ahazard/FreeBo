@@ -237,6 +237,19 @@ def test_effect_stale_epoch_ticket_rejected(sc):
     assert sc.result(73)["error"] == "stale_epoch"
 
 
+def test_stale_stop_latches_but_never_regresses_state(sc):
+    # sc unlatched at epoch1/gen1. A newer STOP -> epoch5/gen5. A STALE STOP (epoch2/gen2) still latches+zeros
+    # but must NOT lower the accepted epoch/generation (agent_next_2 §5.2).
+    sc.send(cmd="estop", command_id=80, epoch=5, generation=5)
+    r1 = sc.result(80)
+    assert r1["latched"] is True and r1["generation"] == 5 and r1["token_status"] == "newer"
+    sc.send(cmd="estop", command_id=81, epoch=2, generation=2)
+    r2 = sc.result(81)
+    assert r2["latched"] is True and r2["local_latch_set"] is True   # still latches + zeros
+    assert r2["generation"] == 5 and r2["epoch"] == 5                # NOT regressed
+    assert r2["token_status"] == "stale"
+
+
 def test_parent_death_latches_and_new_instance_starts_latched():
     # agent_next_2 §2.5: closing the parent pipe after an unlatched release must fail-safe (latch + zero + exit);
     # a brand-new sidecar instance then starts LATCHED and refuses effects until a full new reconciliation.

@@ -323,14 +323,14 @@ class AgentBrain:
             s = self.settings.snapshot()
             allowed = (intent in commands.ALWAYS) or addressed or self.identity.authority_active(s)
             if allowed:
-                if intent == "STOP" and self._loop is not None:   # instant halt, even mid-think
-                    # P0-R4 item 5: voice STOP is the SAME master STOP as the red button — one meaning for
-                    # "STOP". Operator-only RESUME lifts it (listening is inhibited while stopped).
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self.emergency_stop("voice STOP", cancel_tts=True, master=True), self._loop)
-                    except Exception:  # noqa: BLE001
-                        pass
+                if intent == "STOP":
+                    # agent_next_2 §5.3: voice STOP is the SAME master STOP as the red button, dispatched EXACTLY
+                    # ONCE here. Do NOT also enqueue a `command` event (which would re-enter emergency_stop).
+                    if self._loop is not None:
+                        with contextlib.suppress(Exception):
+                            asyncio.run_coroutine_threadsafe(
+                                self.emergency_stop("voice STOP", cancel_tts=True, master=True), self._loop)
+                    return
                 self._post("command", {"intent": intent, "text": text})
                 return
         self._speech_pending.set()
@@ -1591,10 +1591,14 @@ class AgentBrain:
             result["epoch"], result["generation"], result["dispatch_id"] = tok.epoch, tok.generation, tok.dispatch_id
             self._stopped = True            # park: reasoner/idle loops no-op until RESUME
             self._reason_gen += 1           # invalidate any in-flight reason cycle (P0 §4)
-            # P0 §4: actively CANCEL the in-flight reason task so a cycle blocked in a provider/VLM await is torn
-            # down promptly (the generation bump also makes it fail its next boundary guard if cancellation races).
+            # agent_next_2 §5.4: CANCEL stale reason tasks but NEVER the task currently EXECUTING this STOP (a
+            # STOP tool call runs inside a reason task) — self-cancelling would interrupt the STOP before it
+            # dispatches the hard stop. The generation bump invalidates the caller's cycle AFTER STOP completes.
+            cur = None
+            with contextlib.suppress(Exception):
+                cur = asyncio.current_task()
             rt = self._reason_task
-            if rt is not None and not rt.done():
+            if rt is not None and rt is not cur and not rt.done():
                 with contextlib.suppress(Exception):
                     rt.cancel()
             with contextlib.suppress(Exception):
@@ -1609,15 +1613,21 @@ class AgentBrain:
             from . import audio_state
             with contextlib.suppress(Exception):
                 audio_state.cancel()
+        # agent_next_2 §5.1: begin the TRUE priority link E-STOP IMMEDIATELY (don't await an ordinary stop first).
+        estop_fut = None
+        if tok is not None:
+            with contextlib.suppress(Exception):
+                estop_fut = asyncio.ensure_future(self.link.estop(generation=tok.generation, epoch=tok.epoch))
+        # Cancel the active executor action WITHOUT a preceding ordinary stop racing ahead of the hard stop
+        # (the cancelled action's own `finally` deadman-stops as a SUPPLEMENT, after E-STOP has started).
         try:
-            await self.executor.preempt(reason)
+            await self.executor.cancel_active(reason, dispatch_stop=False)
             result["executor_preempted"] = True
         except Exception as e:  # noqa: BLE001
-            result["error"] = f"preempt: {type(e).__name__}: {e}"
-        if tok is not None:
-            # Stamp the transport with THIS stop's generation (item 2 — never another stop's).
+            result["error"] = f"cancel_active: {type(e).__name__}: {e}"
+        if estop_fut is not None:
             try:
-                tr = await self.link.estop(generation=tok.generation, epoch=tok.epoch)
+                tr = await estop_fut
                 result["transport_result"] = tr
                 result["transport_dispatch_succeeded"] = _link_transport_ok(tr)
             except Exception as e:  # noqa: BLE001

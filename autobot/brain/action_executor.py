@@ -212,13 +212,21 @@ class ActionExecutor:
             pass
         self.last_stop_complete_ts = time.monotonic()
 
-    async def preempt(self, reason: str = "preempted") -> None:
-        """Cancel the in-flight action (barge-in / manual takeover / reflex) and stop. The running `run_drive`
-        observes the token at its next checkpoint and finishes as CANCELLED. Does not need the lock."""
+    async def cancel_active(self, reason: str = "preempted", *, dispatch_stop: bool = True) -> None:
+        """Cancel the in-flight action (barge-in / manual takeover / reflex). The running `run_drive` observes the
+        token at its next checkpoint and finishes as CANCELLED (its own `finally` deadman-stops).
+
+        agent_next_2 §5.1: with `dispatch_stop=False` this does NOT issue an ordinary `link.stop()` — used by the
+        master STOP path so the true priority `link.estop()` is never delayed behind a regular transport stop."""
         a = self._active
         if a is not None and a.state not in TERMINAL:
             a.cancel_token.cancel()
-        await self._stop()
+        if dispatch_stop:
+            await self._stop()
+
+    async def preempt(self, reason: str = "preempted") -> None:
+        """Cancel the in-flight action AND issue an ordinary bounded stop (manual takeover / reflex barge-in)."""
+        await self.cancel_active(reason, dispatch_stop=True)
 
     async def _await_fresh(self, before_seq: Optional[int], token: CancelToken):
         """Poll for a frame whose sequence is strictly newer than `before_seq`, up to the evidence deadline.
