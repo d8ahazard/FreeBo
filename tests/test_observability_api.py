@@ -8,9 +8,16 @@ import pytest
 from autobot import observability as obs
 
 
+class _Client:
+    def __init__(self, host="127.0.0.1"):
+        self.host = host
+
+
 class _ReqQ:
-    def __init__(self, params):
-        self.query_params = params
+    def __init__(self, params=None, host="127.0.0.1", headers=None):
+        self.query_params = params or {}
+        self.client = _Client(host)
+        self.headers = headers or {}
 
 
 @pytest.fixture(scope="module")
@@ -62,8 +69,37 @@ async def test_query_endpoint_filters(server, tmp_path):
     body = json.loads(resp.body.decode())
     assert body["returned"] == 1 and body["events"][0]["type"] == "drive"
     # correlation trace endpoint groups the incident
-    tr = await server.api_events_trace("zz")
+    tr = await server.api_events_trace(_ReqQ(), "zz")
     assert len(json.loads(tr.body.decode())["events"]) == 2
+
+
+async def test_query_endpoint_rejects_bad_int_param(server, tmp_path):
+    _fresh_journal(tmp_path)
+    resp = await server.api_events(_ReqQ({"limit": "notanint"}))
+    assert resp.status_code == 400
+
+
+async def test_non_loopback_requires_owner_token(server, tmp_path, monkeypatch):
+    _fresh_journal(tmp_path)
+    monkeypatch.delenv("AUTOBOT_OWNER_TOKEN", raising=False)
+    # a non-loopback client with no configured token is forbidden
+    resp = await server.api_events(_ReqQ(host="10.0.0.5"))
+    assert resp.status_code == 403
+    # with a token configured but wrong/absent header -> 401
+    monkeypatch.setenv("AUTOBOT_OWNER_TOKEN", "sekret")
+    resp2 = await server.api_events(_ReqQ(host="10.0.0.5"))
+    assert resp2.status_code == 401
+    # correct header -> allowed
+    resp3 = await server.api_events(_ReqQ(host="10.0.0.5", headers={"X-Owner-Token": "sekret"}))
+    assert resp3.status_code == 200
+
+
+async def test_hardware_gate_states_hardware_not_run(server, tmp_path):
+    _fresh_journal(tmp_path)
+    import json
+    resp = await server.api_hardware_gate(_ReqQ())
+    body = json.loads(resp.body.decode())
+    assert body["hardware_run"] is False and body["physical_acceptance"] is False
 
 
 async def test_export_bundle_is_redacted_with_manifest(server, tmp_path):
@@ -71,11 +107,12 @@ async def test_export_bundle_is_redacted_with_manifest(server, tmp_path):
     j = obs.journal()
     j.emit(obs.CAT_MOTION, "drive", "ai", correlation_id="inc1", detail={"api_key": "sk-XXX", "ly": 0.2})
     import json
-    resp = await server.api_events_export(correlation_id="inc1")
+    resp = await server.api_events_export(_ReqQ(), correlation_id="inc1")
     bundle = json.loads(resp.body.decode())
-    assert bundle["schema"] == "freebo.incident.v1"
+    assert bundle["schema"] == "freebo.incident" and bundle["schema_version"] == 2
     assert bundle["software_sha"] and "platform" in bundle and "readiness" in bundle
-    assert bundle["event_count"] == 1
+    assert bundle["hardware_run"] is False
+    assert "attachment" in resp.headers.get("content-disposition", "")
     blob = json.dumps(bundle)
     assert "sk-XXX" not in blob and "<redacted>" in blob   # secret redacted at the journal boundary
 
@@ -86,6 +123,6 @@ async def test_summary_endpoint(server, tmp_path):
     for ms in (10, 50):
         j.emit(obs.CAT_MOTION, "drive", "ai", outcome="moved", latency_ms=ms)
     import json
-    resp = await server.api_events_summary(since_seq=0)
+    resp = await server.api_events_summary(_ReqQ())
     s = json.loads(resp.body.decode())
     assert s["total"] >= 2 and s["by_category"].get(obs.CAT_MOTION, 0) >= 2

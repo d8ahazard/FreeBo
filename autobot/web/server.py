@@ -143,6 +143,7 @@ def _publish_frame(jpeg: bytes) -> None:
 # --- event hub ---
 _ws_clients: set[WebSocket] = set()
 _event_ring: deque[dict] = deque(maxlen=300)
+_BG_TASKS: list = []
 
 
 async def emit(event: dict):
@@ -155,6 +156,20 @@ async def emit(event: dict):
             dead.append(ws)
     for ws in dead:
         _ws_clients.discard(ws)
+
+
+def _journal_ws_broadcast(ev) -> None:
+    """Thread-safe live delivery of one journaled event to WS clients (agent_next_4 §6.1). obs.emit() may be
+    called from worker threads, so we hop onto the main loop. Best-effort; never raises into a runtime path."""
+    loop = _MAIN_LOOP
+    if loop is None:
+        return
+    try:
+        payload = {"type": "journal_event", "event": ev.to_dict(),
+                   "cursor": obs.encode_cursor(ev.process_session_id, ev.seq)}
+        loop.call_soon_threadsafe(lambda: asyncio.ensure_future(emit(payload)))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ------------- lifecycle -------------
@@ -231,23 +246,35 @@ async def _startup():
         LINK.set_audio_sink(_audio_in_sink)
     except Exception:  # noqa: BLE001
         pass
-    asyncio.create_task(_telemetry_poller())
-    asyncio.create_task(_audio_status_poller())
-    asyncio.create_task(_daily_memory_task())
+    # agent_next_4 §8.7: TRACK startup background tasks so shutdown can cancel/await them.
+    global _BG_TASKS
+    _BG_TASKS = [asyncio.create_task(_telemetry_poller()),
+                 asyncio.create_task(_audio_status_poller()),
+                 asyncio.create_task(_daily_memory_task())]
+    # §6.1: deliver each journaled event live to WS clients as a `journal_event` (thread-safe — emit() may be
+    # called from worker threads). The client dedups by event id and catches up via the query API on reconnect.
+    obs.set_on_emit(_journal_ws_broadcast)
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     with contextlib.suppress(Exception):
         await brain.emergency_stop("shutdown")   # preempt + stop before tearing down the loop
+    # agent_next_4 §8.7: cancel + await the tracked startup background tasks.
+    for t in _BG_TASKS:
+        t.cancel()
+    for t in _BG_TASKS:
+        with contextlib.suppress(Exception):
+            await t
     # Tear down media workers (unsubscribe + join) so a restart leaves no duplicate subscribers / leaked threads.
     for worker in (AUDIO_SINK, VISUAL_REFLEX):
         if worker is not None and hasattr(worker, "stop"):
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(worker.stop)
     await brain.stop_loop()
-    # Phase 1 observability: deterministic journal flush on shutdown.
+    # Phase 1 observability: stop live broadcast + deterministic journal drain/flush on shutdown.
     with contextlib.suppress(Exception):
+        obs.set_on_emit(None)
         obs.emit(obs.CAT_SYSTEM, "shutdown", "server", outcome="ok")
         j = obs.journal()
         if j is not None:
@@ -389,11 +416,18 @@ def _state_payload() -> dict:
         "setup": {"complete": s.setup_complete},
         "audio": (AUDIO_SINK.audio_status() if (AUDIO_SINK and hasattr(AUDIO_SINK, "audio_status")) else None),
         "build": _frontend_build(),
+        "journal": (obs.journal().health() if obs.journal() is not None else {"configured": False}),
     }
 
 
 @app.get("/api/state")
 async def api_state():
+    return JSONResponse(_state_payload())
+
+
+@app.get("/api/status")
+async def api_status():
+    # Alias of /api/state (the hardware harness + external tooling probe /api/status). Same bounded payload.
     return JSONResponse(_state_payload())
 
 
@@ -545,7 +579,8 @@ async def api_settings(req: Request):
     return JSONResponse({"ok": True, "changed": changed, **_state_payload()})
 
 
-def _software_sha() -> str:
+# agent_next_4 §8.6: cache software provenance ONCE at import (no git subprocess per export).
+def _compute_software_sha() -> str:
     import subprocess
     try:
         return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parents[2]),
@@ -554,75 +589,178 @@ def _software_sha() -> str:
         return "unknown"
 
 
+_SOFTWARE_SHA = _compute_software_sha()
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
+def _obs_denied(request: Request):
+    """agent_next_4 §5.2 access policy. Allow loopback requests (the local UI session). For a non-loopback
+    client, require the configured owner token via the `X-Owner-Token` header (never a query string). Returns a
+    401/403 JSONResponse when denied, else None. No general identity platform — proportional protection."""
+    client = (request.client.host if request.client else "") or ""
+    if client in _LOOPBACK:
+        return None
+    import os as _os
+    token = _os.environ.get("AUTOBOT_OWNER_TOKEN", "")
+    if not token:
+        return JSONResponse({"error": "observability access requires an owner token on non-loopback binds; "
+                                      "set AUTOBOT_OWNER_TOKEN"}, status_code=403)
+    if request.headers.get("X-Owner-Token") != token:
+        return JSONResponse({"error": "invalid or missing owner token"}, status_code=401)
+    return None
+
+
+def _q_int(q, name: str):
+    """Parse an int query param; raise ValueError on a non-integer so the endpoint can return HTTP 400."""
+    v = q.get(name)
+    if v is None or v == "":
+        return None
+    return int(v)
+
+
 @app.get("/api/events")
 async def api_events(request: Request):
-    """Query the structured event journal (agent_next_3 §C4). Bounded; cursor-paginated. Filters: category, type,
-    source, outcome, correlation_id, epoch, generation, since_seq, limit."""
+    """Query the structured event journal (agent_next_4 §5.1). Bounded; opaque cursor paginated. Filters:
+    category/type/source/outcome/incident_id/correlation_id/process_session_id/command_id/event_id/epoch/
+    generation/start/end (UTC ISO)/order(asc|desc)/persistent/limit."""
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
     j = obs.journal()
     if j is None:
-        return JSONResponse({"events": [], "next_cursor": 0, "returned": 0, "more": False})
+        return JSONResponse({"events": [], "next_cursor": None, "returned": 0, "more": False})
     q = request.query_params
-
-    def _int(name):
-        v = q.get(name)
-        try:
-            return int(v) if v is not None else None
-        except ValueError:
-            return None
+    try:
+        epoch, generation, ticket_id, limit = _q_int(q, "epoch"), _q_int(q, "generation"), _q_int(q, "ticket_id"), _q_int(q, "limit")
+    except ValueError:
+        return JSONResponse({"error": "epoch/generation/ticket_id/limit must be integers"}, status_code=400)
+    order = (q.get("order") or "desc").lower()
+    if order not in ("asc", "desc"):
+        return JSONResponse({"error": "order must be 'asc' or 'desc'"}, status_code=400)
     return JSONResponse(j.query(
         category=q.get("category"), type=q.get("type"), source=q.get("source"), outcome=q.get("outcome"),
-        correlation_id=q.get("correlation_id"), epoch=_int("epoch"), generation=_int("generation"),
-        since_seq=(_int("since_seq") or 0), limit=(_int("limit") or 200)))
+        incident_id=q.get("incident_id"), correlation_id=q.get("correlation_id"),
+        process_session_id=q.get("process_session_id"), command_id=q.get("command_id"),
+        event_id=q.get("event_id"), epoch=epoch, generation=generation, ticket_id=ticket_id,
+        start=q.get("start"), end=q.get("end"), order=order,
+        persistent=(q.get("persistent") in ("1", "true", "yes")),
+        cursor=q.get("cursor"), limit=(limit or 200)))
 
 
 @app.get("/api/events/recent")
-async def api_events_recent(limit: int = 200):
+async def api_events_recent(request: Request, limit: int = 200):
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
     j = obs.journal()
     return JSONResponse({"events": (j.recent(limit) if j is not None else [])})
 
 
 @app.get("/api/events/trace/{correlation_id}")
-async def api_events_trace(correlation_id: str):
-    """One correlation trace (e.g. a STOP/RESUME incident grouped by `stop-genN` / `reset-genN`)."""
+async def api_events_trace(request: Request, correlation_id: str):
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
     j = obs.journal()
     return JSONResponse({"correlation_id": correlation_id,
                          "events": (j.correlation_trace(correlation_id) if j is not None else [])})
 
 
+@app.get("/api/events/incident/{incident_id}")
+async def api_events_incident(request: Request, incident_id: str):
+    """One full causal incident in chronological order (agent_next_4 §5.3)."""
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
+    j = obs.journal()
+    return JSONResponse({"incident_id": incident_id,
+                         "events": (j.incident_trace(incident_id) if j is not None else [])})
+
+
+@app.get("/api/events/incidents")
+async def api_events_incidents(request: Request, limit: int = 50):
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
+    j = obs.journal()
+    return JSONResponse({"incidents": (j.incidents(limit=limit) if j is not None else [])})
+
+
+@app.get("/api/events/health")
+async def api_events_health(request: Request):
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
+    j = obs.journal()
+    return JSONResponse(j.health() if j is not None else {"writer_alive": False, "configured": False})
+
+
 @app.get("/api/events/summary")
-async def api_events_summary(since_seq: int = 0):
+async def api_events_summary(request: Request, cursor: str | None = None):
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
     j = obs.journal()
-    return JSONResponse(j.summary(since_seq=since_seq) if j is not None else {"total": 0})
+    return JSONResponse(j.summary(cursor=cursor) if j is not None else {"total": 0})
 
 
-@app.get("/api/events/export")
-async def api_events_export(correlation_id: str | None = None, limit: int = 2000):
-    """Deterministic, redacted incident bundle (agent_next_3 §C6): redacted JSONL events + software SHA +
-    platform/version summary + readiness snapshot + metric summary. No credentials/audio/images/memory."""
-    import platform as _plat
-    import sys as _sys
-    j = obs.journal()
-    if correlation_id:
-        events = (j.correlation_trace(correlation_id, limit=limit) if j is not None else [])
-    else:
-        events = (j.recent(limit) if j is not None else [])
+@app.get("/api/hardware_gate")
+async def api_hardware_gate(request: Request):
+    """Software-only hardware-gate readiness report (agent_next_4 §5.3). ALWAYS states hardware_run=false."""
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
     readiness = {}
     with contextlib.suppress(Exception):
         readiness = brain.status_dict().get("readiness", {}) or {}
-    metric_summary = {}
+    jh = {}
     with contextlib.suppress(Exception):
-        metric_summary = j.summary() if j is not None else {}
+        j = obs.journal()
+        jh = j.health() if j is not None else {}
+    return JSONResponse({
+        "software_sha": _SOFTWARE_SHA, "hardware_run": False, "physical_acceptance": False,
+        "phase0_software_gate": "ACCEPTED, FROZEN", "phase0_physical_gate": "PENDING, HARDWARE NOT RUN",
+        "readiness": readiness, "journal_health": jh,
+        "note": "software-only readiness; YES does not authorize hardware",
+    })
+
+
+@app.get("/api/events/export")
+async def api_events_export(request: Request, correlation_id: str | None = None,
+                            incident_id: str | None = None, limit: int = 5000):
+    """Deterministic, redacted incident bundle (agent_next_4 §8.5): attachment + stable schema version. Events
+    are already redacted at the journal boundary. Returns 503 if the journal is unavailable."""
+    denied = _obs_denied(request)
+    if denied is not None:
+        return denied
+    import platform as _plat
+    import sys as _sys
+    j = obs.journal()
+    if j is None:
+        return JSONResponse({"error": "journal not configured"}, status_code=503)
+    if incident_id:
+        events = j.incident_trace(incident_id, limit=limit)
+    elif correlation_id:
+        events = j.correlation_trace(correlation_id, limit=limit)
+    else:
+        events = j.recent(limit)
+    readiness, metric_summary = {}, {}
+    with contextlib.suppress(Exception):
+        readiness = brain.status_dict().get("readiness", {}) or {}
+    with contextlib.suppress(Exception):
+        metric_summary = j.summary()
     bundle = {
-        "schema": "freebo.incident.v1",
-        "software_sha": _software_sha(),
+        "schema": "freebo.incident", "schema_version": 2,
+        "software_sha": _SOFTWARE_SHA,
         "platform": {"system": _sys.platform, "python": _plat.python_version()},
-        "correlation_id": correlation_id,
-        "event_count": len(events),
-        "readiness": readiness,
-        "metric_summary": metric_summary,
-        "events": events,   # already redacted at the journal boundary
+        "generated_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "incident_id": incident_id, "correlation_id": correlation_id,
+        "hardware_run": False, "physical_acceptance": False,
+        "event_count": len(events), "readiness": readiness, "metric_summary": metric_summary,
+        "events": events,
     }
-    return JSONResponse(bundle)
+    name = f"incident_{incident_id or correlation_id or 'recent'}_{_SOFTWARE_SHA[:12]}.json"
+    return JSONResponse(bundle, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 async def _emit_capabilities() -> None:
@@ -1451,6 +1589,14 @@ async def ws(ws: WebSocket):
         await ws.send_json({"type": "hello", **_state_payload()})
         for ev in list(_event_ring)[-80:]:
             await ws.send_json(ev)
+        # §6.1 catch-up: seed the live timeline with a bounded window of recent journal events; the client
+        # dedups by event id and can page older history via /api/events with the opaque cursor.
+        with contextlib.suppress(Exception):
+            j = obs.journal()
+            if j is not None:
+                for d in j.recent(150):
+                    await ws.send_json({"type": "journal_event", "event": d,
+                                        "cursor": obs.encode_cursor(d.get("process_session_id", ""), d.get("seq", 0))})
         while True:
             # we don't need client messages, but keep the socket alive and drain pings
             await ws.receive_text()
