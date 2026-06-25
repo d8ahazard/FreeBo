@@ -127,7 +127,7 @@ class MockRobotLink(RobotLink):
         print("[mock] stop", flush=True)
         return {"ok": True}
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
         print(f"[mock] action {name}", flush=True)
         s = self.state
         if name.startswith("eyes_") and name[5:] in EYE_ANIMATIONS:

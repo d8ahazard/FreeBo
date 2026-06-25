@@ -159,7 +159,7 @@ class Air2BridgeLink(RobotLink):
     async def stop(self) -> dict[str, Any]:
         return await self._cmd(cmd="stop")
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
         # Eye/expression actions (eyes_happy, eyes_blink, ...) -> a dedicated 'eyes' command the browser maps
         # to the Air 2 emote channel (RTM_EMOTE). Everything else passes through as a generic action.
         n = (name or "").lower()

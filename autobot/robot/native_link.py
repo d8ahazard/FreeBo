@@ -507,7 +507,7 @@ class NativeRobotLink(RobotLink):
         await asyncio.to_thread(self._do_stop)
         return {"ok": True}
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
         ok = await asyncio.to_thread(self._do_action, name)
         return {"ok": True, "action": name} if ok else {"ok": False, "error": "unknown action"}
 

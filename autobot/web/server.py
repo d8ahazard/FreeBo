@@ -207,6 +207,12 @@ async def _startup():
             AUDIO_SINK.requested = lambda: bool(SETTINGS.snapshot().allow_audio_in)
             AUDIO_SINK.permitted = lambda: brain.safety.check_listen(SETTINGS.snapshot()).effective_enabled
             AUDIO_SINK.attach(_active_hub())
+    # agent_next_2 §4.2: wire the central effect admitter into the link so every non-zero physical effect is
+    # admitted + ticketed + correlated (no rtm._send bypass). No-op on links without the hook (mock).
+    _set_admit = getattr(LINK, "set_effect_admitter", None)
+    if callable(_set_admit):
+        with contextlib.suppress(Exception):
+            _set_admit(brain.safety.admit_effect, SETTINGS.snapshot)
     # Video-rate looming reflex (fastest available visual collision cue): a cheap subscriber enqueues frames;
     # a worker runs optical-flow and, on looming, stops + preempts via the loop. No-op on hubless links.
     if hasattr(LINK, "hub"):
@@ -743,24 +749,22 @@ async def api_overseer_act(req: Request):
                      else LINK.move(d.ly, d.rx, d.duration, generation=tk.generation, epoch=tk.epoch))
         res = {**res, "clamped": {"ly": d.ly, "rx": d.rx, "duration": d.duration}}
     elif kind == "action":
-        res = await LINK.action(str(body.get("name", "")))
+        res = await LINK.action(str(body.get("name", "")), source="overseer")
     elif kind == "eyes":
-        res = await LINK.action(f"eyes_{str(body.get('animation', 'neutral')).lower()}")
+        res = await LINK.action(f"eyes_{str(body.get('animation', 'neutral')).lower()}", source="overseer")
     elif kind == "connection":
         res = await LINK.connection(str(body.get("state", "start")))
     elif kind in ("move_mode", "move_speed"):
-        # P0-R4 amendment E: the robot's movement gear is a TYPED command (raw 103011 is banned). Air 2 only.
-        # P0 §3: use the CORRELATED send (send_acked), never the fire-and-forget `_send`, so the result reflects
-        # real delivery + carries the sidecar identity.
-        rtm = getattr(LINK, "rtm", None)
-        send_acked = getattr(rtm, "send_acked", None)
-        if not callable(send_acked):
-            return JSONResponse({"ok": False, "error": "typed RTM not available on this link"})
+        # agent_next_2 §4.3: the movement gear is a TICKETED effect via the typed link methods (no rtm._send /
+        # send_acked bypass). Rejected during master STOP / unsynchronized state like any other effect.
         if kind == "move_mode":
-            cmd = {"cmd": "move_mode", "mode": int(body.get("mode", 0))}
+            fn = getattr(LINK, "set_move_mode", None)
+            res = await fn(int(body.get("mode", 0)), source="overseer") if callable(fn) else \
+                {"ok": False, "error": "move_mode not supported on this link"}
         else:
-            cmd = {"cmd": "move_speed", "speed": int(body.get("speed", 0))}
-        res = await asyncio.to_thread(send_acked, cmd)
+            fn = getattr(LINK, "set_move_speed", None)
+            res = await fn(int(body.get("speed", 0)), source="overseer") if callable(fn) else \
+                {"ok": False, "error": "move_speed not supported on this link"}
     elif kind == "say":
         if not s.talk_enabled:
             return JSONResponse({"ok": False, "blocked": "talk disabled (UI toggle off)"})

@@ -15,6 +15,7 @@ sidecar (rtm uid/token) and the RTC receiver (rtc uid/token) — one RTM + one R
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
@@ -22,6 +23,12 @@ from typing import Any, Optional
 
 from .link import RobotLink
 from .media_hub import MediaHub
+
+# Effect-class labels (string protocol values; mirror autobot/brain/safety.py EFFECT_* — kept as literals here
+# so the robot/ layer never imports brain/). The admitter (SafetyFloor.admit_effect) takes these strings.
+EFFECT_DOCK, EFFECT_AVOID, EFFECT_LASER = "dock", "avoid", "laser"
+EFFECT_RELEASE, EFFECT_RESUME = "release", "resume"
+EFFECT_MOVE_MODE, EFFECT_MOVE_SPEED, EFFECT_EYES = "move_mode", "move_speed", "eyes"
 
 # named eye states -> emote (mirror proto.py / sidecar)
 _EYE_STATES = {"neutral", "happy", "sad", "angry", "surprised", "sleepy", "love", "dizzy",
@@ -261,29 +268,52 @@ class Air2NativeLink(RobotLink):
     # --- control (native RTM) ---
     async def drive(self, ly: float, rx: float, *, generation: int | None = None,
                     epoch: int | None = None) -> dict[str, Any]:
-        # ACKNOWLEDGED: ok reflects real Agora delivery (command_result), not a sidecar stdin write. The motion
-        # ticket's {generation, epoch} (P0 §3) is carried so the sidecar rejects a drive whose ticket was
-        # superseded by a STOP between admission and the actual SDK send.
-        res = await asyncio.to_thread(self.rtm.send_acked, self._ticketed(
-            {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0}, generation, epoch))
+        # agent_next_2 §4.1: a physical drive REQUIRES an admitted motion ticket (epoch+generation). There is NO
+        # fallback to current RtmNode state — an un-ticketed production drive is a protocol failure, rejected here.
+        if generation is None or epoch is None:
+            return {"ok": False, "sent_to_agora": False, "error": "missing_motion_ticket", "ly": ly, "rx": rx}
+        res = await asyncio.to_thread(self.rtm.send_acked,
+                                      {"cmd": "drive", "ly": ly, "rx": rx, "duration": 0.0,
+                                       "generation": int(generation), "epoch": int(epoch)})
         return {**res, "ly": ly, "rx": rx}
 
     async def move(self, ly: float, rx: float, duration: float, *, generation: int | None = None,
                    epoch: int | None = None) -> dict[str, Any]:
-        res = await asyncio.to_thread(self.rtm.send_acked, self._ticketed(
-            {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration}, generation, epoch))
+        if generation is None or epoch is None:
+            return {"ok": False, "sent_to_agora": False, "error": "missing_motion_ticket",
+                    "ly": ly, "rx": rx, "duration": duration}
+        res = await asyncio.to_thread(self.rtm.send_acked,
+                                      {"cmd": "drive", "ly": ly, "rx": rx, "duration": duration,
+                                       "generation": int(generation), "epoch": int(epoch)})
         return {**res, "ly": ly, "rx": rx, "duration": duration}
 
-    @staticmethod
-    def _ticketed(cmd: dict[str, Any], generation: int | None, epoch: int | None) -> dict[str, Any]:
-        """Stamp the admitted motion ticket onto a drive command. When the executor supplies the ticket the
-        sidecar enforces it EXACTLY (stale ticket -> rejected); when absent (legacy direct call) the RtmNode
-        falls back to its current authoritative generation/epoch."""
-        if generation is not None:
-            cmd["generation"] = int(generation)
-        if epoch is not None:
-            cmd["epoch"] = int(epoch)
-        return cmd
+    # --- ticketed effect dispatch (agent_next_2 §4) ---
+    def set_effect_admitter(self, admit, settings_getter) -> None:
+        """Wire the central effect-admission authority (SafetyFloor.admit_effect) + a live settings getter. Until
+        this is wired, NON-zero effects are refused (no legacy bypass in production)."""
+        self._effect_admit = admit
+        self._effect_settings = settings_getter
+
+    async def _effect(self, effect_class: str, cmd: dict[str, Any], *, source: str = "ai") -> dict[str, Any]:
+        """Admit + CORRELATED-send one ticketed physical effect. The admitted EffectTicket (epoch, generation,
+        effect_class, ticket_id) + process/sidecar identity are stamped so the sidecar enforces it a third time.
+        Denied (master STOP / latched / unsynchronized / toggle off) -> refused, no send."""
+        admit = getattr(self, "_effect_admit", None)
+        if admit is None:
+            return {"ok": False, "blocked": "effect admitter not wired"}
+        s = None
+        getter = getattr(self, "_effect_settings", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                s = getter()
+        ticket = admit(effect_class, source, s)
+        if ticket is None:
+            return {"ok": False, "blocked": f"effect '{effect_class}' not admitted (STOP/latched/inhibited)"}
+        full = {**cmd, "effect_class": effect_class, "ticket_id": ticket.ticket_id,
+                "generation": ticket.generation, "epoch": ticket.epoch,
+                "process_instance_id": self.rtm._process_instance_id,
+                "sidecar_instance_id": self.rtm._sidecar_instance_id}
+        return await asyncio.to_thread(self.rtm.send_acked, full, 0.8)
 
     async def stop(self) -> dict[str, Any]:
         return await asyncio.to_thread(self.rtm.send_acked, {"cmd": "stop"})
@@ -312,31 +342,45 @@ class Air2NativeLink(RobotLink):
         rg = (eg + 1) if release_generation is None else int(release_generation)
         return await asyncio.to_thread(self.rtm.reset_reconcile, ee, eg, re, rg, 0.8)
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
+        # agent_next_2 §4.3/§4.4: action() is NOT a safety bypass. Every physical effect is admitted + ticketed +
+        # correlated via _effect(); no rtm._send/raw here.
         n = (name or "").lower()
         if n.startswith("eyes_"):
             state = n[len("eyes_"):]
             if state in _EYE_STATES:
-                self.rtm.status["eyes"] = state
-                res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "eyes", "state": state})
+                res = await self._effect(EFFECT_EYES, {"cmd": "eyes", "state": state}, source=source)
+                if res.get("ok"):
+                    self.rtm.status["eyes"] = state
                 return {**res, "eyes": state}
             return {"ok": False, "error": f"unknown eye state {state}"}
         if n == "dock":
-            res = await asyncio.to_thread(self.rtm.send_acked, {"cmd": "dock"})
-            return {**res, "docking": True}
+            res = await self._effect(EFFECT_DOCK, {"cmd": "dock"}, source=source)
+            return {**res, "docking": res.get("ok", False)}
         if n.startswith("avoid"):
-            return {"ok": self.rtm.avoid(n != "avoid_off")}
+            on = n != "avoid_off"
+            res = await self._effect(EFFECT_AVOID, {"cmd": "avoid", "on": on}, source=source)
+            return {**res, "avoid": on}
         if n.startswith("laser"):
             on = n not in ("laser_off", "laser_0")
-            return {"ok": self.rtm._send({"cmd": "laser", "on": on}), "laser": on}  # typed (raw 103051 banned)
+            res = await self._effect(EFFECT_LASER, {"cmd": "laser", "on": on}, source=source)
+            return {**res, "laser": on}
         if n in ("release", "release_control"):
-            return {"ok": self.rtm._send({"cmd": "release"}), "released": True}
+            res = await self._effect(EFFECT_RELEASE, {"cmd": "release"}, source=source)
+            return {**res, "released": res.get("ok", False)}
         if n in ("resume", "resume_control"):
-            return {"ok": self.rtm._send({"cmd": "resume"}), "resumed": True}
+            res = await self._effect(EFFECT_RESUME, {"cmd": "resume"}, source=source)
+            return {**res, "resumed": res.get("ok", False)}
         if n in ("dock_release", "go_home"):
-            # dock + release our controller heartbeat so the robot's onboard return-to-charge can run
-            return {"ok": self.rtm._send({"cmd": "dock_release"}), "docking": True, "released": True}
+            res = await self._effect(EFFECT_DOCK, {"cmd": "dock_release"}, source=source)
+            return {**res, "docking": res.get("ok", False), "released": res.get("ok", False)}
         return {"ok": False, "error": f"action '{name}' not supported on native Air2"}
+
+    async def set_move_mode(self, mode: int, *, source: str = "ai") -> dict[str, Any]:
+        return await self._effect(EFFECT_MOVE_MODE, {"cmd": "move_mode", "mode": int(mode)}, source=source)
+
+    async def set_move_speed(self, speed: int, *, source: str = "ai") -> dict[str, Any]:
+        return await self._effect(EFFECT_MOVE_SPEED, {"cmd": "move_speed", "speed": int(speed)}, source=source)
 
     async def connection(self, state: str) -> dict[str, Any]:
         """Go-dark / wake. `stop` cuts all robot I/O (stop drive, release controller, drop inbound media) but

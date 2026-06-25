@@ -148,10 +148,24 @@ class OverseerGate(RobotLink):
         return await self._inner.estop_reset(expected_epoch=expected_epoch, expected_generation=expected_generation,
                                              release_epoch=release_epoch, release_generation=release_generation)
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
         if self._on():
             return await self._intercept("action", {"name": name})
-        return await self._inner.action(name)
+        return await self._inner.action(name, source=source)
+
+    # ticketed effect dispatch + admitter wiring pass-throughs (agent_next_2 §4)
+    def set_effect_admitter(self, admit, settings_getter) -> None:
+        fn = getattr(self._inner, "set_effect_admitter", None)
+        if callable(fn):
+            fn(admit, settings_getter)
+
+    async def set_move_mode(self, mode: int, *, source: str = "ai") -> dict[str, Any]:
+        fn = getattr(self._inner, "set_move_mode", None)
+        return await fn(mode, source=source) if callable(fn) else {"ok": False, "error": "unsupported"}
+
+    async def set_move_speed(self, speed: int, *, source: str = "ai") -> dict[str, Any]:
+        fn = getattr(self._inner, "set_move_speed", None)
+        return await fn(speed, source=source) if callable(fn) else {"ok": False, "error": "unsupported"}
 
     async def say_audio(self, g711: bytes, codec: str = "mulaw") -> dict[str, Any]:
         if self._on():

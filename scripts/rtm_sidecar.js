@@ -133,6 +133,20 @@ function result(c, extra) {
 
 function zeroFrame() { return { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }; }
 
+// agent_next_2 §4.5: validate a ticketed physical EFFECT. Returns an error string (rejected) or null (ok).
+// Mandatory identity + ticket; MISSING fields are rejected, not just stale ones. STOP + zero motion bypass this.
+function effectOk(c) {
+  if (latched) return "estop_latched";
+  if (activeStops > 0) return "estop_in_flight";
+  if (c.process_instance_id == null || c.sidecar_instance_id == null) return "missing_identity";
+  if (c.generation == null || c.epoch == null || c.ticket_id == null) return "missing_ticket";
+  if (c.sidecar_instance_id !== SIDECAR_ID) return "wrong_sidecar_instance";
+  if (acceptedProcessId != null && c.process_instance_id !== acceptedProcessId) return "wrong_process_instance";
+  if (c.generation !== generation) return "stale_generation";
+  if (c.epoch !== epoch) return "stale_epoch";
+  return null;
+}
+
 function clearTimers() { for (const t of timers) clearInterval(t); timers = []; }
 
 let _lastNeed = 0;
@@ -445,13 +459,20 @@ async function handle(c) {
       return;
     }
     case "stop": { clearDrive(); return acked(c, RTM_DRIVE, zeroFrame()); }
-    case "eyes": return acked(c, RTM_EMOTE, { voiceIds: [], cycleMode: 0, emojiIds: [EYE_IDS[c.state] ?? 0], moveIds: [] });
-    case "dock": return acked(c, RTM_DOCK, null);
-    case "avoid": return acked(c, RTM_AVOID, { avoidobstacle: c.on !== false });
-    // P0-R4 amendment E: typed control commands (so these never need the generic raw channel).
-    case "laser": return acked(c, RTM_LASER, { laser: c.on !== false });
-    case "move_mode": return acked(c, RTM_MOVE_MODE, { moveMode: c.mode | 0 });
-    case "move_speed": return acked(c, RTM_MOVE_MODE, { moveSpeed: c.speed | 0 });
+    // agent_next_2 §4.5: typed physical effects REQUIRE an admitted ticket + matching identity/epoch/gen and are
+    // refused while latched / mid-STOP. Missing identity or ticket is rejected (not merely stale fields).
+    case "eyes": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_EMOTE, { voiceIds: [], cycleMode: 0, emojiIds: [EYE_IDS[c.state] ?? 0], moveIds: [] }); }
+    case "dock": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_DOCK, null); }
+    case "avoid": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_AVOID, { avoidobstacle: c.on !== false }); }
+    case "laser": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_LASER, { laser: c.on !== false }); }
+    case "move_mode": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_MOVE_MODE, { moveMode: c.mode | 0 }); }
+    case "move_speed": { const e = effectOk(c); if (e) { result(c, { sent_to_agora: false, error: e }); return; }
+      return acked(c, RTM_MOVE_MODE, { moveSpeed: c.speed | 0 }); }
     case "release": {
       // Stop our controller heartbeat so the robot reverts to its OWN autonomy (e.g. low-battery return
       // home). We stay logged into RTM (still receive telemetry) but no longer claim active control.

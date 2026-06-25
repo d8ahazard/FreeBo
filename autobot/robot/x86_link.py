@@ -360,7 +360,7 @@ class X86RobotLink(RobotLink):
         rc = self._send_mavlink(proto.mav_motor(0.0, 0.0))
         return {"ok": rc >= 0}
 
-    async def action(self, name: str) -> dict[str, Any]:
+    async def action(self, name: str, *, source: str = "ai") -> dict[str, Any]:
         s = self._state
         name = name.lower()
         if name == "dock":

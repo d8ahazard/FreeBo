@@ -203,6 +203,40 @@ def test_two_phase_release_clears_latch_and_permits_drive(sc):
     assert sc.result(13)["sent_to_agora"] is True
 
 
+def test_effect_requires_identity_and_ticket(sc):
+    # agent_next_2 §4.5: a typed effect REQUIRES identity + a ticket (missing is rejected, not just stale).
+    sc.send(cmd="dock", command_id=50)
+    assert sc.result(50)["error"] == "missing_identity"
+    sc.send(cmd="dock", command_id=51, process_instance_id="P1", sidecar_instance_id=sc.sid)
+    assert sc.result(51)["error"] == "missing_ticket"
+    sc.send(cmd="dock", command_id=52, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=1, ticket_id=7)
+    assert sc.result(52)["sent_to_agora"] is True
+
+
+def test_effect_rejected_after_stop(sc):
+    sc.send(cmd="estop", command_id=60, epoch=2, generation=2)
+    sc.result(60)
+    sc.send(cmd="laser", command_id=61, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=1, ticket_id=1)
+    assert sc.result(61)["error"] == "estop_latched"
+
+
+def test_effect_stale_epoch_ticket_rejected(sc):
+    # advance to a newer reconciled epoch via two-phase release, then a ticket for the OLD epoch is stale.
+    sc.send(cmd="estop", command_id=70, epoch=5, generation=5)
+    sc.result(70)
+    sc.send(cmd="prepare_reset", command_id=71, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            expected_epoch=5, expected_generation=5, release_epoch=6, release_generation=6)
+    nonce = sc.result(71)["prepare_nonce"]
+    sc.send(cmd="commit_reset", command_id=72, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            prepare_nonce=nonce)
+    sc.result(72)
+    sc.send(cmd="laser", command_id=73, process_instance_id="P1", sidecar_instance_id=sc.sid,
+            epoch=1, generation=6, ticket_id=2)        # epoch 1 is stale (now 6)
+    assert sc.result(73)["error"] == "stale_epoch"
+
+
 def test_parent_death_latches_and_new_instance_starts_latched():
     # agent_next_2 §2.5: closing the parent pipe after an unlatched release must fail-safe (latch + zero + exit);
     # a brand-new sidecar instance then starts LATCHED and refuses effects until a full new reconciliation.
