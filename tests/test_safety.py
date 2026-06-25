@@ -71,7 +71,7 @@ def test_estop_latch_blocks_every_source():
 def test_estop_reset_permits_motion_again():
     sf = _sf()
     sf.estop_latch()
-    sf.estop_reset()
+    sf.arb._unsafe_clear_for_tests()   # no-sidecar test release (production uses the reconciled CAS)
     d = sf.check_drive(settings(autonomy="auto", allow_motion=True, max_speed=0.6), 0.5, 0.0, 1.0, source="manual")
     assert d.allowed
 

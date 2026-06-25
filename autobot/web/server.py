@@ -582,22 +582,38 @@ async def api_resume():
     link/sidecar latch+generation FIRST and stays inhibited if the sidecar reset is not acknowledged; only
     then clears the process latch + master inhibit. Each faculty restores to its own requested toggle;
     autonomy stays manual; circuit-breaker HOLD is left intact (it has its own reset)."""
-    res: dict = {}
-    # P0-R4 atomicity item 2: RESET is a compare-and-swap. Capture (epoch, generation) NOW; reconcile the
-    # link/sidecar; then commit the desired unlatch ONLY if no transition happened meanwhile (a newer STOP
-    # advances the epoch and makes this reset fail, even if the system was already inhibited).
+    # P0-R4 atomicity item 3: ADMISSION FIRST — do not contact the link at all unless a reset is admissible
+    # (no STOP in flight, currently latched+inhibited, no other reset active). The unsafe side effect must not
+    # precede the decision.
     token = brain.safety.begin_reset()
+    if token is None:
+        await _emit_capabilities()
+        return JSONResponse({"ok": False, "error": "reset not admissible (STOP in flight / not latched / "
+                                                    "another reset active); still inhibited"}, status_code=409)
+    res: dict = {}
     try:
         res = await LINK.estop_reset(generation=token.generation) or {}
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     link_ok = bool(res.get("ok", False)) if isinstance(res, dict) else False
-    committed = link_ok and brain.safety.commit_reset(token)   # CAS: fails if a newer STOP intervened
-    if not committed:
+    if not link_ok:
+        brain.safety.abort_reset(token)     # consume the attempt; stays latched
         await _emit_capabilities()
-        reason = (res.get("error") if not link_ok else "superseded by a newer STOP (epoch advanced)") \
-            or "reset not reconciled; still inhibited"
-        return JSONResponse({"ok": False, "error": reason, "reconcile": res}, status_code=409)
+        return JSONResponse({"ok": False, "error": res.get("error") or "link reset not reconciled; still inhibited",
+                             "reconcile": res}, status_code=409)
+    # Link unlatched. Commit the CAS — fails if a newer STOP advanced the epoch while we awaited the link.
+    if not brain.safety.commit_reset(token):
+        # P0-R4 atomicity item 5: the link is now unlatched but the process is NOT — REASSERT the latch to the
+        # sidecar immediately rather than leaving it dangerously unlatched. Keep all faculties inhibited.
+        reassert_err = None
+        with contextlib.suppress(Exception):
+            ra = await LINK.estop(generation=brain.safety.control_generation())
+            if not bool(ra.get("ok") if isinstance(ra, dict) else False):
+                reassert_err = "sidecar relatch not acknowledged"
+        await _emit_capabilities()
+        return JSONResponse({"ok": False, "critical": reassert_err is not None,
+                             "error": "superseded by a newer STOP; sidecar re-latched, still inhibited",
+                             "reassert_error": reassert_err}, status_code=409)
     brain.resume()                          # clear parked state (latch+inhibit already released by the CAS)
     await emit({"type": "estop_reset", "ok": True, "latched": False, "master_inhibited": False})
     await emit({"type": "settings", "changed": [], "settings": SETTINGS.public_dict()})

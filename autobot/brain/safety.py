@@ -33,83 +33,158 @@ class Decision:
 
 
 @dataclass
+class StopToken:
+    """Identity of ONE master-STOP dispatch (P0-R4 atomicity item 1). Tracked while its transport send is in
+    flight; only this exact token's completion clears it, so an older STOP finishing can't make a newer STOP
+    look done."""
+    epoch: int
+    generation: int
+    dispatch_id: int
+
+
+@dataclass
 class ResetToken:
-    """A compare-and-swap snapshot captured when a RESET begins (P0-R4 atomicity). The reset may commit only
-    if the arbiter's (epoch, generation) are STILL these values when the sidecar response arrives — so a newer
-    STOP (which advanced the epoch) makes the old reset fail, even if the system was already inhibited."""
+    """A single-use compare-and-swap snapshot captured when a RESET is ADMITTED. The reset may commit only if
+    it is still the active attempt, no STOP is in flight, and (epoch, generation) are unchanged."""
     reset_attempt_id: int
     epoch: int
     generation: int
 
 
+@dataclass
+class MotionTicket:
+    """An admission ticket for one motion dispatch (P0-R4 atomicity item 8). Validated again immediately
+    before the write reaches the sidecar, so a drive admitted before a STOP cannot dispatch after it."""
+    epoch: int
+    generation: int
+
+
 class ControlArbiter:
-    """The ONE process-side control-transition authority (P0-R4 atomicity amendment). Every STOP / RESET /
-    reconnect / drive-admission consults this single RLock-protected object so latch + generation + epoch
-    transitions are atomic and monotonic. STOP always advances the transition epoch AND generation (idempotent
-    STATE is fine; idempotent transition IDENTITY is not). Observed-sidecar state lives in the link layer
-    (RtmNode); the arbiter owns the DESIRED state + the instance check is done link-side."""
+    """The ONE process-side control-transition authority (P0-R4 atomicity). Every STOP / RESET / motion
+    admission consults this single RLock-protected object. ALL access is via lock-protected methods — callers
+    must never read mutable fields directly (item 9)."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self.transition_epoch = 0
-        self.desired_generation = 0
-        self.desired_latched = False
-        self.master_inhibited = False
-        self.estop_in_flight = False
-        self._reset_attempt = 0
+        self._epoch = 0
+        self._generation = 0
+        self._latched = False
+        self._inhibited = False
+        self._active_stops: set[int] = set()   # dispatch_ids of STOPs whose transport send is in flight
+        self._dispatch_seq = 0
+        self._reset_seq = 0
+        self._active_reset_id: Optional[int] = None
 
-    def begin_master_stop(self) -> dict:
-        """STOP: assert local inhibit + motion latch, ALWAYS advance epoch + generation (even if already
-        inhibited), mark an E-STOP dispatch in flight. Returns the exact {generation, epoch} the caller must
-        stamp on the transport command. The single synchronous entry for every STOP source."""
+    # --- transitions ---
+    def begin_master_stop(self) -> StopToken:
+        """STOP: assert inhibit + latch, ALWAYS advance epoch + generation, register a tracked in-flight
+        dispatch, and invalidate any in-progress reset admission. Returns this STOP's unique token."""
         with self._lock:
-            self.transition_epoch += 1
-            self.desired_generation += 1
-            self.desired_latched = True
-            self.master_inhibited = True
-            self.estop_in_flight = True
-            return {"generation": self.desired_generation, "epoch": self.transition_epoch}
+            self._epoch += 1
+            self._generation += 1
+            self._latched = True
+            self._inhibited = True
+            self._dispatch_seq += 1
+            did = self._dispatch_seq
+            self._active_stops.add(did)
+            self._active_reset_id = None    # a new STOP cancels any pending reset admission
+            return StopToken(self._epoch, self._generation, did)
 
-    def latch_motion(self) -> dict:
-        """Motion-only latch (non-master reflex/barge-in). Still monotonic in epoch + generation."""
+    def latch_motion(self) -> StopToken:
+        """Motion-only latch (reflex/barge-in). Monotonic; NOT a tracked master dispatch (dispatch_id 0)."""
         with self._lock:
-            self.transition_epoch += 1
-            self.desired_generation += 1
-            self.desired_latched = True
-            return {"generation": self.desired_generation, "epoch": self.transition_epoch}
+            self._epoch += 1
+            self._generation += 1
+            self._latched = True
+            return StopToken(self._epoch, self._generation, 0)
 
-    def end_estop_dispatch(self) -> None:
+    def end_estop_dispatch(self, token: StopToken) -> None:
+        """Clear ONLY this STOP's in-flight marker."""
         with self._lock:
-            self.estop_in_flight = False
+            self._active_stops.discard(token.dispatch_id)
 
-    def begin_reset(self) -> ResetToken:
+    def stop_in_flight(self) -> bool:
         with self._lock:
-            self._reset_attempt += 1
-            return ResetToken(self._reset_attempt, self.transition_epoch, self.desired_generation)
+            return bool(self._active_stops)
+
+    # --- reset admission + CAS (items 3, 4) ---
+    def begin_reset(self) -> Optional[ResetToken]:
+        """Admit a reset ONLY when safe to even contact the link: no STOP in flight, currently latched +
+        inhibited, and no other reset already active. Returns None (rejected) otherwise."""
+        with self._lock:
+            if self._active_stops:
+                return None
+            if not (self._inhibited and self._latched):
+                return None
+            if self._active_reset_id is not None:
+                return None
+            self._reset_seq += 1
+            self._active_reset_id = self._reset_seq
+            return ResetToken(self._reset_seq, self._epoch, self._generation)
 
     def commit_reset(self, token: ResetToken) -> bool:
-        """CAS: clear the desired latch/inhibit ONLY if no transition happened since the reset began and no
-        E-STOP dispatch is in flight. A newer STOP (advanced epoch) makes this fail."""
+        """Single-use CAS. Consumes the token on EVERY path (commit or abort), so it can never commit twice.
+        Commits only if it is the active attempt, nothing is in flight, and (epoch, generation) are unchanged."""
         with self._lock:
-            if self.estop_in_flight:
+            if token.reset_attempt_id != self._active_reset_id:
+                return False                 # not the active attempt / already consumed
+            self._active_reset_id = None      # consume
+            if self._active_stops:
                 return False
-            if token.epoch != self.transition_epoch or token.generation != self.desired_generation:
+            if token.epoch != self._epoch or token.generation != self._generation:
                 return False
-            self.desired_latched = False
-            self.master_inhibited = False
+            self._latched = False
+            self._inhibited = False
             return True
 
-    def force_clear(self) -> None:
-        """Unconditional unlatch/release (simple links / mock with no sidecar to reconcile)."""
+    def abort_reset(self, token: ResetToken) -> None:
         with self._lock:
-            self.desired_latched = False
-            self.master_inhibited = False
+            if token.reset_attempt_id == self._active_reset_id:
+                self._active_reset_id = None
+
+    # --- motion admission (item 8) ---
+    def admit_motion(self) -> Optional[MotionTicket]:
+        with self._lock:
+            if self._inhibited or self._latched or self._active_stops:
+                return None
+            return MotionTicket(self._epoch, self._generation)
+
+    def validate_ticket(self, ticket: MotionTicket) -> bool:
+        with self._lock:
+            return (not self._inhibited and not self._latched and not self._active_stops
+                    and ticket.epoch == self._epoch and ticket.generation == self._generation)
+
+    # --- lock-protected reads (item 9) ---
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch
+
+    def is_latched(self) -> bool:
+        with self._lock:
+            return self._latched
+
+    def is_master_inhibited(self) -> bool:
+        with self._lock:
+            return self._inhibited
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {"transition_epoch": self.transition_epoch, "desired_generation": self.desired_generation,
-                    "desired_latched": self.desired_latched, "master_inhibited": self.master_inhibited,
-                    "estop_in_flight": self.estop_in_flight}
+            return {"transition_epoch": self._epoch, "desired_generation": self._generation,
+                    "desired_latched": self._latched, "master_inhibited": self._inhibited,
+                    "stop_in_flight": bool(self._active_stops),
+                    "reset_active": self._active_reset_id is not None}
+
+    def _unsafe_clear_for_tests(self) -> None:
+        """TEST/no-sidecar ONLY — never a production release path (item 10)."""
+        with self._lock:
+            self._latched = False
+            self._inhibited = False
+            self._active_stops.clear()
+            self._active_reset_id = None
 
 
 @dataclass
@@ -165,10 +240,13 @@ class SafetyFloor:
         speed clamp is non-negotiable; see .cursor/rules/30-safety.mdc)."""
         # Master STOP inhibit + latched E-STOP are the hardest gates — they block EVERY source
         # (manual/overseer included). Nothing moves until RESUME reconciles + clears it.
-        if self.arb.master_inhibited:
+        snap = self.arb.snapshot()
+        if snap["master_inhibited"]:
             return Decision(False, "master_inhibited (STOP)")
-        if self.arb.desired_latched:
+        if snap["desired_latched"]:
             return Decision(False, "estop_latched")
+        if snap["stop_in_flight"]:
+            return Decision(False, "estop dispatch in flight")
         ai = source in ("ai", "recovery")
         if ai and not getattr(s, "allow_motion", True):
             return Decision(False, "motion disabled by the user (Control toggle)")
@@ -194,56 +272,58 @@ class SafetyFloor:
     # --- latched emergency stop ---
     def estop_latch(self) -> int:
         """Motion-only latch (reflex/barge-in). Bumps generation + epoch via the arbiter. Returns generation."""
-        return self.arb.latch_motion()["generation"]
+        return self.arb.latch_motion().generation
 
     # --- the single STOP/RESET transition entries (P0-R4 atomicity) ---
-    def begin_master_stop(self) -> dict:
-        """The ONE synchronous master-STOP transition: assert inhibit+latch, advance epoch+generation ALWAYS,
-        mark dispatch in flight. Returns {generation, epoch} to stamp on the transport command."""
+    def begin_master_stop(self) -> "StopToken":
+        """The ONE synchronous master-STOP transition. Returns a StopToken (epoch, generation, dispatch_id)."""
         return self.arb.begin_master_stop()
 
-    def end_estop_dispatch(self) -> None:
-        self.arb.end_estop_dispatch()
+    def end_estop_dispatch(self, token: "StopToken") -> None:
+        self.arb.end_estop_dispatch(token)
 
-    def begin_reset(self) -> ResetToken:
+    def begin_reset(self) -> Optional[ResetToken]:
+        """Admit a reset (None if rejected — STOP in flight / not latched / another reset active)."""
         return self.arb.begin_reset()
 
     def commit_reset(self, token: ResetToken) -> bool:
         return self.arb.commit_reset(token)
 
-    def transition_epoch(self) -> int:
-        return self.arb.transition_epoch
+    def abort_reset(self, token: ResetToken) -> None:
+        self.arb.abort_reset(token)
 
-    def estop_reset(self) -> None:
-        """Unconditional unlatch/release (simple links / mock). The reconciled CAS path is begin_reset/
-        commit_reset; use that with a sidecar."""
-        self.arb.force_clear()
+    def admit_motion(self) -> Optional[MotionTicket]:
+        return self.arb.admit_motion()
+
+    def validate_ticket(self, ticket: MotionTicket) -> bool:
+        return self.arb.validate_ticket(ticket)
+
+    def stop_in_flight(self) -> bool:
+        return self.arb.stop_in_flight()
+
+    def transition_epoch(self) -> int:
+        return self.arb.epoch()
 
     def is_latched(self) -> bool:
-        return self.arb.desired_latched
+        return self.arb.is_latched()
 
     def control_generation(self) -> int:
-        return self.arb.desired_generation
+        return self.arb.generation()
 
-    # --- master autonomous-faculty inhibit (STOP/RESUME) ---
-    def master_inhibit(self) -> int:
-        """Back-compat alias for begin_master_stop(); returns the new generation. Prefer begin_master_stop()
-        which returns the epoch too. STOP always advances epoch + generation (one transition identity)."""
-        return self.arb.begin_master_stop()["generation"]
-
-    def master_release(self) -> None:
-        """RESUME: clear the master faculty inhibit. Callers should prefer commit_reset() (CAS); this is the
-        unconditional release used after a validated reconciliation."""
-        self.arb.force_clear()
-
+    # --- master autonomous-faculty inhibit ---
     def is_master_inhibited(self) -> bool:
-        return self.arb.master_inhibited
+        return self.arb.is_master_inhibited()
+
+    # NOTE (P0-R4 atomicity item 10): there is intentionally NO public unconditional master_inhibit /
+    # master_release / estop_reset / force_clear. STOP goes through begin_master_stop() (tokenized); release
+    # happens ONLY through the reconciled CAS commit_reset(). Tests use arb._unsafe_clear_for_tests().
 
     # --- central faculty authority (P0-R4.1) ---
     def _faculty(self, capability: str, requested: bool, s: Settings,
                  extra_reason: str = "") -> FacultyDecision:
         """Common faculty decision: master inhibit > asleep > requested toggle > faculty-specific extra."""
-        if self.arb.master_inhibited:
+        snap = self.arb.snapshot()
+        if snap["master_inhibited"]:
             eff, reason = False, "master STOP"
         elif getattr(s, "asleep", False):
             eff, reason = False, "asleep"
@@ -254,8 +334,8 @@ class SafetyFloor:
         else:
             eff, reason = True, ""
         return FacultyDecision(allowed=eff, capability=capability, reason=reason,
-                               master_inhibited=self.arb.master_inhibited, requested_enabled=requested,
-                               effective_enabled=eff, generation=self.arb.desired_generation, ts=time.time())
+                               master_inhibited=snap["master_inhibited"], requested_enabled=requested,
+                               effective_enabled=eff, generation=snap["desired_generation"], ts=time.time())
 
     def check_think(self, s: Settings) -> FacultyDecision:
         return self._faculty(CAP_THINK, bool(getattr(s, "allow_think", True)), s)
@@ -276,9 +356,12 @@ class SafetyFloor:
         means: requested + not master/asleep/latched + autonomy permits AI motion + scope not hold."""
         requested = bool(getattr(s, "allow_motion", True))
         extra = ""
-        if not self.arb.master_inhibited and not getattr(s, "asleep", False) and requested:
-            if self.arb.desired_latched:
+        snap = self.arb.snapshot()
+        if not snap["master_inhibited"] and not getattr(s, "asleep", False) and requested:
+            if snap["desired_latched"]:
                 extra = "estop_latched"
+            elif snap["stop_in_flight"]:
+                extra = "estop dispatch in flight"
             elif not self.autonomy_allows_motion(s):
                 extra = f"autonomy '{s.autonomy}'"
             elif self._scope == "hold":
@@ -299,8 +382,10 @@ class SafetyFloor:
             # The faculty view says OK but the agent found a richer blocker (stale telem/video, etc.).
             caps[CAP_MOTION]["effective"] = False
             caps[CAP_MOTION]["reason"] = motion_reason
-        return {"master_inhibited": self.arb.master_inhibited, "generation": self.arb.desired_generation,
-                "transition_epoch": self.arb.transition_epoch, "capabilities": caps, "ts": time.time()}
+        snap = self.arb.snapshot()
+        return {"master_inhibited": snap["master_inhibited"], "generation": snap["desired_generation"],
+                "transition_epoch": snap["transition_epoch"], "stop_in_flight": snap["stop_in_flight"],
+                "capabilities": caps, "ts": time.time()}
 
     def set_quiet(self, seconds: float) -> None:
         """'Shut up' — drop `say` for this many seconds (a temporary hush, distinct from the talk toggle)."""
@@ -310,7 +395,7 @@ class SafetyFloor:
         return time.time() < self._quiet_until
 
     def check_say(self, s: Settings) -> Decision:
-        if self.arb.master_inhibited:
+        if self.arb.is_master_inhibited():
             return Decision(False, "master_inhibited (STOP)")
         if getattr(s, "asleep", False):
             return Decision(False, "asleep")

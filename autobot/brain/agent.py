@@ -1527,26 +1527,27 @@ class AgentBrain:
         Returns a STRUCTURED result (never swallowed) so callers can report local safety state and transport
         dispatch INDEPENDENTLY (P0-R4 item 1 + amendment A): `local_inhibit_asserted`, `local_motion_latched`,
         `executor_preempted`, `transport_dispatch_succeeded`, `transport_result`, `generation`, `error`."""
-        result = {"reason": reason, "master": master, "latch": latch, "epoch": None,
+        result = {"reason": reason, "master": master, "latch": latch, "epoch": None, "dispatch_id": None,
                   "local_inhibit_asserted": False, "local_motion_latched": False,
                   "executor_preempted": False, "transport_dispatch_succeeded": False,
-                  "transport_result": None, "generation": self.safety.control_generation(), "error": None}
+                  "transport_result": None, "generation": None, "error": None}
+        tok = None
         if master:
-            # P0-R4 atomicity item 1: ONE synchronous begin_master_stop() asserts inhibit+latch and ALWAYS
-            # advances epoch+generation. The endpoint must NOT also call master_inhibit() — this is the single
-            # transition. estop_in_flight is set here and cleared after the transport dispatch below.
+            # P0-R4 atomicity items 1+2: ONE begin_master_stop() returns THIS stop's token. We stamp the link
+            # E-STOP with the token's OWN generation and clear ONLY this token's in-flight marker afterward —
+            # we never re-read control_generation() (which a concurrent STOP could have advanced).
             tok = self.safety.begin_master_stop()
-            result["epoch"] = tok["epoch"]
+            result["epoch"], result["generation"], result["dispatch_id"] = tok.epoch, tok.generation, tok.dispatch_id
             self._stopped = True            # park: reasoner/idle loops no-op until RESUME
             self._reason_gen += 1           # invalidate any in-flight reason cycle (P0-R4 item 9)
             with contextlib.suppress(Exception):
                 self.settings.update(autonomy="manual")
         elif latch:
-            self.safety.estop_latch()       # motion-only latch (reflex/barge-in); monotonic
+            tok = self.safety.arb.latch_motion()   # motion-only latch (reflex/barge-in); monotonic
+            result["epoch"], result["generation"] = tok.epoch, tok.generation
         result["local_inhibit_asserted"] = (self.safety.is_master_inhibited() if master
                                             else self.safety.is_latched())
         result["local_motion_latched"] = self.safety.is_latched()
-        result["generation"] = self.safety.control_generation()
         if cancel_tts:
             from . import audio_state
             with contextlib.suppress(Exception):
@@ -1556,19 +1557,19 @@ class AgentBrain:
             result["executor_preempted"] = True
         except Exception as e:  # noqa: BLE001
             result["error"] = f"preempt: {type(e).__name__}: {e}"
-        if latch or master:
-            # Contract is normalized: EVERY link's estop() accepts `generation` (no TypeError fallback).
+        if tok is not None:
+            # Stamp the transport with THIS stop's generation (item 2 — never another stop's).
             try:
-                tr = await self.link.estop(generation=self.safety.control_generation())
+                tr = await self.link.estop(generation=tok.generation)
                 result["transport_result"] = tr
                 result["transport_dispatch_succeeded"] = _link_transport_ok(tr)
             except Exception as e:  # noqa: BLE001
                 result["error"] = f"estop: {type(e).__name__}: {e}"
             finally:
                 if master:
-                    # Dispatch recorded -> clear the in-flight flag so a subsequent RESET CAS can proceed
-                    # (a NEW stop in the meantime advanced the epoch and will still fail the old reset).
-                    self.safety.end_estop_dispatch()
+                    # Clear ONLY this token's in-flight marker — an older STOP finishing can't unblock a newer
+                    # STOP, and RESET stays blocked until every STOP dispatch has cleared.
+                    self.safety.end_estop_dispatch(tok)
         if behavior_stop:
             with contextlib.suppress(Exception):
                 self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again

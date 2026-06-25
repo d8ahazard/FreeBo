@@ -1,8 +1,8 @@
-"""P0-R4 atomicity — ControlArbiter compare-and-swap + monotonic transition tests.
+"""P0-R4 atomicity — ControlArbiter tokenized STOP tracking, reset admission/CAS, motion admission.
 
-These prove the single process-side transition authority: STOP always advances epoch+generation (even when
-already inhibited), and a RESET commits only via CAS — a newer STOP (advanced epoch) makes an older reset
-fail, including under forced concurrent ordering.
+Forced-ordering tests (barriers/events where concurrency matters) prove: STOP always advances epoch+gen even
+when inhibited; an older STOP finishing does not unblock a newer in-flight STOP; RESET is admission-gated +
+single-use CAS; a motion ticket admitted before STOP is rejected after.
 """
 from __future__ import annotations
 
@@ -11,66 +11,101 @@ import threading
 from autobot.brain.safety import ControlArbiter
 
 
+def _stopped_ready_for_reset() -> ControlArbiter:
+    a = ControlArbiter()
+    tok = a.begin_master_stop()
+    a.end_estop_dispatch(tok)
+    return a
+
+
 def test_stop_advances_epoch_and_generation_even_when_already_inhibited():
     a = ControlArbiter()
     t1 = a.begin_master_stop()
-    t2 = a.begin_master_stop()           # already inhibited, but a NEW transition identity
-    assert t2["epoch"] > t1["epoch"]
-    assert t2["generation"] > t1["generation"]
-    assert a.master_inhibited and a.desired_latched
+    t2 = a.begin_master_stop()
+    assert t2.epoch > t1.epoch and t2.generation > t1.generation
+    assert t1.dispatch_id != t2.dispatch_id
+    assert a.is_master_inhibited() and a.is_latched()
 
 
-def test_reset_cas_succeeds_when_nothing_changed():
+def test_overlapping_stops_older_finishing_first_keeps_in_flight():
+    # Item 1 required ordering: A begins (blocked), B begins (blocked), A completes -> still in flight (B),
+    # RESET must be refused; only after B completes is reset admissible.
     a = ControlArbiter()
-    a.begin_master_stop()
-    a.end_estop_dispatch()
+    a_tok = a.begin_master_stop()
+    b_tok = a.begin_master_stop()
+    a.end_estop_dispatch(a_tok)             # older STOP completes first
+    assert a.stop_in_flight() is True
+    assert a.begin_reset() is None          # B still in flight -> reset refused
+    a.end_estop_dispatch(b_tok)
+    assert a.stop_in_flight() is False
+    assert a.begin_reset() is not None      # now admissible
+
+
+def test_reset_admission_rejected_when_not_latched():
+    a = ControlArbiter()
+    assert a.begin_reset() is None          # never stopped -> not latched/inhibited
+
+
+def test_reset_admission_rejected_while_stop_in_flight():
+    a = ControlArbiter()
+    a.begin_master_stop()                   # not ended -> in flight
+    assert a.begin_reset() is None
+
+
+def test_only_one_active_reset_attempt():
+    a = _stopped_ready_for_reset()
+    t1 = a.begin_reset()
+    assert t1 is not None
+    assert a.begin_reset() is None          # a second concurrent reset is refused
+
+
+def test_reset_cas_succeeds_when_unchanged():
+    a = _stopped_ready_for_reset()
     tok = a.begin_reset()
     assert a.commit_reset(tok) is True
-    assert a.desired_latched is False and a.master_inhibited is False
+    assert not a.is_latched() and not a.is_master_inhibited()
+
+
+def test_reset_token_is_single_use():
+    a = _stopped_ready_for_reset()
+    tok = a.begin_reset()
+    assert a.commit_reset(tok) is True
+    assert a.commit_reset(tok) is False     # cannot commit twice
 
 
 def test_reset_cas_fails_after_a_newer_stop():
-    # The exact required ordering: STOP@epoch -> RESET captures epoch -> newer STOP advances -> RESET rejected.
-    a = ControlArbiter()
-    a.begin_master_stop()
-    a.end_estop_dispatch()
-    tok = a.begin_reset()                 # captures the current epoch/generation
-    a.begin_master_stop()                 # a NEWER stop advances the epoch
-    a.end_estop_dispatch()
-    assert a.commit_reset(tok) is False   # the stale reset cannot clear anything
-    assert a.desired_latched is True and a.master_inhibited is True
-
-
-def test_estop_in_flight_blocks_reset_commit():
-    a = ControlArbiter()
-    a.begin_master_stop()                 # leaves estop_in_flight=True (no end_estop_dispatch)
+    a = _stopped_ready_for_reset()
     tok = a.begin_reset()
+    nt = a.begin_master_stop()              # newer STOP advances epoch (also cancels the active reset id)
+    a.end_estop_dispatch(nt)
     assert a.commit_reset(tok) is False
-    a.end_estop_dispatch()
-    assert a.commit_reset(tok) is True    # now permitted (nothing else changed)
+    assert a.is_latched() and a.is_master_inhibited()
 
 
-def test_concurrent_stop_during_reset_forces_cas_failure():
-    # Force the race with barriers: the reset captures its token, then a STOP runs on another thread BEFORE
-    # the reset commits. The commit must observe the advanced epoch and fail.
+def test_motion_admission_and_stale_ticket_after_stop():
+    # Item 8: a ticket admitted before STOP must be rejected after STOP.
     a = ControlArbiter()
-    a.begin_master_stop()
-    a.end_estop_dispatch()
-    tok = a.begin_reset()
+    ticket = a.admit_motion()
+    assert ticket is not None and a.validate_ticket(ticket) is True
+    nt = a.begin_master_stop()
+    assert a.validate_ticket(ticket) is False    # stale (epoch advanced + latched)
+    a.end_estop_dispatch(nt)
+    assert a.admit_motion() is None              # still latched/inhibited
 
-    captured = threading.Barrier(2)
-    stop_done = threading.Event()
+
+def test_concurrent_stop_blocks_reset_admission_under_barrier():
+    a = _stopped_ready_for_reset()
+    barrier = threading.Barrier(2)
+    done = threading.Event()
 
     def stopper():
-        captured.wait()            # both threads aligned at this point
-        a.begin_master_stop()      # newer STOP advances epoch
-        a.end_estop_dispatch()
-        stop_done.set()
+        barrier.wait()
+        a.begin_master_stop()    # in flight (not ended) -> reset must be refused
+        done.set()
 
     t = threading.Thread(target=stopper)
     t.start()
-    captured.wait()
-    stop_done.wait(2.0)            # ensure the newer STOP landed before we attempt commit
+    barrier.wait()
+    done.wait(2.0)
     t.join(2.0)
-    assert a.commit_reset(tok) is False
-    assert a.desired_latched is True
+    assert a.begin_reset() is None
