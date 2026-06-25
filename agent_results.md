@@ -1,105 +1,152 @@
 # Agent Results
 
-> WORK IN PROGRESS — `agent_next_5.md` ("Run the Supervised R4.0 Gate, Then Begin Phase 2 Benchmarking").
-> Communicate only here. Phase 0 software stays ACCEPTED/FROZEN. **Hardware is NOT run by the agent**: the
-> supervised R4.0 gate (§4) requires a physically-present human operator + an interactive arming ceremony, which
-> the directive forbids auto-arming/inferring. The agent delivers the §1 preflight corrections + the honest §3
-> R4.0 runner + tests, commits a clean preflight SHA, and STOPS at the physical boundary for the operator.
+> `agent_next_5.md`. The agent completed the §1 preflight corrections + the honest §3 supervised R4.0 runner +
+> tests and ran the §2 preflight software gate. **Hardware was NOT run**: §4 (the supervised R4.0 smoke) requires
+> a physically-present operator + an interactive arming ceremony, which the directive forbids the agent from
+> auto-arming or inferring. The robot is untouched; the gate awaits the operator. §5 (Phase 2) stays BLOCKED.
 
 ## Directive
-`agent_next_5.md`: fix the §1 production-path preflight defects, build an honest supervised R4.0 runner (§3),
-then (operator) run the R4.0 smoke gate (§4); conditionally begin a Phase 2 model benchmark (§5) ONLY if R4.0
-passes. Hardware execution and Phase 2 are gated on a physically-present operator and a hardware PASS.
+`agent_next_5.md`: fix the §1 production-path preflight defects, build an honest supervised R4.0 runner (§3), then
+(operator) run the R4.0 smoke (§4); conditionally begin a Phase 2 model benchmark (§5) ONLY after an R4.0 PASS.
 
 ## Baseline SHA
-- agent_next_4 tested code SHA `e7763058d6b7db23c8c2dc3032e7dbf44d623aa0`; final report
-  `eaef25d5ed89ebb0bf421bd246a7ef9956096e97`.
-- Canonical suite at baseline: 243 passed, 2 hardware-gated skips, exit 0. Real Node child-process tests ran.
-  Software-only R4.0 rehearsal 12/12. Hardware was not run.
+- agent_next_4 tested code SHA `e7763058d6b7db23c8c2dc3032e7dbf44d623aa0`; report
+  `eaef25d5ed89ebb0bf421bd246a7ef9956096e97`. Suite 243 passed / 2 hardware-skips / exit 0; rehearsal 12/12.
 - Environment: win32 (Win 10.0.26200), Python 3.10.11, Node v22.16.0.
 
 ## Review disposition
-Phase 1 is accepted; the §1 findings are real preflight corrections (no phase downgrade). Status of each is
-tracked in **Preflight defects corrected** below.
+Phase 1 accepted. All seven §1 findings were real and are corrected as preflight (no phase downgrade). The 1.1
+static audit additionally uncovered FIVE more un-ticketed production motion call sites beyond the three named.
 
 ## Preflight defects corrected
-- **1.1 Manual motion drops the ticket id** — `/api/control` (manual + overseer) and the overseer calibration
-  probe admitted a ticket but called `LINK.drive()/move()` with only epoch+generation, so the Air 2 native link
-  (which mandates `ticket_id`) fails closed on the real robot. (pending)
-- **1.2 Descending cursor pagination wrong** — `seq > cursor` was applied regardless of order; descending pages
-  repeat newer rows. Fix to order-aware semantics + validate the cursor's session/sequence domain. (pending)
-- **1.3 Recovery may restore the oldest tail** — streaming each file from its start + a global budget can restore
-  a large active file's OLDEST rows and starve rotated history. Fix to bounded newest-tail recovery in true
-  chronological order. (pending)
-- **1.4 Writer shutdown can strand the writer** — a full queue makes `put_nowait(None)` fail so no sentinel
-  reaches the writer; the join times out and the file can close while the daemon writer is alive. Fix so the
-  writer always observes closure, drains to the deadline, and the file is never closed while it can still write.
-  (pending)
-- **1.5 Loopback trust unsafe behind a reverse proxy** — trusting `request.client.host==127.0.0.1` exposes
-  observability through a local proxy. Fix: require the owner token whenever the configured bind is non-loopback,
-  regardless of peer address; fail closed; never trust `X-Forwarded-For`/`Forwarded`. (pending)
-- **1.6 Harness not yet an honest R4.0 gate runner** — addressed by the §3 rewrite. (pending)
-- **1.7 Stale software counts in acceptance docs** — update `docs/PHASE0_ACCEPTANCE.md` to the current immutable
-  evidence (243), preserving the old snapshot as history. (pending)
+- **1.1 Manual/auto motion dropped the ticket id — FIXED.** Every production `drive()/move()` now passes the full
+  ticket (epoch+generation+ticket_id): `/api/control` (manual + overseer), the overseer calibration probe, and
+  (caught by the new audit) `locomotion.turn/step/reverse`, `motion_profile` calibration, and `go_to_place`. The
+  static authority audit now FAILS on any production motion call carrying epoch/generation without ticket_id. New
+  API contract test proves manual Air 2 motion reaches the fake sidecar with the full ticket; a partial ticket
+  fails closed before transport.
+- **1.2 Descending cursor pagination — FIXED.** Order-aware (`asc: seq>cursor`, `desc: seq<cursor`); the opaque
+  cursor preserves + reports its session; a malformed cursor raises → the API returns HTTP 400. Tests: asc/desc
+  3-page walks with no dup/omission, malformed 400, foreign-session resume by durable seq.
+- **1.3 Newest-tail recovery — FIXED.** Retained files processed in true chronological order; the newest
+  `recover_max_events` recovered via bounded reverse-line reading (not the first records); persistent queries
+  scan each file's newest tail so a large active file can't starve rotated history. Tests added.
+- **1.4 Writer shutdown — FIXED.** The writer ALWAYS observes closure via `_closing` (a full queue can drop the
+  sentinel); the file is closed by the writer itself (never under a live writer); exact undrained count;
+  idempotent repeat close. Deterministic full-queue shutdown test (blocked writer is not force-closed mid-write).
+- **1.5 Reverse-proxy access — FIXED.** The access decision keys on the CONFIGURED bind, not the peer: a loopback
+  bind is allowed; a non-loopback bind requires `AUTOBOT_OWNER_TOKEN` via `X-Owner-Token` for EVERY request
+  (fail-closed; `X-Forwarded-For`/`Forwarded` never trusted). A proxy-forwarded 127.0.0.1 peer cannot bypass.
+- **1.6 R4.0 runner — DONE.** See §R4.0 arming and runner.
+- **1.7 Stale acceptance docs — FIXED.** `docs/PHASE0_ACCEPTANCE.md` now references the current immutable evidence
+  (243), with the old 162-pass snapshot kept only as history.
 
 ## Preflight tested code SHA
-(pending)
+**`48396440a58bc22ad68e01b5427ad730e095a932`** (`4839644`) — the clean commit the focused groups, full suite,
+rehearsal, and frontend build were all run against. The hardware run MUST reference this exact SHA. Evidence
+commit `662ee53`; this report is committed last (distinct SHA).
+
+Commit wave: `2b3a912` baseline · `ee76803` 1.1 · `3aca23d` 1.2–1.5 · `4839644` 1.6/§3 runner + 1.7 docs ·
+`662ee53` preflight evidence.
 
 ## Preflight exact tests and exit codes
-(pending)
+- Focused groups: `pytest -q -p no:recording test_authority_audit test_api_contract test_observability
+  test_observability_api test_hardware_harness test_rtm_node test_sidecar_protocol` → **92 passed, exit 0**
+  (real Node child-process tests ran).
+- Rehearsal: `python scripts/phase1_rehearsal.py` → **12/12 PASS, exit 0** (mock link + real Node FAKE sidecar
+  only; `ready_for_supervised_R4_0=true`).
+- Canonical full suite: `python -X faulthandler -m pytest -q -p no:recording` → **260 passed, 2 skipped, exit 0**
+  (~88s). Skipped (both intentional, `--hardware`-gated): `tests/test_hardware.py` [1] and [2].
 
 ## R4.0 arming and operator checklist
-(pending — built by the agent; EXECUTED by the operator)
+The runner (`scripts/hardware_smoke.py --mode r4_0 --armed`) refuses ALL motion until every arming condition
+passes (§3.1): `--mode r4_0` + `--armed` + the typed presence phrase `I AM PHYSICALLY PRESENT` + a clean git tree
++ the exact tested preflight SHA (`--expect-sha 4839644`) + the running app reporting the SAME software SHA + a
+live AIR2 link + synchronized process/sidecar control + a healthy journal writer + the operator confirming the
+7-item physical safety checklist (flat floor, 2 m clear radius, hazards excluded, operator within reach, STOP
+visible, intervention path, battery/telemetry/video live). `--auto` is diagnostics-only and can never arm or pass.
+Caps: forward ≤0.20, turn ≤0.18, duration ≤0.60 s, normal stop after each ordinary motion, explicit reconciled
+RESUME after each master STOP, freshness gate, never an unbounded held drive.
 
 ## R4.0 physical evidence SHA
-NOT RUN by the agent. Requires a physically-present operator (§4).
+NONE — not run by the agent. When the operator runs it, evidence lands under
+`data/test-evidence/hardware/<sha>/r4_0/<timestamp>/`.
 
 ## R4.0 trial results
 NOT RUN.
 
 ## R4.0 acceptance report
-NOT RUN.
+NOT RUN. The runner computes `acceptance_report()` (required trial counts, STOP local-inhibit/transport/observed-
+halt/no-post-stop-motion/latch/stale-effect-rejected/explicit-RESUME, stop/ack/motion-dispatch p95, journal
+health); any missing measurement fails the gate. Verified by 16 harness unit tests with a simulated client.
 
 ## R4.0 verdict
-**NOT RUN — pending supervised operator execution.** The directive forbids the agent from arming/inferring
-presence; `--auto` is diagnostics-only and can never pass.
+**NOT RUN — pending supervised operator execution.** No PASS may be claimed without operator observations.
 
 ## Phase status
 - Phase 0 software gate: ACCEPTED, FROZEN
 - Phase 0 physical gate: PENDING (R4.0 not yet run)
 - Phase 1 observability: COMPLETE FOR R4.0
-- Phase 2 cognition/model benchmarking: BLOCKED (conditional on an R4.0 PASS, which requires the operator)
+- Phase 2 cognition/model benchmarking: BLOCKED (requires an R4.0 PASS)
 - Phase 3 personality: BLOCKED
 
 ## Conditional Phase 2 status
-NOT ENTERED. §5 begins only after an R4.0 PASS in this wave; R4.0 was not run (no operator present).
+NOT ENTERED. §5 begins only after an R4.0 PASS in this wave; R4.0 was not run (no physically-present operator).
 
 ## Benchmark architecture
-(not entered)
+Not entered (Phase 2 gated on R4.0 PASS).
 
 ## Benchmark candidates actually tested
-(not entered)
+None (Phase 2 not entered).
 
 ## Benchmark results
-(not entered)
+None (Phase 2 not entered).
 
 ## Recommended model stack
-(not entered)
+None (Phase 2 not entered).
 
 ## Proposed configuration changes
-(none applied; none proposed — Phase 2 not entered)
+None proposed and none applied (Phase 2 not entered). No production model configuration was changed.
 
 ## Exact final tests and exit codes
-(pending)
+As in "Preflight exact tests and exit codes" above (focused 92, full suite 260/2-skip, rehearsal 12/12; all exit
+0). No physical trials were run.
 
 ## Frontend build evidence
-(pending)
+`cd webui ; npm ci ; npm run build` → tsc clean, exit 0. Byte-identical to agent_next_4 (no webui changes this
+wave): entry `assets/index-BR_lsTOm.js`
+sha256 `FA856A1B887E068076E8ECF4A1D4FEE7671F18D164215D5759AA9497FADEE91B`; CSS `assets/index-BfsfA-T8.css`
+sha256 `85C8A1DB3716BA29103596CF06CEE1ABBC9C350D3D1EF95DBBEF5EB50CE03AE7`; `index.html`
+sha256 `BBF1B84DA0B6EEE1D3E52F79F477C6051697AD4AAD5590DCE95C992E3B5F65E4`.
 
 ## Machine-readable evidence paths
-(pending)
+Under `data/test-evidence/software/48396440a58bc22ad68e01b5427ad730e095a932/`:
+- `summary.json` — counts, exit codes, env, frontend hashes, defects corrected, hardware status.
+- `fullsuite.txt` — raw full-suite output (260 passed / 2 skipped / exit 0).
+- `rehearsal/rehearsal_report.json` + `rehearsal/scenario_*.json` — 12/12 redacted bundles.
+
+## How the operator runs the supervised R4.0 gate (handoff)
+1. Place the EBO Air 2 per the physical safety checklist; keep the UI STOP visible and stay within reach.
+2. Check out the exact tested SHA and confirm a clean tree: `git checkout 4839644` (no local edits).
+3. Start the app against the live robot (AIR2 link); confirm `/api/hardware_gate` reports `software_sha` =
+   `48396440a58bc22ad68e01b5427ad730e095a932`, `journal_health.writer_alive=true`, and readiness
+   `synchronized=true`.
+4. Run: `python scripts/hardware_smoke.py --mode r4_0 --armed --expect-sha 48396440a58bc22ad68e01b5427ad730e095a932 --base http://127.0.0.1:8200`
+   (add `--owner-token <token>` if the app binds non-loopback). Type the presence phrase + answer every physical
+   observation honestly (`?` = unknown = not a pass).
+5. On PASS, record: Phase 0 physical gate = R4.0 SMOKE PASSED; R4.10 PENDING; Phase 2 = AUTHORIZED. On FAIL/ABORT,
+   the robot is left latched + inhibited; fix only the observed issue and stop. A PASS is NOT authorization for
+   R4.10. Phase 2 only begins after a recorded R4.0 PASS.
 
 ## Known limitations
-(pending)
+- The agent cannot perform §4 (physical R4.0) or §5 (Phase 2 benchmark) — both require a physically-present
+  operator / an R4.0 PASS. Delivered: the preflight corrections + the runner + tests, ready to execute.
+- Deterministic STOP scenarios are orchestrated through EXISTING APIs (capped move + connection bounce); no new
+  motion-capable endpoint was added (the directive's optional gated endpoint was intentionally avoided to keep the
+  motion attack surface minimal). The "executor_move" scenario is approximated by a longer capped move.
+- The connect-time `set_control` remains assert-latch-only (documented; unchanged).
 
 ## Working-tree status
-In progress.
+All code + evidence committed (tested preflight SHA `4839644`; evidence `662ee53`). This report is committed last
+(distinct SHA). `webui/dist/` is a gitignored build artifact (hashes above). The robot was not contacted; no
+hardware was run.
