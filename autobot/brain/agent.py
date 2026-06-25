@@ -318,9 +318,11 @@ class AgentBrain:
             allowed = (intent in commands.ALWAYS) or addressed or self.identity.authority_active(s)
             if allowed:
                 if intent == "STOP" and self._loop is not None:   # instant halt, even mid-think
+                    # P0-R4 item 5: voice STOP is the SAME master STOP as the red button — one meaning for
+                    # "STOP". Operator-only RESUME lifts it (listening is inhibited while stopped).
                     try:
                         asyncio.run_coroutine_threadsafe(
-                            self.emergency_stop("voice STOP", cancel_tts=True, behavior_stop=True), self._loop)
+                            self.emergency_stop("voice STOP", cancel_tts=True, master=True), self._loop)
                     except Exception:  # noqa: BLE001
                         pass
                 self._post("command", {"intent": intent, "text": text})
@@ -342,7 +344,10 @@ class AgentBrain:
     async def _handle_critical_async(self, intent: str) -> None:
         """Apply a barge-in command immediately: cancel our own TTS, preempt + stop the robot, then run the
         command. The clock for this started at the detected keyword (in the worker), not at utterance endpoint."""
-        await self.emergency_stop(f"barge-in {intent}", cancel_tts=True)   # cancel TTS + preempt + stop NOW
+        # P0-R4 item 5: barge-in STOP is the SAME master STOP path; barge-in QUIET only hushes (cancel TTS,
+        # not a master inhibit).
+        is_stop = str(intent).lower() == "stop"
+        await self.emergency_stop(f"barge-in {intent}", cancel_tts=True, master=is_stop)
         try:
             s = self.settings.snapshot()
             await self._apply_command(intent, "", s)   # STOP -> hold position; QUIET -> hush window
@@ -1566,8 +1571,9 @@ class AgentBrain:
         """Apply a matched voice order (preempts normal reasoning). Side effects first, then for the
         non-terminal ones let the cortex acknowledge + act under the new behavior."""
         if intent == "STOP":
-            await self.emergency_stop("STOP command", cancel_tts=True, behavior_stop=True)
-            await self.emit({"type": "thought", "text": "(stopping — holding position)", "ts": time.time()})
+            # P0-R4 item 5: one meaning for STOP — the master inhibit (operator RESUME required).
+            await self.emergency_stop("STOP command", cancel_tts=True, master=True)
+            await self.emit({"type": "thought", "text": "(MASTER STOP — inhibited until RESUME)", "ts": time.time()})
             await self._set_status("idle", "stopped (you told me to)")
             return
         if intent == "QUIET":
