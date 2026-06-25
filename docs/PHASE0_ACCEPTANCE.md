@@ -1,7 +1,13 @@
 # Phase 0 — Acceptance
 
-Phase 0 passes ONLY when the physical evidence passes. Status today: **FAIL** (software gates met +
-unit/integration-verified; hardware gates NOT run — hardware eligibility = NO).
+Phase 0 has TWO separate gates (do NOT conflate them):
+- **Software safety gate: ACCEPTED FOR PHASE 1** (agent_next_3 Gate A) — the software safety architecture is
+  accepted and Phase 1 observability is authorized.
+- **Physical gate: PENDING — HARDWARE NOT RUN** — the supervised R4.0 smoke + R4.10 acceptance have not been
+  executed on the live Air 2. Hardware eligibility = NO. Physical movement is disabled by policy.
+
+Phase 0 is NOT "fully passed": software acceptance for Phase 1 and physical acceptance are distinct. The frozen
+Phase 0 software invariant list lives in `docs/ROADMAP.md`.
 
 Raw machine-readable evidence is stored under `data/test-evidence/` (immutable summary tied to the tested
 commit). Hardware runs are joint (operator + live Air 2).

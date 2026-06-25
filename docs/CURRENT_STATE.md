@@ -50,18 +50,22 @@ PHASE0_ACCEPTANCE.md for the gates.
   STOP distinguishes inhibit vs degraded; capability heartbeat repairs the STOP banner; toggles never show an
   ability effective before the kernel reports it.
 
-## Open blockers (Phase 0 = FAIL)
-- **Hardware not run**: the E-STOP smoke gate (R4.0) and full hardware acceptance (R4.10) have NOT been
-  executed on the live Air 2. Nothing here is hardware-validated. Hardware eligibility = NO.
-- **Non-drive effect-command ticket enforcement** in the sidecar (dock/laser/move_mode/avoid/release/resume)
-  is not complete (they carry identity + use the correlated path, but are not per-command ticket-rejected yet).
-- **Air 2 requires the Agora cloud** (internet); there is no verified local-only Air 2 control. EBO Max is
-  unverified.
+## Phase gate status
+- **Phase 0 software safety gate: ACCEPTED FOR PHASE 1** (agent_next_3 Gate A). All physical effects — including
+  `drive` — now require the full mandatory authority ticket, validated in the sidecar (`driveTicketError` /
+  `effectOk`); the active-drive repeat + delayed-stop are bound to the full per-drive ticket.
+- **Phase 0 physical gate: PENDING — HARDWARE NOT RUN.** R4.0 smoke + R4.10 acceptance not executed on the
+  live Air 2. Hardware eligibility = NO. Physical movement is disabled by policy.
+- **Phase 1 observability: AUTHORIZED.** Phase 2 / Phase 3: BLOCKED pending the R4.0 physical smoke.
+- See `docs/ROADMAP.md` for the frozen Phase 0 software invariant list (may not be weakened without a reviewed
+  migration). Do NOT describe Phase 0 as fully passed — software acceptance and physical acceptance are separate.
+- **Air 2 requires the Agora cloud** (internet); no verified local-only Air 2 control. EBO Max unverified.
 
 ## Test gate
-The canonical suite `python -X faulthandler -m pytest -q -p no:recording` passes (162 passed, 3 skipped) and
-has been observed to exit 0 on three consecutive fresh runs (~62s each) with no leaked tasks / no socketpair
-hang. See PHASE0_ACCEPTANCE.md for the reproducible commands + counts and `agent_results.md` for the run log.
+The canonical suite `python -X faulthandler -m pytest -q -p no:recording` passes and has run clean three
+consecutive times on Windows (the per-test loop `socketpair` flake is fixed by a bounded retry in
+`tests/conftest.py`). See PHASE0_ACCEPTANCE.md for reproducible commands + actual counts and `agent_results.md`
+for the per-run evidence (committed under `data/test-evidence/software/<sha>/`).
 
 ## How the UI is served
 `autobot/web/server.py` serves `webui/dist/index.html` + `/assets/*`. `webui/dist` is gitignored; build via
