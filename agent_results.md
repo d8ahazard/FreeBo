@@ -97,21 +97,31 @@ unexpected motion was reported. Root cause (see below). Robot left **latched + i
 the wave stops here; only the observed issue is to be fixed; **no broad refactor; Phase 2 NOT entered.**
 
 ### Root cause (from evidence, not inference)
-1. **Cloud motion-dispatch latency ~0.5–1.0 s (p95 1031 ms vs 250 ms target).** Drive commands reach the robot
-   over the Agora/RTM cloud path with high, variable lag.
-2. **The 100 ms drive keepalive repeat** (sidecar `driveRepeat`, by design so the robot's deadman doesn't cut a
-   pulse) bunches under that lag, so a short 0.4–0.6 s pulse presents as several discrete same-direction nudges —
-   the operator's "repeating itself." It is latch-safe (each repeat checks `!latched`), so every pulse still
-   halted.
+1. **PRIMARY — the R4.0 forward cap (0.20) is below the Air 2 forward deadband (0.25).** `autobot/brain/
+   motion_model.py` AIR2: `forward_deadband=0.25`, `forward_min=0.30`, `forward_unit_speed=0.33`. A normalized
+   forward command of 0.20 is below the threshold that produces ANY forward drive, so the forward pulses did not
+   travel — only the 100 ms keepalive twitch was visible ("repeating itself"). Turn cap 0.18 is in the usable
+   band (turn_deadband=0.10, turn_min=0.12), so turns DID move — matching the operator's observation. The
+   directive §3.3 forward cap (≤0.20) was set for conservatism without the Air 2 deadband in mind; the harness
+   sends the raw capped magnitude (it bypasses the closed-loop cerebellum that normally drives at ~0.33). The app
+   sets no onboard `moveSpeed` at startup, so the robot ran at the firmware default.
+2. **Cloud motion-dispatch latency ~0.5–1.0 s (p95 1031 ms vs 250 ms target)** over the Agora/RTM path —
+   secondary; it bunches the 100 ms keepalive repeats and breaks the STOP-scenario timing.
 3. **Harness staging flaw:** the master-STOP scenario fires a 0.6 s pulse then immediately the STOP; under ~1 s
-   dispatch lag the pulse auto-zeroes (its `driveStopTimer`) BEFORE the STOP lands, so there is no active motion
-   to halt → the operator cannot observe a STOP-arresting-motion → correct abort.
+   lag the pulse auto-zeroes (its `driveStopTimer`) BEFORE the STOP lands, so there is no active motion to halt →
+   correct abort.
 
-### Narrow fix candidates (not yet applied — operator to choose; no broad refactor)
-- Harness: for STOP scenarios, keep the robot in motion until the STOP fires using back-to-back capped pulses
-  (each still ≤0.20/≤0.18 mag, ≤0.6 s, no unbounded held drive) so a STOP-during-motion is observable.
-- Investigate/measure the cloud motion-dispatch latency (the dominant real issue) before re-running R4.0.
-- Neither touches the safety floor or the frozen Phase 0 invariants.
+No safety failure: every observed motion halted, no post-stop or unexpected motion, STOP dispatched + latched +
+inhibited on every attempt.
+
+### Narrow fix candidates (NOT applied — require operator authorization; deviate from §3.3 / no broad refactor)
+- **Raise the R4.0 forward cap above the deadband** (e.g. forward 0.30 ≈ `forward_min`, still ≪ `forward_max`
+  0.55 and ≪ the safety-floor `max_speed`) so forward actually moves. This is a deliberate deviation from the
+  directive's ≤0.20 forward cap and needs explicit sign-off.
+- Optionally set a higher onboard `moveSpeed` first and re-measure the effective deadband.
+- Harness: for STOP scenarios keep the robot in motion until the STOP fires via back-to-back capped pulses (no
+  unbounded held drive) so a STOP-during-motion is observable under the cloud latency.
+- None of these touch the safety floor or the frozen Phase 0 invariants.
 
 ## Phase status
 - Phase 0 software gate: ACCEPTED, FROZEN
