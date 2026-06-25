@@ -97,6 +97,23 @@ def test_fail_pending_releases_blocked_waiters():
     assert 999 not in n._pending
 
 
+def test_result_wrong_kind_cannot_satisfy_waiter():
+    # agent_next_2 §3.3: a result with the correct command id but the WRONG command kind must not resolve a
+    # waiter (and must not adopt state from the mismatched result).
+    n, _ = _node()
+    n._sidecar_instance_id = "SID"
+    evt = threading.Event()
+    n._pending[7] = {"event": evt, "result": None, "kind": "commit_reset"}
+    n._handle_event({"ev": "command_result", "command_id": 7, "cmd": "drive", "sidecar_instance_id": "SID",
+                     "sent_to_agora": True, "generation": 99})
+    assert not evt.is_set() and n._pending[7]["result"] is None
+    assert n._sidecar_gen != 99                         # mismatched result did not mutate observed state
+    # the correct kind resolves it
+    n._handle_event({"ev": "command_result", "command_id": 7, "cmd": "commit_reset", "sidecar_instance_id": "SID",
+                     "reconciled": True, "latched": False})
+    assert evt.is_set()
+
+
 def test_duplicate_command_result_is_ignored():
     n, _ = _node()
     # No pending slot for this id -> a late/duplicate result must not raise or mis-resolve anything.

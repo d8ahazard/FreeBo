@@ -44,9 +44,12 @@ class RtmNode:
         self.connected = False
         self.last_error: Optional[str] = None
         self._proc: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()             # serializes stdin writes
+        self._state_lock = threading.RLock()      # agent_next_2 §3.1: guards ALL protocol/identity/reset state
         self._running = False
+        self._closing = False                     # set under state lock during deterministic shutdown
         self._thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
         self._logs: deque[str] = deque(maxlen=300)
         # --- command acknowledgment (P0-R3.1): correlate each acked command to the sidecar's real Agora send
         #     result, so callers learn ACTUAL delivery instead of stdin-write success. ---
@@ -87,15 +90,21 @@ class RtmNode:
         self._thread.start()
 
     def stop(self) -> None:
+        # agent_next_2 §3.6: deterministic shutdown — mark closing, fail pending, kill child, then bounded-join
+        # BOTH the manager thread and the tracked stderr-reader thread, and clear instance/control-ready state.
+        with self._state_lock:
+            self._closing = True
         self._running = False
         self._kill()
-        # P0 §6: bounded join of the reader/manager thread so teardown doesn't leave a thread blocked on a
-        # now-dead pipe (daemon=True already prevents a hard hang; the join keeps shutdown deterministic).
-        t = self._thread
-        if t is not None and t.is_alive():
-            with contextlib.suppress(Exception):
-                t.join(timeout=2.0)
+        for t in (self._thread, self._stderr_thread):
+            if t is not None and t.is_alive():
+                with contextlib.suppress(Exception):
+                    t.join(timeout=2.0)
         self._thread = None
+        self._stderr_thread = None
+        with self._state_lock:
+            self._sidecar_instance_id = None
+            self._sidecar_control_ready = False
 
     def _fail_pending(self, reason: str) -> None:
         """Release every blocked send_acked waiter immediately (P0-R4.4) so a sidecar exit/reconnect can't
@@ -179,9 +188,14 @@ class RtmNode:
         self._proc = subprocess.Popen(
             [node, str(SIDECAR)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, cwd=str(REPO_ROOT))
-        threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
-        self._connect()  # push an initial session
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, args=(self._proc,),
+                                               name="rtm-stderr", daemon=True)
+        self._stderr_thread.start()
         assert self._proc.stdout is not None
+        # agent_next_2 §3.2: read + validate the `ready` line and BIND that exact sidecar instance BEFORE we
+        # connect/reconcile. The sidecar starts latched + control-not-ready; we only mark synchronized after an
+        # exact reconcile. (We never fire-and-forget an UNLATCH — set_control can only assert a latch now.)
+        bound = False
         for line in self._proc.stdout:
             if not self._running:
                 break
@@ -191,6 +205,14 @@ class RtmNode:
             try:
                 ev = json.loads(line)
             except Exception:  # noqa: BLE001
+                continue
+            if not bound and ev.get("ev") == "ready":
+                self._handle_event(ev)                 # binds sidecar_instance_id (control-not-ready)
+                if not self._sidecar_instance_id:
+                    self.last_error = "sidecar 'ready' without an instance id"
+                    return
+                self._connect()                         # connect + latch-preserving reconcile (after ready)
+                bound = True
                 continue
             self._handle_event(ev)
 
@@ -245,18 +267,32 @@ class RtmNode:
                                           "error": "result_from_replaced_sidecar"}
                         slot["event"].set()
                 return   # do not fall through to on_event / state adoption
-            # Learn the sidecar's authoritative latch/generation/epoch + control-readiness from every echo.
-            if ev.get("generation") is not None:
-                self._sidecar_gen = int(ev.get("generation"))
-            if ev.get("latched") is not None:
-                self._sidecar_latched = bool(ev.get("latched"))
-            if ev.get("epoch") is not None:
-                self._sidecar_epoch = int(ev.get("epoch"))
-            if ev.get("control_ready") is not None:
-                self._sidecar_control_ready = bool(ev.get("control_ready"))
-            if ev.get("accepted_process_id") is not None:
-                self._sidecar_accepted_process = ev.get("accepted_process_id")
             cid = ev.get("command_id")
+            # agent_next_2 §3.3: STRICT correlation — a result must not satisfy a waiter when the command KIND
+            # differs from what that slot is waiting for (a correct id but wrong kind cannot resolve it).
+            if cid is not None:
+                with self._pending_lock:
+                    slot = self._pending.get(cid)
+                if slot is not None:
+                    want = slot.get("kind")
+                    got = ev.get("cmd")
+                    if want is not None and got is not None and want != got:
+                        self._last_reconcile_error = f"result_kind_mismatch:{got}!={want}"
+                        self._logs.append(f"[warn] result kind mismatch cid={cid} {got}!={want}")
+                        return   # do NOT satisfy the waiter or adopt state from a mismatched result
+            # Learn the sidecar's authoritative latch/generation/epoch + control-readiness from every (validated)
+            # echo, under the state lock (§3.1).
+            with self._state_lock:
+                if ev.get("generation") is not None:
+                    self._sidecar_gen = int(ev.get("generation"))
+                if ev.get("latched") is not None:
+                    self._sidecar_latched = bool(ev.get("latched"))
+                if ev.get("epoch") is not None:
+                    self._sidecar_epoch = int(ev.get("epoch"))
+                if ev.get("control_ready") is not None:
+                    self._sidecar_control_ready = bool(ev.get("control_ready"))
+                if ev.get("accepted_process_id") is not None:
+                    self._sidecar_accepted_process = ev.get("accepted_process_id")
             if cid is not None:
                 with self._pending_lock:
                     slot = self._pending.get(cid)
@@ -390,14 +426,14 @@ class RtmNode:
         """Process vs sidecar control identity/epoch/generation/latch for the readiness surface (P0 §2 + §5).
         `synchronized` False means the two disagree — a sidecar restart not yet reconciled, an instance
         mismatch, control not ready, or differing epoch/generation/latch — and motion MUST be blocked."""
-        synced = (self._sidecar_instance_id is not None
+        with self._state_lock:
+          synced = (self._sidecar_instance_id is not None
                   and self._sidecar_control_ready
                   and self._auth_gen == self._sidecar_gen
                   and self._auth_epoch == self._sidecar_epoch
                   and self._auth_latched == self._sidecar_latched
-                  and (self._sidecar_accepted_process is None
-                       or self._sidecar_accepted_process == self._process_instance_id))
-        return {"process_instance_id": self._process_instance_id,
+                  and self._sidecar_accepted_process == self._process_instance_id)
+          return {"process_instance_id": self._process_instance_id,
                 "sidecar_instance_id": self._sidecar_instance_id,
                 "sidecar_control_ready": self._sidecar_control_ready,
                 "process_latched": self._auth_latched, "process_generation": self._auth_gen,
@@ -437,7 +473,8 @@ class RtmNode:
         # closed (stays latched).
         evt = threading.Event()
         with self._pending_lock:
-            self._pending[cid] = {"event": evt, "result": None}
+            # §3.3: record the expected command KIND so a wrong-kind result can never satisfy this waiter.
+            self._pending[cid] = {"event": evt, "result": None, "kind": cmd.get("cmd")}
         t0 = time.monotonic()
         if not self._send({**cmd, "command_id": cid}):
             with self._pending_lock:
