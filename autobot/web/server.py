@@ -541,20 +541,34 @@ async def _emit_capabilities() -> None:
 
 @app.post("/api/estop")
 async def api_estop():
-    """MASTER STOP (P0-R4.2): a master autonomous-faculty inhibit. The inhibit + motion latch + generation
-    bump are set FIRST (synchronously, before any await) so every faculty is blocked immediately; then we
-    cancel TTS, park reasoning, preempt the executor, slam a link-level zero-frame burst, and drop to manual.
-    Operator video + telemetry + RTM health + UI stay alive. Stays inhibited until an explicit /api/resume."""
-    gen = brain.safety.master_inhibit()     # set the gate NOW, before awaiting anything
+    """MASTER STOP (P0-R4.1 + amendment A). The master inhibit + motion latch + generation bump are set FIRST
+    (synchronously, before any await) so every faculty is blocked immediately; then the ONE stop path cancels
+    TTS, invalidates reasoning, preempts the executor, and invokes the TRUE link-level estop() exactly once
+    (through OverseerGate -> the real link). We do NOT call a plain LINK.stop() afterward and call it a hard
+    stop. Operator video + telemetry + UI stay alive.
+
+    Returns INDEPENDENT facts (never overloading `ok`): `ok` is the success of the whole requested operation
+    (i.e. transport actually dispatched). Local inhibit/latch are reported separately and remain set on EVERY
+    failure. The response is degraded (HTTP 503) when the link E-STOP did not dispatch."""
+    gen = brain.safety.master_inhibit()     # set the gate NOW, before awaiting anything (local, synchronous)
     SETTINGS.update(autonomy="manual")
-    with contextlib.suppress(Exception):
-        await brain.emergency_stop("estop", cancel_tts=True, master=True)
-    with contextlib.suppress(Exception):
-        await LINK.stop()
-    await emit({"type": "estop", "ok": True, "latched": True, "master_inhibited": True, "generation": gen})
+    res = await brain.emergency_stop("estop", cancel_tts=True, master=True)
+    local_inhibit = brain.safety.is_master_inhibited()
+    local_latched = brain.safety.is_latched()
+    transport_ok = bool(res.get("transport_dispatch_succeeded"))
+    payload = {
+        "ok": transport_ok,                       # amendment A: ok=false on any degraded/failed transport
+        "local_inhibit_asserted": local_inhibit,
+        "local_motion_latched": local_latched,
+        "transport_dispatch_succeeded": transport_ok,
+        "generation": gen,
+        "error": None if transport_ok else (res.get("error") or "link E-STOP not dispatched"),
+    }
+    await emit({"type": "estop", **payload, "latched": local_latched, "master_inhibited": local_inhibit})
     await emit({"type": "settings", "changed": ["autonomy"], "settings": SETTINGS.public_dict()})
     await _emit_capabilities()
-    return JSONResponse({"ok": True, "latched": True, "master_inhibited": True, "generation": gen})
+    # Local safety is asserted regardless; a transport failure is surfaced as a degraded response, NOT 2xx.
+    return JSONResponse(payload, status_code=200 if transport_ok else 503)
 
 
 @app.post("/api/resume")

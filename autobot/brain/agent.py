@@ -59,6 +59,19 @@ CORTEX_EVERY = 4
 # Event priorities (lower = handled first). Commands + speech + manual preempt autonomous wandering.
 _PRIORITY = {"command": 0, "speech": 0, "manual": 0, "state": 1, "touch": 1, "idle": 2}
 
+
+def _link_transport_ok(tr) -> bool:
+    """Did a link-level E-STOP actually DISPATCH at the transport layer? Honest reading of a link result —
+    prefers the sidecar's explicit `initial_zero_sdk_send_succeeded`, then `sent_to_agora`, never a bare `ok`
+    that might only mean 'local state asserted' (P0-R4 amendment A)."""
+    if not isinstance(tr, dict):
+        return False
+    if tr.get("initial_zero_sdk_send_succeeded") is not None:
+        return bool(tr["initial_zero_sdk_send_succeeded"])
+    if tr.get("sent_to_agora") is not None:
+        return bool(tr["sent_to_agora"])
+    return bool(tr.get("ok"))
+
 VISION_PROMPT = (
     "You are the eyes of a small two-wheeled roaming robot. In 1-3 concise sentences, describe this camera "
     "frame for navigation: where the open floor/clear paths are (left/center/right), obstacles or walls and "
@@ -140,6 +153,7 @@ class AgentBrain:
         self._was_touched = False
         self._idle_pending = False   # coalesce idle triggers so a slow reasoner can't accumulate a backlog
         self._stopped = False        # master STOP parked state: reasoner/idle loops no-op until RESUME (P0-R4.2)
+        self._reason_gen = 0          # reason generation: bumped on master STOP to invalidate in-flight cycles (P0-R4.6)
         self._reflex_active = False  # ToF reflex currently engaged (obstacle very close) — anti-spam latch
         self._reflex_blocked = False  # arm a one-shot "turn, don't go forward" hint for the next cortex decision
         # Deterministic navigator (midbrain) state: roam-tick counter + anti-spin memory.
@@ -1493,40 +1507,53 @@ class AgentBrain:
 
     async def emergency_stop(self, reason: str, *, cancel_tts: bool = False,
                              behavior_stop: bool = False, latch: bool = False,
-                             master: bool = False) -> None:
+                             master: bool = False) -> dict:
         """The ONE stop path used by every STOP source (recognized STOP, barge-in, STOP tool, ToF + visual
         reflex, manual takeover, shutdown/error). It (1) sets the gate — `master` STOP inhibits ALL autonomous
-        faculties + latches motion + drops to manual; `latch` is the motion-only latch (reflex/barge-in);
-        (2) cancels in-flight TTS, (3) parks reasoning so the reasoner stops acting, (4) preempts the active
-        ActionExecutor action, (5) issues a latched hard-stop burst at the link layer, (6) updates behavior.
-        Safe to call when nothing is active (it just stops)."""
+        faculties + latches motion + drops to manual + invalidates the current reason generation; `latch` is
+        the motion-only latch (reflex/barge-in); (2) cancels in-flight TTS, (3) preempts the active
+        ActionExecutor action, (4) issues the link-level latched E-STOP exactly once, (5) updates behavior.
+
+        Returns a STRUCTURED result (never swallowed) so callers can report local safety state and transport
+        dispatch INDEPENDENTLY (P0-R4 item 1 + amendment A): `local_inhibit_asserted`, `local_motion_latched`,
+        `executor_preempted`, `transport_dispatch_succeeded`, `transport_result`, `generation`, `error`."""
+        result = {"reason": reason, "master": master, "latch": latch,
+                  "local_inhibit_asserted": False, "local_motion_latched": False,
+                  "executor_preempted": False, "transport_dispatch_succeeded": False,
+                  "transport_result": None, "generation": self.safety.control_generation(), "error": None}
         if master:
             self.safety.master_inhibit()    # inhibit all faculties + latch motion + bump generation
             self._stopped = True            # park: reasoner/idle loops no-op until RESUME
+            self._reason_gen += 1           # invalidate any in-flight reason cycle (P0-R4 item 6)
             with contextlib.suppress(Exception):
                 self.settings.update(autonomy="manual")
         elif latch:
             self.safety.estop_latch()       # sync; sets the gate immediately (server also latches before await)
+        result["local_inhibit_asserted"] = (self.safety.is_master_inhibited() if master
+                                            else self.safety.is_latched())
+        result["local_motion_latched"] = self.safety.is_latched()
+        result["generation"] = self.safety.control_generation()
         if cancel_tts:
             from . import audio_state
-            audio_state.cancel()
+            with contextlib.suppress(Exception):
+                audio_state.cancel()
         try:
             await self.executor.preempt(reason)
-        except Exception:  # noqa: BLE001
-            pass
+            result["executor_preempted"] = True
+        except Exception as e:  # noqa: BLE001
+            result["error"] = f"preempt: {type(e).__name__}: {e}"
         if latch or master:
-            est = getattr(self.link, "estop", None)
-            if est is not None:
-                gen = self.safety.control_generation()
-                try:
-                    await est(generation=gen)   # carry the authoritative generation (P0-R4.4)
-                except TypeError:
-                    with contextlib.suppress(Exception):
-                        await est()              # link whose estop() takes no generation kwarg
-                except Exception:  # noqa: BLE001
-                    pass
+            # Contract is normalized: EVERY link's estop() accepts `generation` (no TypeError fallback).
+            try:
+                tr = await self.link.estop(generation=self.safety.control_generation())
+                result["transport_result"] = tr
+                result["transport_dispatch_succeeded"] = _link_transport_ok(tr)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = f"estop: {type(e).__name__}: {e}"
         if behavior_stop:
-            self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
+            with contextlib.suppress(Exception):
+                self.behavior.set_voice_intent("stopped", seconds=3600.0)  # stay put until told to move again
+        return result
 
     def resume(self) -> None:
         """RESUME (operator): clear the master faculty inhibit + parked state. The caller (server) MUST have
