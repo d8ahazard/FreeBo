@@ -21,6 +21,24 @@ CAP_LISTEN = "listen"
 CAP_SEE = "ai_vision"
 CAPABILITIES = (CAP_THINK, CAP_MOTION, CAP_SPEAK, CAP_LISTEN, CAP_SEE)
 
+# P0 (agent_next_2 §1): the closed set of physical effect classes. EVERY non-zero robot effect is one of these
+# and must carry an admitted EffectTicket. E-STOP and zero/deadman motion are the only always-permitted effects
+# (they are not admitted as tickets). Read-only telemetry / operator video are NOT effects.
+EFFECT_MOTION = "motion"
+EFFECT_DOCK = "dock"
+EFFECT_RELEASE = "release"            # give up controller ownership (robot autonomy)
+EFFECT_RESUME = "resume"             # re-claim controller ownership
+EFFECT_MOVE_MODE = "move_mode"
+EFFECT_MOVE_SPEED = "move_speed"
+EFFECT_AVOID = "avoid"
+EFFECT_LASER = "laser"
+EFFECT_EYES = "eyes"
+EFFECT_SPEECH = "speech"
+EFFECT_CALIBRATION = "calibration"
+EFFECT_CLASSES = (EFFECT_MOTION, EFFECT_DOCK, EFFECT_RELEASE, EFFECT_RESUME, EFFECT_MOVE_MODE,
+                  EFFECT_MOVE_SPEED, EFFECT_AVOID, EFFECT_LASER, EFFECT_EYES, EFFECT_SPEECH,
+                  EFFECT_CALIBRATION)
+
 
 @dataclass
 class Decision:
@@ -52,11 +70,19 @@ class ResetToken:
 
 
 @dataclass
-class MotionTicket:
-    """An admission ticket for one motion dispatch (P0-R4 atomicity item 8). Validated again immediately
-    before the write reaches the sidecar, so a drive admitted before a STOP cannot dispatch after it."""
+class EffectTicket:
+    """An admission ticket for ONE physical robot effect (agent_next_2 §1.1). Carries the control transition it
+    was admitted under (epoch, generation), the effect class, and a unique ticket id. Re-validated immediately
+    before the write reaches the sidecar and a THIRD time inside the sidecar — so an effect admitted before a
+    STOP cannot dispatch after it, at any hop. Motion uses `effect_class=motion` (the `MotionTicket` alias)."""
     epoch: int
     generation: int
+    effect_class: str = EFFECT_MOTION
+    ticket_id: int = 0
+
+
+# Motion is just the motion-class effect ticket. Kept as a name for the motion call sites + existing tests.
+MotionTicket = EffectTicket
 
 
 class ControlArbiter:
@@ -74,6 +100,7 @@ class ControlArbiter:
         self._dispatch_seq = 0
         self._reset_seq = 0
         self._active_reset_id: Optional[int] = None
+        self._effect_seq = 0          # monotonic ticket-id source for admitted effects
 
     # --- transitions ---
     def begin_master_stop(self) -> StopToken:
@@ -142,14 +169,23 @@ class ControlArbiter:
             if token.reset_attempt_id == self._active_reset_id:
                 self._active_reset_id = None
 
-    # --- motion admission (item 8) ---
-    def admit_motion(self) -> Optional[MotionTicket]:
+    # --- effect / motion admission (item 8 + agent_next_2 §1.1) ---
+    def admit_effect(self, effect_class: str) -> Optional[EffectTicket]:
+        """Admit ONE physical effect: a unique-ticket-id snapshot of the current transition, ONLY when not
+        inhibited/latched and no STOP is in flight. Mechanical gate only — per-class POLICY (autonomy, talk
+        toggle, etc.) is applied by SafetyFloor.admit_effect before calling this."""
         with self._lock:
             if self._inhibited or self._latched or self._active_stops:
                 return None
-            return MotionTicket(self._epoch, self._generation)
+            self._effect_seq += 1
+            return EffectTicket(self._epoch, self._generation, effect_class, self._effect_seq)
 
-    def validate_ticket(self, ticket: MotionTicket) -> bool:
+    def admit_motion(self) -> Optional[EffectTicket]:
+        return self.admit_effect(EFFECT_MOTION)
+
+    def validate_ticket(self, ticket: EffectTicket) -> bool:
+        """A ticket is valid only while the control transition it was admitted under is still current and motion
+        is permitted (not inhibited/latched, no STOP in flight). Epoch+generation must match exactly."""
         with self._lock:
             return (not self._inhibited and not self._latched and not self._active_stops
                     and ticket.epoch == self._epoch and ticket.generation == self._generation)
@@ -295,7 +331,24 @@ class SafetyFloor:
     def admit_motion(self) -> Optional[MotionTicket]:
         return self.arb.admit_motion()
 
-    def validate_ticket(self, ticket: MotionTicket) -> bool:
+    def admit_effect(self, effect_class: str, source: str = "ai",
+                     settings: Optional[Settings] = None) -> Optional[EffectTicket]:
+        """The ONE authority for admitting a non-zero physical robot effect (agent_next_2 §4.2). Applies
+        per-class POLICY on top of the mechanical arbiter gate (master inhibit / latch / STOP in flight). Returns
+        an EffectTicket carrying the current (epoch, generation, effect_class, ticket_id) or None (denied).
+        E-STOP and zero/deadman motion are NOT admitted here — they are always permitted by their own path."""
+        s = settings if settings is not None else getattr(self, "_settings_ref", None)
+        # Speech is additionally gated by the talk toggle + quiet window (mirrors check_say's policy view).
+        if effect_class == EFFECT_SPEECH:
+            if s is not None and not bool(getattr(s, "talk_enabled", False)):
+                return None
+            if self.is_quiet():
+                return None
+        # All other effect classes rely on the master-inhibit/latch/STOP gate in the arbiter (motion's extra
+        # speed/scope/autonomy policy is applied by check_drive before admission).
+        return self.arb.admit_effect(effect_class)
+
+    def validate_ticket(self, ticket: EffectTicket) -> bool:
         return self.arb.validate_ticket(ticket)
 
     def stop_in_flight(self) -> bool:

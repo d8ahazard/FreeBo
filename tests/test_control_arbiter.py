@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 
-from autobot.brain.safety import ControlArbiter
+from autobot.brain.safety import EFFECT_DOCK, EFFECT_LASER, EFFECT_MOTION, ControlArbiter
 
 
 def _stopped_ready_for_reset() -> ControlArbiter:
@@ -91,6 +91,26 @@ def test_motion_admission_and_stale_ticket_after_stop():
     assert a.validate_ticket(ticket) is False    # stale (epoch advanced + latched)
     a.end_estop_dispatch(nt)
     assert a.admit_motion() is None              # still latched/inhibited
+
+
+def test_effect_tickets_are_classed_unique_and_invalidated_by_stop():
+    # agent_next_2 §1.1: every effect carries an admitted ticket {epoch,gen,effect_class,ticket_id}.
+    a = ControlArbiter()
+    t_dock = a.admit_effect(EFFECT_DOCK)
+    t_laser = a.admit_effect(EFFECT_LASER)
+    t_motion = a.admit_motion()
+    assert t_dock is not None and t_dock.effect_class == EFFECT_DOCK
+    assert t_laser is not None and t_laser.effect_class == EFFECT_LASER
+    assert t_motion is not None and t_motion.effect_class == EFFECT_MOTION
+    ids = {t_dock.ticket_id, t_laser.ticket_id, t_motion.ticket_id}
+    assert len(ids) == 3 and 0 not in ids        # unique, non-zero ticket ids
+    assert all(a.validate_ticket(t) for t in (t_dock, t_laser, t_motion))
+    nt = a.begin_master_stop()
+    # every prior effect ticket is invalidated by the STOP (epoch advanced + latched)
+    assert not any(a.validate_ticket(t) for t in (t_dock, t_laser, t_motion))
+    assert a.admit_effect(EFFECT_DOCK) is None    # no admission while latched/inhibited
+    a.end_estop_dispatch(nt)
+    assert a.admit_effect(EFFECT_LASER) is None   # still latched after dispatch ends
 
 
 def test_concurrent_stop_blocks_reset_admission_under_barrier():
