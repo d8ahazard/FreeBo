@@ -18,7 +18,7 @@ A journal failure is surfaced (counters + a health event) but never raises into 
 from __future__ import annotations
 
 import base64
-import itertools
+import contextlib
 import json
 import math
 import os
@@ -136,14 +136,22 @@ def encode_cursor(session_id: str, seq: int) -> str:
     return base64.urlsafe_b64encode(f"{session_id}|{int(seq)}".encode()).decode()
 
 
-def decode_cursor(cursor: Optional[str]) -> Optional[int]:
+def parse_cursor(cursor: Optional[str]) -> Optional[tuple[str, int]]:
+    """Decode an opaque cursor to (process_session_id, seq), or None if malformed. The session component is
+    preserved (not silently discarded) so the caller can validate the cursor's domain (agent_next_5 §1.2)."""
     if not cursor:
         return None
     try:
         raw = base64.urlsafe_b64decode(cursor.encode()).decode()
-        return int(raw.rsplit("|", 1)[1])
-    except Exception:  # noqa: BLE001 - a malformed cursor is treated as "from the start"
+        sid, seq = raw.rsplit("|", 1)
+        return sid, int(seq)
+    except Exception:  # noqa: BLE001
         return None
+
+
+def decode_cursor(cursor: Optional[str]) -> Optional[int]:
+    p = parse_cursor(cursor)
+    return p[1] if p is not None else None
 
 
 def _pct(xs: list[float], p: float) -> Optional[float]:
@@ -152,6 +160,45 @@ def _pct(xs: list[float], p: float) -> Optional[float]:
     s = sorted(xs)
     rank = max(1, math.ceil((p / 100.0) * len(s)))
     return s[min(rank, len(s)) - 1]
+
+
+def _read_tail_lines(path: Path, max_lines: int, block: int = 65536) -> list[str]:
+    """Read up to the last `max_lines` non-empty lines of a file using bounded reverse chunk reads (never loads
+    the whole file when it is large). Returns them in file order (oldest→newest of the tail)."""
+    if max_lines <= 0:
+        return []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b""
+            reached_start = pos == 0
+            while pos > 0 and buf.count(b"\n") <= max_lines:
+                read = min(block, pos)
+                pos -= read
+                f.seek(pos)
+                buf = f.read(read) + buf
+                reached_start = pos == 0
+        parts = buf.split(b"\n")
+        if not reached_start and parts:
+            parts = parts[1:]                       # first piece may be a partial line; drop it
+        decoded = [p.decode("utf-8", "replace") for p in parts]
+        return [ln for ln in decoded if ln.strip()][-max_lines:]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _tail_events(path: Path, max_events: int) -> list[dict]:
+    """The newest <= max_events VALID events from a JSONL file (tolerates malformed/truncated lines)."""
+    out: list[dict] = []
+    for line in _read_tail_lines(path, max_events * 2):
+        try:
+            d = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if validate_event_dict(d):
+            out.append(d)
+    return out[-max_events:]
 
 
 def _stream_jsonl(path: Path, max_events: int) -> Iterator[dict]:
@@ -209,6 +256,7 @@ class EventJournal:
         # background writer
         self._wq: queue.Queue = queue.Queue(maxsize=int(queue_max))
         self._closing = threading.Event()
+        self._close_deadline = 3.0
         self._writer: Optional[threading.Thread] = None
         if self.path is not None:
             with self._lock:
@@ -245,27 +293,34 @@ class EventJournal:
         return files
 
     def _recover_locked(self) -> None:
-        """Bounded streaming recovery (agent_next_4 §2.2): restore the newest history into the ring + continue
-        the sequence. Oldest→newest order is: rotated .N (older) then active. We read newest-first to fill the
-        bounded ring, then reverse for chronological ring order."""
+        """Bounded NEWEST-tail recovery (agent_next_5 §1.3). Process retained files in true chronological order
+        (active is newest, then .1, .2, …) and recover the newest `recover_max_events` via bounded reverse
+        reading — NOT the first records encountered. A large active file can no longer restore its oldest rows
+        or starve rotated history, and the durable sequence is continued from the true max seq seen."""
         budget = self.recover_max_events
         collected: list[dict] = []
         max_seq = 0
-        # newest first: active, then .1, .2, ...
-        for p in [self.path] + [self.path.with_suffix(self.path.suffix + f".{i}") for i in range(1, self.max_files + 1)]:
+        # newest file first; pull each file's newest tail until the global budget is filled.
+        files = [self.path] + [self.path.with_suffix(self.path.suffix + f".{i}") for i in range(1, self.max_files + 1)]
+        for p in files:
             if p is None or not p.exists():
                 continue
-            for d in _stream_jsonl(p, budget):
-                collected.append(d)
-                if isinstance(d.get("seq"), int):
-                    max_seq = max(max_seq, d["seq"])
-                if len(collected) >= budget:
-                    break
-            if len(collected) >= budget:
+            remaining = budget - len(collected)
+            if remaining <= 0:
                 break
-        # collected is newest-first across files only approximately; sort by seq for a stable ring + ts bounds
-        collected.sort(key=lambda d: d.get("seq", 0))
-        tail = collected[-self._mem.maxlen:] if self._mem.maxlen else collected
+            collected.extend(_tail_events(p, remaining))
+        for d in collected:
+            if isinstance(d.get("seq"), int):
+                max_seq = max(max_seq, d["seq"])
+        # de-dup by id (rotation overlap is possible) + stable durable-seq order for the ring + ts bounds.
+        seen: set = set()
+        uniq = []
+        for d in sorted(collected, key=lambda d: d.get("seq", 0)):
+            if d.get("id") in seen:
+                continue
+            seen.add(d.get("id"))
+            uniq.append(d)
+        tail = uniq[-self._mem.maxlen:] if self._mem.maxlen else uniq
         for d in tail:
             self._mem.append(d)
         self.recovered = len(tail)
@@ -319,35 +374,57 @@ class EventJournal:
         return ev
 
     def _writer_loop(self) -> None:
+        # agent_next_5 §1.4: the writer ALWAYS observes closure via `_closing` (not only a queued sentinel — a
+        # full queue can drop the sentinel). It wakes at least every flush_interval, so closure is observed even
+        # when no sentinel can be enqueued. The None sentinel is only a best-effort wake.
         batch: list[dict] = []
         last_flush = time.monotonic()
-        while True:
-            timeout = self.flush_interval
+        while not self._closing.is_set():
             try:
-                item = self._wq.get(timeout=timeout)
-                if item is None:   # shutdown sentinel
-                    break
-                batch.append(item)
-                # opportunistically drain more without blocking
-                while len(batch) < 256:
-                    try:
-                        nxt = self._wq.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt is None:
-                        self._flush_batch(batch)
-                        return
-                    batch.append(nxt)
+                item = self._wq.get(timeout=self.flush_interval)
+                if item is not None:
+                    batch.append(item)
+                    while len(batch) < 256:
+                        try:
+                            nxt = self._wq.get_nowait()
+                        except queue.Empty:
+                            break
+                        if nxt is not None:
+                            batch.append(nxt)
             except queue.Empty:
                 pass
             if batch and (time.monotonic() - last_flush >= self.flush_interval or len(batch) >= 64):
                 self._flush_batch(batch)
                 batch = []
                 last_flush = time.monotonic()
-            elif not batch:
-                last_flush = time.monotonic()
+        self._drain_and_close(batch)
+
+    def _drain_and_close(self, batch: list[dict]) -> None:
+        """Closure path, owned by the writer thread so the file is NEVER closed while it can still be written.
+        Drain the queue until empty or the bounded deadline, flush, record the EXACT undrained count, then close
+        the file here."""
+        deadline = time.monotonic() + self._close_deadline
+        while time.monotonic() < deadline:
+            try:
+                item = self._wq.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                batch.append(item)
+            if len(batch) >= 256:
+                self._flush_batch(batch)
+                batch = []
         if batch:
             self._flush_batch(batch)
+        self.undrained = self._wq.qsize()
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except Exception as e:  # noqa: BLE001
+                    self._surface(e)
+                self._fh = None
 
     def _flush_batch(self, batch: list[dict]) -> None:
         if not batch or self._fh is None:
@@ -405,37 +482,51 @@ class EventJournal:
 
     def query(self, *, limit: int = 200, cursor: Optional[str] = None, order: str = "desc",
               persistent: bool = False, **filters: Any) -> dict:
-        """Bounded query. By default scans the in-memory ring (recent/live). With `persistent=True` (or a time
-        range / incident / id filter) it ALSO streams the retained JSONL window, merging + de-duping by id,
-        bounded by recover_max_events. Returns events + an OPAQUE next_cursor + `more`."""
+        """Bounded, ORDER-AWARE, cursor-paginated query (agent_next_5 §1.2). Ascending walks forward
+        (`seq > cursor_seq`); descending walks backward (`seq < cursor_seq`). The cursor encodes the session +
+        durable seq; because seq is durable-monotonic across restarts it is a valid resume point even from a prior
+        process session. A malformed cursor raises ValueError (the API maps it to HTTP 400). By default scans the
+        in-memory ring; with `persistent=True` / a time-range / id filter it ALSO streams the retained JSONL
+        window (bounded, de-duped by id)."""
         limit = max(1, min(int(limit), 1000))
-        since_seq = decode_cursor(cursor) or 0
+        order = "asc" if order == "asc" else "desc"
+        parsed = parse_cursor(cursor) if cursor else None
+        if cursor and parsed is None:
+            raise ValueError("malformed cursor")
+        cursor_seq = parsed[1] if parsed is not None else None
+        cursor_session = parsed[0] if parsed is not None else None
         with self._lock:
             rows = list(self._mem)
         need_persistent = persistent or any(filters.get(k) is not None for k in
                                             ("start", "end", "incident_id", "event_id", "command_id"))
         if need_persistent and self.path is not None:
+            # §1.3: pull each retained file's NEWEST tail (bounded) so one large active file can't starve the
+            # rotated history; bounded overall by recover_max_events and de-duped by id against the ring.
             seen = {d.get("id") for d in rows}
-            scanned = 0
-            for p in self._retained_files():
-                for d in _stream_jsonl(p, self.recover_max_events):
-                    scanned += 1
+            budget = self.recover_max_events
+            for p in self._retained_files():            # newest-first: active, .1, .2, …
+                if budget <= 0:
+                    break
+                for d in _tail_events(p, budget):
                     if d.get("id") not in seen:
                         seen.add(d.get("id"))
                         rows.append(d)
-                    if scanned >= self.recover_max_events:
-                        break
-                if scanned >= self.recover_max_events:
-                    break
-        out = [d for d in rows if d.get("seq", 0) > since_seq and self._match(d, filters)]
+                        budget -= 1
+
+        def _after(seq: int) -> bool:
+            if cursor_seq is None:
+                return True
+            return seq > cursor_seq if order == "asc" else seq < cursor_seq
+        out = [d for d in rows if _after(d.get("seq", 0)) and self._match(d, filters)]
         out.sort(key=lambda d: d.get("seq", 0), reverse=(order != "asc"))
         page = out[:limit]
         more = len(out) > limit
-        next_seq = (page[-1]["seq"] if (page and order == "asc") else
-                    (out[limit]["seq"] if more else (page[-1]["seq"] if page else since_seq)))
         return {"events": page, "returned": len(page), "more": more,
-                "next_cursor": encode_cursor(self.process_session_id, next_seq) if page else cursor,
-                "process_session_id": self.process_session_id}
+                "next_cursor": (encode_cursor(self.process_session_id, page[-1]["seq"]) if page else cursor),
+                "process_session_id": self.process_session_id,
+                "cursor_session": cursor_session,
+                "cursor_foreign_session": (cursor_session is not None
+                                           and cursor_session != self.process_session_id)}
 
     def correlation_trace(self, correlation_id: str, limit: int = 1000) -> list[dict]:
         return self.query(correlation_id=correlation_id, limit=limit, order="asc")["events"]
@@ -507,25 +598,26 @@ class EventJournal:
         }
 
     def flush_and_close(self, *, deadline_s: float = 3.0) -> None:
-        """Deterministic drain (agent_next_4 §2.3): signal the writer, join with a bounded deadline, count any
-        undrained events, then close the file."""
+        """Deterministic, idempotent shutdown (agent_next_5 §1.4). Signals closure (the writer ALWAYS observes it,
+        even if the queue is full and no sentinel can be enqueued), joins within a bounded deadline, and lets the
+        writer drain + close the file itself so the file is never closed while the writer can still write. A
+        no-path (memory-only) journal or a repeat call is a clean no-op."""
+        self._close_deadline = deadline_s
+        self._closing.set()
+        with contextlib.suppress(queue.Full):
+            self._wq.put_nowait(None)       # best-effort immediate wake; correctness does NOT depend on it
         if self._writer is not None and self._writer.is_alive():
-            try:
-                self._wq.put_nowait(None)   # sentinel
-            except queue.Full:
-                pass
-            self._writer.join(timeout=deadline_s)
-            if self._writer.is_alive():
-                self.undrained = self._wq.qsize()
+            self._writer.join(timeout=deadline_s + max(0.5, self.flush_interval * 2))
+        # Defensive close ONLY when the writer is gone (or never existed); never close under a live writer.
         with self._lock:
-            if self._fh is not None:
+            if self._fh is not None and (self._writer is None or not self._writer.is_alive()):
                 try:
                     self._fh.flush()
                     self._fh.close()
                 except Exception as e:  # noqa: BLE001
                     self._surface(e)
                 self._fh = None
-        self._closing.set()
+                self.undrained = self._wq.qsize()
 
     @staticmethod
     def recover(path: str | Path, max_events: int = 100000) -> list[dict]:

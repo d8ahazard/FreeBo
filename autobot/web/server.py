@@ -593,17 +593,26 @@ _SOFTWARE_SHA = _compute_software_sha()
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
 
 
+def _bind_is_loopback() -> bool:
+    """True only when the server's CONFIGURED bind host is loopback. agent_next_5 §1.5: the access decision keys
+    on the bind, NOT on the immediate peer address — a reverse proxy on the same host makes remote requests
+    appear to originate from 127.0.0.1, so trusting the peer would expose observability. Default bind is
+    0.0.0.0 → NOT loopback → fail closed (token required)."""
+    host = (SETTINGS.snapshot().host or "").strip().lower()
+    return host in _LOOPBACK or host.startswith("127.")
+
+
 def _obs_denied(request: Request):
-    """agent_next_4 §5.2 access policy. Allow loopback requests (the local UI session). For a non-loopback
-    client, require the configured owner token via the `X-Owner-Token` header (never a query string). Returns a
-    401/403 JSONResponse when denied, else None. No general identity platform — proportional protection."""
-    client = (request.client.host if request.client else "") or ""
-    if client in _LOOPBACK:
+    """agent_next_5 §1.5 access policy (fail-closed). If the configured bind is loopback the server is only
+    reachable locally → allow. Otherwise REQUIRE the owner token via the `X-Owner-Token` header (never a query
+    string) for EVERY request regardless of peer address; `X-Forwarded-For`/`Forwarded` are never trusted.
+    Returns a 401/403 JSONResponse when denied, else None."""
+    if _bind_is_loopback():
         return None
     import os as _os
     token = _os.environ.get("AUTOBOT_OWNER_TOKEN", "")
     if not token:
-        return JSONResponse({"error": "observability access requires an owner token on non-loopback binds; "
+        return JSONResponse({"error": "observability access requires an owner token on a non-loopback bind; "
                                       "set AUTOBOT_OWNER_TOKEN"}, status_code=403)
     if request.headers.get("X-Owner-Token") != token:
         return JSONResponse({"error": "invalid or missing owner token"}, status_code=401)
@@ -637,14 +646,18 @@ async def api_events(request: Request):
     order = (q.get("order") or "desc").lower()
     if order not in ("asc", "desc"):
         return JSONResponse({"error": "order must be 'asc' or 'desc'"}, status_code=400)
-    return JSONResponse(j.query(
-        category=q.get("category"), type=q.get("type"), source=q.get("source"), outcome=q.get("outcome"),
-        incident_id=q.get("incident_id"), correlation_id=q.get("correlation_id"),
-        process_session_id=q.get("process_session_id"), command_id=q.get("command_id"),
-        event_id=q.get("event_id"), epoch=epoch, generation=generation, ticket_id=ticket_id,
-        start=q.get("start"), end=q.get("end"), order=order,
-        persistent=(q.get("persistent") in ("1", "true", "yes")),
-        cursor=q.get("cursor"), limit=(limit or 200)))
+    try:
+        result = j.query(
+            category=q.get("category"), type=q.get("type"), source=q.get("source"), outcome=q.get("outcome"),
+            incident_id=q.get("incident_id"), correlation_id=q.get("correlation_id"),
+            process_session_id=q.get("process_session_id"), command_id=q.get("command_id"),
+            event_id=q.get("event_id"), epoch=epoch, generation=generation, ticket_id=ticket_id,
+            start=q.get("start"), end=q.get("end"), order=order,
+            persistent=(q.get("persistent") in ("1", "true", "yes")),
+            cursor=q.get("cursor"), limit=(limit or 200))
+    except ValueError:
+        return JSONResponse({"error": "malformed cursor"}, status_code=400)
+    return JSONResponse(result)
 
 
 @app.get("/api/events/recent")

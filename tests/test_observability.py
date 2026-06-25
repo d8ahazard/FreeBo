@@ -185,6 +185,116 @@ def test_incidents_grouping_and_severity():
         j.flush_and_close()
 
 
+def _paginate(j, order, limit):
+    """Walk every page in `order`, returning the ordered list of seqs and asserting no duplicates."""
+    seqs, seen, cursor = [], set(), None
+    for _ in range(100):
+        r = j.query(order=order, limit=limit, cursor=cursor)
+        for e in r["events"]:
+            assert e["seq"] not in seen, f"duplicate seq {e['seq']} in {order} pagination"
+            seen.add(e["seq"])
+            seqs.append(e["seq"])
+        if not r["more"]:
+            break
+        cursor = r["next_cursor"]
+    return seqs
+
+
+def test_ascending_cursor_pagination_three_pages_no_dup_no_omission():
+    j = EventJournal(path=None, max_mem=1000)
+    try:
+        for i in range(10):
+            j.emit(CAT_MOTION, "drive", "ai", detail={"i": i})
+        seqs = _paginate(j, "asc", 4)                     # 10 events / 4 -> 3 pages
+        assert seqs == sorted(seqs)                        # ascending
+        assert len(seqs) == 10 and len(set(seqs)) == 10    # no omission, no duplicate
+    finally:
+        j.flush_and_close()
+
+
+def test_descending_cursor_pagination_three_pages_no_dup_no_omission():
+    j = EventJournal(path=None, max_mem=1000)
+    try:
+        for i in range(10):
+            j.emit(CAT_MOTION, "drive", "ai", detail={"i": i})
+        seqs = _paginate(j, "desc", 4)
+        assert seqs == sorted(seqs, reverse=True)          # descending walks BACKWARD (the §1.2 fix)
+        assert len(seqs) == 10 and len(set(seqs)) == 10    # no omission, no duplicate
+    finally:
+        j.flush_and_close()
+
+
+def test_malformed_cursor_raises():
+    j = EventJournal(path=None)
+    try:
+        with pytest.raises(ValueError):
+            j.query(cursor="!!!not-a-cursor!!!")
+    finally:
+        j.flush_and_close()
+
+
+def test_foreign_session_cursor_paginates_by_durable_seq():
+    j = EventJournal(path=None, max_mem=1000)
+    try:
+        for i in range(6):
+            j.emit(CAT_MOTION, "drive", "ai")
+        # a cursor minted by a DIFFERENT (prior) process session, but a valid durable seq, still resumes by seq
+        foreign = encode_cursor("some-other-session-id", 3)
+        r = j.query(order="asc", cursor=foreign)
+        assert r["cursor_foreign_session"] is True
+        assert all(e["seq"] > 3 for e in r["events"]) and r["events"]                # resumed by durable seq
+    finally:
+        j.flush_and_close()
+
+
+def test_recovery_restores_newest_tail_of_large_active_file(tmp_path):
+    # §1.3: a large active file must restore its NEWEST rows, not the first ones encountered.
+    p = tmp_path / "j.jsonl"
+    j1 = EventJournal(path=p, max_bytes=10_000_000, max_files=2, flush_interval=0.05)  # no rotation
+    last = None
+    for i in range(200):
+        last = j1.emit(CAT_MOTION, "drive", "ai", detail={"i": i})
+    _drain(j1)
+    j1.flush_and_close()
+    j2 = EventJournal(path=p, recover_max_events=20, max_mem=40)
+    try:
+        drives = [r for r in j2.recent(50) if r["type"] == "drive"]
+        assert drives[-1]["seq"] == last.seq               # the NEWEST drive was restored
+        assert drives[0]["detail"]["i"] >= 180             # tail (newest ~20), NOT the oldest rows
+        # the durable sequence continued from the true max (recovery emits journal_recovered at max+1)
+        assert any(r["type"] == "journal_recovered" and r["seq"] == last.seq + 1 for r in j2.recent(50))
+        assert j2.emit(CAT_MOTION, "drive", "ai").seq > last.seq
+    finally:
+        j2.flush_and_close()
+
+
+def test_full_queue_shutdown_does_not_strand_writer(tmp_path):
+    # §1.4: with a full queue (no sentinel can be enqueued) the writer still observes closure, the file is NEVER
+    # closed while the writer can still write, and a delayed writer is joined once it can proceed.
+    import threading
+    j = EventJournal(path=tmp_path / "j.jsonl", queue_max=4, flush_interval=0.05)
+    gate = threading.Event()
+    orig = j._flush_batch
+    def _blocking_flush(batch):
+        gate.wait(timeout=5.0)                              # hold the writer inside flush
+        return orig(batch)
+    j._flush_batch = _blocking_flush                        # type: ignore[assignment]
+    for i in range(50):                                     # overflow the queue while the writer is blocked
+        j.emit(CAT_MOTION, "drive", "ai", detail={"i": i})
+    # close with a short deadline while the writer is still blocked -> it must NOT be force-closed mid-write
+    t = threading.Thread(target=lambda: j.flush_and_close(deadline_s=0.3))
+    t.start()
+    t.join(timeout=3.0)
+    assert j._writer.is_alive() is True                     # still blocked; not stranded-and-file-closed
+    assert j._fh is not None                                # file NOT closed under a live writer
+    gate.set()                                              # let the writer proceed
+    j._writer.join(timeout=3.0)
+    assert j._writer.is_alive() is False                    # writer observed closure and exited
+    assert isinstance(j.undrained, int)                     # exact undrained count recorded
+    j.flush_and_close()                                     # idempotent repeat
+    assert j.health()["writer_alive"] is False
+
+
 def test_module_emit_safe_before_configure(monkeypatch):
     monkeypatch.setattr(obs, "_JOURNAL", None)
     assert obs.emit(CAT_MOTION, "drive", "ai") is None

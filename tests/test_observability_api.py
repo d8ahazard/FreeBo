@@ -24,6 +24,10 @@ class _ReqQ:
 def server():
     os.environ["AUTOBOT_ROBOT_LINK"] = "mock"
     from autobot.web import server as srv
+    # agent_next_5 §1.5: the access policy keys on the CONFIGURED bind. Default a loopback bind for the endpoint
+    # tests (a loopback-only deployment is allowed without a token); access-policy tests override the bind host.
+    # `host` is a deploy setting (not USER_EDITABLE), so set the attribute directly.
+    srv.SETTINGS.host = "127.0.0.1"
     return srv
 
 
@@ -79,19 +83,44 @@ async def test_query_endpoint_rejects_bad_int_param(server, tmp_path):
     assert resp.status_code == 400
 
 
-async def test_non_loopback_requires_owner_token(server, tmp_path, monkeypatch):
+async def test_query_endpoint_rejects_malformed_cursor(server, tmp_path):
+    _fresh_journal(tmp_path)
+    resp = await server.api_events(_ReqQ({"cursor": "!!!garbage!!!"}))
+    assert resp.status_code == 400
+
+
+async def test_non_loopback_bind_requires_owner_token(server, tmp_path, monkeypatch):
     _fresh_journal(tmp_path)
     monkeypatch.delenv("AUTOBOT_OWNER_TOKEN", raising=False)
-    # a non-loopback client with no configured token is forbidden
-    resp = await server.api_events(_ReqQ(host="10.0.0.5"))
-    assert resp.status_code == 403
-    # with a token configured but wrong/absent header -> 401
+    monkeypatch.setattr(server.SETTINGS, "host", "0.0.0.0")   # non-loopback bind -> fail closed
+    # no token configured -> forbidden, regardless of (loopback) peer
+    assert (await server.api_events(_ReqQ())).status_code == 403
+    # token configured but wrong/absent header -> 401
     monkeypatch.setenv("AUTOBOT_OWNER_TOKEN", "sekret")
-    resp2 = await server.api_events(_ReqQ(host="10.0.0.5"))
-    assert resp2.status_code == 401
+    assert (await server.api_events(_ReqQ())).status_code == 401
     # correct header -> allowed
-    resp3 = await server.api_events(_ReqQ(host="10.0.0.5", headers={"X-Owner-Token": "sekret"}))
-    assert resp3.status_code == 200
+    assert (await server.api_events(_ReqQ(headers={"X-Owner-Token": "sekret"}))).status_code == 200
+
+
+async def test_reverse_proxy_loopback_peer_cannot_bypass(server, tmp_path, monkeypatch):
+    # §1.5: a request that APPEARS to come from 127.0.0.1 (forwarded by a local reverse proxy) must NOT bypass
+    # the token when the configured bind is non-loopback. The decision ignores the peer + X-Forwarded-For.
+    _fresh_journal(tmp_path)
+    monkeypatch.delenv("AUTOBOT_OWNER_TOKEN", raising=False)
+    monkeypatch.setattr(server.SETTINGS, "host", "0.0.0.0")
+    spoof = _ReqQ(host="127.0.0.1", headers={"X-Forwarded-For": "127.0.0.1", "Forwarded": "for=127.0.0.1"})
+    assert (await server.api_events(spoof)).status_code == 403       # loopback peer is NOT trusted
+    monkeypatch.setenv("AUTOBOT_OWNER_TOKEN", "sekret")
+    assert (await server.api_events(spoof)).status_code == 401       # still needs the real token
+    ok = _ReqQ(host="127.0.0.1", headers={"X-Owner-Token": "sekret"})
+    assert (await server.api_events(ok)).status_code == 200
+
+
+async def test_loopback_bind_allows_without_token(server, tmp_path, monkeypatch):
+    _fresh_journal(tmp_path)
+    monkeypatch.delenv("AUTOBOT_OWNER_TOKEN", raising=False)
+    monkeypatch.setattr(server.SETTINGS, "host", "127.0.0.1")    # loopback-only deployment -> allowed
+    assert (await server.api_events(_ReqQ())).status_code == 200
 
 
 async def test_hardware_gate_states_hardware_not_run(server, tmp_path):
