@@ -83,8 +83,26 @@ const EYE_IDS = { neutral: 0, happy: 1, sad: 2, angry: 3, surprised: 4, sleepy: 
 // diagnostic ids only (env AUTOBOT_RTM_RAW_ALLOW="id,id"); empty by default. 101007 can never be raw-sent.
 // Default allow: the audio call-mode handshake ids (102001 open audio session, 102003 intercom) — non-motion
 // control needed for talkback. NEVER movement/dock/speed/avoidance. Extend via env for diagnostics only.
+// IMMUTABLE hard-forbidden raw ids (P0 agent_next §2.7): movement/dock/ownership/speed-mode/avoid/actuator.
+// Environment config can NEVER add these to the allowlist; they only travel via typed, ticketed commands.
+const RAW_HARD_FORBIDDEN = new Set([
+  RTM_DRIVE,        // 101007 movement
+  RTM_DOCK,         // 103043 docking
+  RTM_LOGIN,        // 101003 controller ownership
+  RTM_KEEPALIVE,    // 101005 ownership heartbeat
+  RTM_MOVE_MODE,    // 103011 speed/mode
+  RTM_AVOID,        // 103045 avoidance
+  RTM_LASER,        // 103051 actuator
+]);
 const RAW_ALLOW = new Set([102001, 102003].concat((process.env.AUTOBOT_RTM_RAW_ALLOW || "")
-  .split(",").map((x) => parseInt(x.trim(), 10)).filter((n) => Number.isFinite(n))));
+  .split(",").map((x) => parseInt(x.trim(), 10))
+  .filter((n) => Number.isFinite(n) && !RAW_HARD_FORBIDDEN.has(n))));   // env can never add a forbidden id
+
+// P0 agent_next §2.1: this sidecar process's identity, generated once at startup. Included in `ready`, state
+// events, and every command_result so Python can reject responses from a REPLACED sidecar instance.
+const crypto = require("crypto");
+const SIDECAR_ID = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex"));
+let acceptedProcessId = null;   // the process_instance_id Python last reconciled with (set via set_control)
 
 function out(obj) { try { process.stdout.write(JSON.stringify(obj) + "\n"); } catch (e) {} }
 function log(level, msg) { out({ ev: "log", level, msg: String(msg).slice(0, 300) }); }
@@ -98,6 +116,19 @@ let connected = false;
 // movement under the wrong latch/generation.
 let latched = true;     // E-STOP latch: while true, ALL drive frames are refused (zero-stop still allowed)
 let generation = 0;     // control generation; bumped on E-STOP; drives stamped with a stale generation are dropped
+let epoch = 0;          // transition epoch (monotonic); mirrors the Python arbiter's epoch on each transition
+let activeStops = 0;    // count of E-STOP dispatches currently in flight (RESET refused while > 0)
+
+// One place to emit a correlated command_result so EVERY result carries the sidecar identity + control state
+// (P0 agent_next §2). Extra fields override the defaults.
+function result(c, extra) {
+  out(Object.assign({
+    ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null,
+    cmd: c && c.cmd, sidecar_instance_id: SIDECAR_ID, accepted_process_id: acceptedProcessId,
+    latched, generation, epoch, rtm_connected: connected,
+    dispatch_ts: Date.now(), completion_ts: Date.now(),
+  }, extra || {}));
+}
 
 function zeroFrame() { return { lx: 0, ly: 0, rx: 0, ry: 0, buttons: 1 }; }
 
@@ -141,10 +172,8 @@ async function sendRtm(id, data) {
 async function acked(c, id, data) {
   const dispatch_ts = Date.now();
   const r = await sendRtm(id, data);
-  // Every command_result echoes the sidecar's authoritative latch+generation so Python can reconcile (P0-R4.4).
-  out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: c && c.cmd,
-        rtm_id: id, sent_to_agora: r.ok, error: r.error, dispatch_ts, completion_ts: Date.now(),
-        rtm_connected: connected, latched, generation });
+  // Every command_result echoes the sidecar identity + authoritative latch/generation/epoch (P0 §2).
+  result(c, { rtm_id: id, sent_to_agora: r.ok, error: r.error, dispatch_ts });
   return r.ok;
 }
 
@@ -295,57 +324,77 @@ async function handle(c) {
     case "logout": return teardown();
     case "ping": return out({ ev: "pong" });
     case "set_control": {
-      // P0-R4.4: Python re-asserts the authoritative latch + generation (on connect / after reconcile).
+      // P0 §2.3: correlated, VALIDATED reconcile (replaces fire-and-forget). Python re-asserts the
+      // authoritative {process id, epoch, generation, latch} on connect / after reconcile. Reject a stale
+      // (lower) epoch/generation; never let an equal-or-lower set_control CLEAR a latch (only RESET unlatches).
+      if (c.generation != null && c.generation < generation) {
+        result(c, { ok: false, control_state_applied: false, control_ready: false, error: "stale_generation" }); return;
+      }
+      if (c.epoch != null && c.epoch < epoch) {
+        result(c, { ok: false, control_state_applied: false, control_ready: false, error: "stale_epoch" }); return;
+      }
+      if (c.process_instance_id != null) acceptedProcessId = c.process_instance_id;
       if (c.generation != null) generation = c.generation;
-      if (c.latched != null) latched = !!c.latched;
+      if (c.epoch != null) epoch = c.epoch;
+      if (c.latched != null) {
+        // Latching is always honored. Unlatching is honored ONLY for a set_control that carried an epoch
+        // (proving it cleared the stale-epoch guard above) — a stale queued set_control with a lower epoch
+        // was already rejected, so it can never unlatch after a newer STOP. A set_control with no epoch can
+        // never clear a latch (fail safe).
+        if (c.latched) latched = true;
+        else if (c.epoch != null) latched = false;
+      }
       if (latched) clearDrive();
-      out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "set_control",
-            sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
-            rtm_connected: connected, latched, generation });
-      log("info", "control reconciled (gen " + generation + ", latched " + latched + ")");
+      const control_ready = FAKE || !!(inst && sess);
+      result(c, { ok: true, control_state_applied: true, reconciled: true, control_ready });
+      log("info", "control reconciled (epoch " + epoch + ", gen " + generation + ", latched " + latched + ")");
       return;
     }
     case "estop_reset": {
-      // P0-R4 amendment B: a RESET must NOT clear a NEWER STOP. The reset captures the generation it expects;
-      // if a later STOP advanced the generation, reject the reset and STAY latched (monotonic by generation).
-      if (c.expected_generation != null && c.expected_generation !== generation) {
-        out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "estop_reset",
-              ok: false, sent_to_agora: false, error: "stale_reset_generation",
-              dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected, latched, generation });
-        log("warn", "RESET rejected (stale gen " + c.expected_generation + " != " + generation + ")");
-        return;
+      // P0 §2.4: validate ALL preconditions BEFORE clearing the latch (validation first, mutation second).
+      // Any failure leaves the sidecar latched. A RESET can never clear a NEWER STOP and can never run while
+      // an E-STOP dispatch is still in flight.
+      if (activeStops > 0) {
+        result(c, { ok: false, sent_to_agora: false, error: "estop_in_flight" });
+        log("warn", "RESET rejected (estop dispatch in flight)"); return;
       }
+      if (c.expected_sidecar_id != null && c.expected_sidecar_id !== SIDECAR_ID) {
+        result(c, { ok: false, sent_to_agora: false, error: "wrong_sidecar_instance" });
+        log("warn", "RESET rejected (sidecar instance mismatch)"); return;
+      }
+      if (c.expected_process_id != null && acceptedProcessId != null && c.expected_process_id !== acceptedProcessId) {
+        result(c, { ok: false, sent_to_agora: false, error: "wrong_process_instance" }); return;
+      }
+      if (c.expected_generation != null && c.expected_generation !== generation) {
+        result(c, { ok: false, sent_to_agora: false, error: "stale_reset_generation" });
+        log("warn", "RESET rejected (stale gen " + c.expected_generation + " != " + generation + ")"); return;
+      }
+      if (c.expected_epoch != null && c.expected_epoch !== epoch) {
+        result(c, { ok: false, sent_to_agora: false, error: "stale_reset_epoch" }); return;
+      }
+      const control_ready = FAKE || !!(inst && sess);
+      if (!control_ready) {                                   // fail closed: no control session => stay latched
+        result(c, { ok: false, sent_to_agora: false, control_ready: false, error: "control_not_ready" }); return;
+      }
+      // all preconditions hold — now mutate
       latched = false;
       if (c.generation != null) generation = c.generation;
-      out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "estop_reset",
-            ok: true, sent_to_agora: true, error: null, dispatch_ts: Date.now(), completion_ts: Date.now(),
-            rtm_connected: connected, control_ready: FAKE || !!(inst && sess), latched, generation });
-      log("info", "E-STOP reset — motion permitted again (gen " + generation + ")");
+      if (c.epoch != null) epoch = c.epoch;
+      result(c, { ok: true, sent_to_agora: true, reconciled: true, control_ready: true });
+      log("info", "E-STOP reset — motion permitted again (epoch " + epoch + ", gen " + generation + ")");
       return;
     }
     case "drive": {
-      // REFUSE motion while the E-STOP is latched (still report a correlated result so the caller learns it).
-      if (latched) {
-        out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
-              sent_to_agora: false, error: "estop_latched", dispatch_ts: Date.now(), completion_ts: Date.now(),
-              rtm_connected: connected, latched, generation });
-        return;
-      }
-      // P0-R4 amendment B/3: generation is MANDATORY and equality is required. A drive with no generation, or
-      // one stamped with a generation other than the current one (e.g. a joystick frame in flight across a
-      // STOP/RESET), is rejected. Raw RTM 101007 cannot reach here (only `drive` does).
-      if (c.generation == null) {
-        out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
-              sent_to_agora: false, error: "missing_generation", dispatch_ts: Date.now(), completion_ts: Date.now(),
-              rtm_connected: connected, latched, generation });
-        return;
-      }
-      if (c.generation !== generation) {
-        out({ ev: "command_result", command_id: (c && c.command_id != null) ? c.command_id : null, cmd: "drive",
-              sent_to_agora: false, error: "stale_generation", dispatch_ts: Date.now(), completion_ts: Date.now(),
-              rtm_connected: connected, latched, generation });
-        return;
-      }
+      // REFUSE motion while the E-STOP is latched or any STOP dispatch is in flight (correlated result so the
+      // caller learns it).
+      if (latched || activeStops > 0) { result(c, { sent_to_agora: false, error: latched ? "estop_latched" : "estop_in_flight" }); return; }
+      // P0 §2.6/§3: a drive is a TICKETED effect — generation AND epoch are mandatory and must match the
+      // accepted control state exactly (a joystick frame in flight across a STOP/RESET is stale on both axes).
+      // Raw RTM 101007 cannot reach here (only `drive` does).
+      if (c.generation == null) { result(c, { sent_to_agora: false, error: "missing_generation" }); return; }
+      if (c.generation !== generation) { result(c, { sent_to_agora: false, error: "stale_generation" }); return; }
+      if (c.epoch != null && c.epoch !== epoch) { result(c, { sent_to_agora: false, error: "stale_epoch" }); return; }
+      if (c.sidecar_instance_id != null && c.sidecar_instance_id !== SIDECAR_ID) { result(c, { sent_to_agora: false, error: "wrong_sidecar_instance" }); return; }
       // robot frame: forward = negative ly; scale to -100..100. The robot has a drive deadman, so a single
       // frame barely twitches — we SUSTAIN by resending the frame ~every 200ms until duration, then stop.
       const myGen = generation;
@@ -391,14 +440,15 @@ async function handle(c) {
     }
     case "__fake": { if (FAKE) _fakeFail = !!c.fail; return; }   // test-only: toggle send failure
     case "raw": {
-      // P0-R4 amendment E: allowlist only. Movement (101007) + any non-approved id is rejected and must use a
-      // typed command. Unknown ids are denied by default.
-      if (c.id === RTM_DRIVE || !RAW_ALLOW.has(c.id)) {
-        out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "raw",
-              ok: false, sent_to_agora: false, error: "raw_id_not_allowed:" + c.id,
-              dispatch_ts: Date.now(), completion_ts: Date.now(), rtm_connected: connected, latched, generation });
-        log("warn", "raw id rejected: " + c.id);
-        return;
+      // P0 §2.7: IMMUTABLE hard-forbidden set (movement/dock/ownership/speed/avoid/actuator) can never travel
+      // raw, regardless of env. Beyond that it is an ALLOWLIST: any non-approved or unknown id is rejected.
+      if (RAW_HARD_FORBIDDEN.has(c.id)) {
+        result(c, { cmd: "raw", ok: false, sent_to_agora: false, error: "raw_id_hard_forbidden:" + c.id });
+        log("warn", "raw id HARD-FORBIDDEN: " + c.id); return;
+      }
+      if (!RAW_ALLOW.has(c.id)) {
+        result(c, { cmd: "raw", ok: false, sent_to_agora: false, error: "raw_id_not_allowed:" + c.id });
+        log("warn", "raw id rejected: " + c.id); return;
       }
       return c.command_id != null ? acked(c, c.id, c.data || {}) : sendRtm(c.id, c.data || {});
     }
@@ -411,23 +461,23 @@ async function handle(c) {
 // generation check), clears timers, then dispatches the zero-frame burst and reports an HONEST ack:
 // local_latch_set is always true; initial_zero_sdk_send_succeeded reflects the REAL first sendRtm result.
 async function doEstop(c) {
-  latched = true;                                            // (1) latch BEFORE any await
-  generation = (c.generation != null) ? c.generation : generation + 1;  // (2) invalidate generation
-  clearDrive();                                              // (3) clear repeat/timeout timers
-  const z = zeroFrame();
-  const dispatch_ts = Date.now();
-  const r0 = await sendRtm(RTM_DRIVE, z);                    // (4) await the FIRST zero frame
-  const retries = [50, 100, 200];
-  for (const d of retries) setTimeout(() => sendRtm(RTM_DRIVE, z), d);   // (5) schedule retries regardless
-  out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "estop",
-        ok: !!r0.ok,                                         // ok == transport (NOT local safety)
-        local_latch_set: true,
-        initial_zero_sdk_send_succeeded: !!r0.ok,
-        sent_to_agora: !!r0.ok,                              // back-compat alias = the real send result
-        retry_count: retries.length,
-        error: r0.error || null,
-        dispatch_ts, completion_ts: Date.now(), rtm_connected: connected, latched, generation });
-  log("warn", "E-STOP LATCHED (gen " + generation + ", initial_send=" + r0.ok + ")");
+  activeStops++;                                             // (0) mark a STOP dispatch in flight (RESET refused)
+  try {
+    latched = true;                                          // (1) latch BEFORE any await
+    generation = (c.generation != null) ? c.generation : generation + 1;  // (2) invalidate generation
+    if (c.epoch != null) epoch = c.epoch;                    //     adopt the arbiter's transition epoch
+    clearDrive();                                            // (3) clear repeat/timeout timers
+    const z = zeroFrame();
+    const dispatch_ts = Date.now();
+    const r0 = await sendRtm(RTM_DRIVE, z);                  // (4) await the FIRST zero frame
+    const retries = [50, 100, 200];
+    for (const d of retries) setTimeout(() => sendRtm(RTM_DRIVE, z), d);   // (5) schedule retries regardless
+    result(c, {                                              // honest ack: ok == transport, not local safety
+      cmd: "estop", ok: !!r0.ok, local_latch_set: true, initial_zero_sdk_send_succeeded: !!r0.ok,
+      sent_to_agora: !!r0.ok, retry_count: retries.length, error: r0.error || null, dispatch_ts,
+    });
+    log("warn", "E-STOP LATCHED (epoch " + epoch + ", gen " + generation + ", initial_send=" + r0.ok + ")");
+  } finally { activeStops--; }                               // (6) dispatch complete; clear in-flight
 }
 
 // ---- stdin command loop (newline-delimited JSON) ----
@@ -443,9 +493,7 @@ async function _pump() {
     while (_queue.length) {
       const c = _queue.shift();
       if (c.cmd === "drive" && c.generation != null && c.generation !== generation) {
-        out({ ev: "command_result", command_id: (c.command_id != null) ? c.command_id : null, cmd: "drive",
-              sent_to_agora: false, error: "stale_generation", dispatch_ts: Date.now(), completion_ts: Date.now(),
-              rtm_connected: connected, latched, generation });
+        result(c, { sent_to_agora: false, error: "stale_generation" });
         continue;
       }
       try { await handle(c); } catch (e) { log("error", "cmd " + c.cmd + ": " + (e && (e.message || e))); }
@@ -474,4 +522,5 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => teardown().finally(() => process.exit(0)));
 process.on("SIGTERM", () => teardown().finally(() => process.exit(0)));
 if (FAKE) connected = true;   // test seam: report connected so command_result.rtm_connected is sane
-out({ ev: "ready" });
+// P0 §2.1: announce this sidecar's identity so Python binds to THIS instance and rejects a replaced one.
+out({ ev: "ready", sidecar_instance_id: SIDECAR_ID });
