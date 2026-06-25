@@ -1,12 +1,20 @@
 import type { AutobotEvent, Settings } from "./types";
 
+// jpost surfaces the HTTP outcome (P0 §9): the parsed body is augmented with `_status` + `_ok` so callers can
+// distinguish a real success from a non-2xx (e.g. a 409 "still inhibited" RESUME) instead of silently treating
+// every response as success. Network failures resolve to a uniform { _ok:false, _status:0, error } envelope.
 async function jpost(path: string, body?: unknown) {
-  const r = await fetch(path, {
-    method: "POST",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return r.json().catch(() => ({}));
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ...data, _status: r.status, _ok: r.ok };
+  } catch (e) {
+    return { _status: 0, _ok: false, error: String(e) };
+  }
 }
 
 export const api = {

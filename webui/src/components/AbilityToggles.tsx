@@ -24,16 +24,20 @@ export default function AbilityToggles(
         {TOGGLES.map(({ key, cap, label, icon, hint }) => {
           const requested = !!settings[key];
           const c = capabilities?.[cap];
-          const effective = c ? c.effective : requested;        // fall back to requested if no surface yet
-          // green = effective; amber = requested but blocked; grey = not requested
-          const dot = effective ? "bg-ok shadow-[0_0_6px_var(--color-ok)]"
+          const known = !!c;                                    // §9: do NOT imply effective before the kernel reports
+          const effective = known ? c!.effective : false;
+          // grey-pulse = unknown (awaiting authoritative data); green = effective; amber = requested but
+          // blocked; grey = not requested.
+          const dot = !known ? "bg-mut animate-pulse"
+            : effective ? "bg-ok shadow-[0_0_6px_var(--color-ok)]"
             : requested ? "bg-warn shadow-[0_0_6px_var(--color-warn)]" : "bg-line";
           const why = c && requested && !effective ? ` — BLOCKED: ${c.reason || "inhibited"}` : "";
+          const effLabel = known ? (effective ? "ON" : "off") : "unknown (awaiting kernel)";
           return (
             <button
               key={String(key)}
               onClick={() => save({ [key]: !requested } as Partial<Settings>)}
-              title={`${hint} — requested ${requested ? "ON" : "off"}, effective ${effective ? "ON" : "off"}${why}`}
+              title={`${hint} — requested ${requested ? "ON" : "off"}, effective ${effLabel}${why}`}
               className={`relative flex flex-col items-center gap-1 rounded-lg py-2 border transition active:scale-95 ${
                 requested ? "border-accent/70 bg-accent/10 text-fg" : "border-line bg-card2/50 text-mut"
               }`}

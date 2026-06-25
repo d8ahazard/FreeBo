@@ -89,8 +89,12 @@ export function useAutobot() {
           pushFeed({ kind: "estop", text: "RESUMED — faculties restore to their toggles (still manual)", ts: Date.now() / 1000 });
           break;
         case "capabilities":
-          // P0-R4.6: fold the authoritative snapshot into brain so toggles/readiness show effective state.
+          // P0-R4.6 / §9: fold the authoritative snapshot into brain so toggles/readiness show effective
+          // state, AND repair the local STOP display from authoritative master_inhibited (so a missed
+          // estop/estop_reset event can never leave the banner wrong).
+          setEstopLatched(!!e.master_inhibited);
           setBrain((b) => (b ? { ...b, capabilities: e.capabilities, master_inhibited: e.master_inhibited,
+                                  estop_latched: !!e.master_inhibited,
                                   control_generation: e.generation } : b));
           break;
         case "audio_status":

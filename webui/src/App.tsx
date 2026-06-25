@@ -30,14 +30,40 @@ export default function App() {
   const [logOpen, setLogOpen] = useState(true);
   const [stopping, setStopping] = useState(false);
   const [estopErr, setEstopErr] = useState(false);
+  const [estopDegraded, setEstopDegraded] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const [resumeErr, setResumeErr] = useState<string | null>(null);
 
   const triggerEstop = () => {
     setStopping(true);
     setEstopErr(false);
+    setEstopDegraded(false);
     api.estop()
-      .then((r) => { if (!(r && (r.ok || r.latched))) setEstopErr(true); })
+      .then((r) => {
+        // Honest states (§9): the LOCAL inhibit is the safety floor; the TRANSPORT dispatch is the robot link.
+        // A local inhibit with a failed/HTTP-503 transport is "degraded", NOT a clean stop or an outright fail.
+        const localOk = !!(r && (r.local_inhibit_asserted || r.latched));
+        const transportOk = !!(r && r.transport_dispatch_succeeded);
+        if (!localOk) setEstopErr(true);
+        else if (!transportOk || r._ok === false) setEstopDegraded(true);
+      })
       .catch(() => setEstopErr(true))
       .finally(() => setStopping(false));
+  };
+
+  const triggerResume = () => {
+    setResuming(true);
+    setResumeErr(null);
+    api.resume()
+      .then((r) => {
+        // Stay STOPPED unless the server reports a fully reconciled resume (2xx + resumed/ok). A 409 (STOP in
+        // flight / not reconciled / superseded) keeps the banner and shows the exact server error.
+        if (!(r && r._ok && (r.resumed || r.ok))) {
+          setResumeErr(r?.error || `resume rejected (HTTP ${r?._status ?? "?"})`);
+        }
+      })
+      .catch((e) => setResumeErr(String(e)))
+      .finally(() => setResuming(false));
   };
 
   const sendChat = () => {
@@ -78,16 +104,23 @@ export default function App() {
           <MicIndicator audio={audioStatus} allowAudioIn={settings?.allow_audio_in ?? false} />
           {estopLatched ? (
             <div className="flex items-center gap-2">
-              <span className="bg-bad/20 text-bad font-bold rounded-lg px-3 py-2 text-sm border border-bad animate-pulse">
-                ■ STOPPED (inhibited)
+              <span className="bg-bad/20 text-bad font-bold rounded-lg px-3 py-2 text-sm border border-bad animate-pulse"
+                    title={estopDegraded ? "Local inhibit asserted but the robot link did not confirm the stop" : undefined}>
+                ■ STOPPED{estopDegraded ? " (degraded — link unconfirmed)" : " (inhibited)"}
               </span>
               <button
-                onClick={() => api.resume()}
-                className="bg-card2 border border-line text-fg rounded-lg px-3 py-2 text-sm active:scale-95 hover:border-accent/50"
+                onClick={triggerResume}
+                disabled={resuming}
+                className="bg-card2 border border-line text-fg rounded-lg px-3 py-2 text-sm active:scale-95 hover:border-accent/50 disabled:opacity-50"
                 title="RESUME: reconcile the link, lift the master inhibit, restore faculties (autonomy stays manual)"
               >
-                RESUME
+                {resuming ? "RESUMING…" : "RESUME"}
               </button>
+              {resumeErr && (
+                <span className="text-[11px] text-bad hud-mono max-w-[260px] truncate" title={resumeErr}>
+                  ⚠ {resumeErr}
+                </span>
+              )}
             </div>
           ) : (
             <button
