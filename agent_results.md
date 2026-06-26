@@ -123,9 +123,30 @@ inhibited on every attempt.
   unbounded held drive) so a STOP-during-motion is observable under the cloud latency.
 - None of these touch the safety floor or the frozen Phase 0 invariants.
 
+## Live hardware session log (operator-supervised; Air 2)
+- **Run #1 (SHA ae6e71e): ABORTED** — forward cap 0.20 < Air 2 forward deadband 0.25 → forward didn't travel;
+  STOP-staging invalid under ~1 s cloud latency. No safety failure (above).
+- **Fix wave (SHA 2e9b9b0, operator-authorized):** forward cap 0.20→0.30 (above deadband, ≪ forward_max/
+  max_speed); STOP-during-motion staging (sustained capped pulses on a separate client). Forward then **validated
+  moving** on hardware (operator confirmed; transport `sent_to_agora=true`).
+- **INCIDENT:** during re-prep the operator restarted the app, which booted into `autonomy=auto` (from `.env`) and
+  the robot **drove autonomously, unsupervised** — while the **RTC video feed was frozen** (hub `video_count`
+  stuck, audio still flowing), i.e. driving BLIND. This is almost certainly the long-standing root of "it runs
+  into everything." Robot E-STOPped to safe (latched+inhibited+manual).
+- **Fixes applied:** (a) `.env AUTOBOT_AUTONOMY=auto→manual` — restarts no longer auto-drive (fail-safe boot);
+  (b) `_state_payload` now coerces non-finite floats to null (SHA 8ba9916) — a stalled feed made
+  `video_age=inf` 500 the whole `/api/state` (UI + harness readiness); (c) a clean restart **recovered the RTC
+  video** (frames flowing ~20 fps again).
+- **Current state:** app healthy at runtime SHA 2e9b9b0 + the inf fix (8ba9916), `autonomy=manual`, video live,
+  forward motion working.
+- **OPEN (not yet fixed):** `readiness.video_age` can report "fresh" while the feed is actually frozen — so the
+  harness freshness gate cannot currently detect a stalled video track. The RTC video stall itself is intermittent
+  (recovered by restart; root cause not yet found). R4.0 has NOT passed.
+
 ## Phase status
 - Phase 0 software gate: ACCEPTED, FROZEN
-- Phase 0 physical gate: **R4.0 ABORTED (no safety failure; staging/latency)** — re-run required
+- Phase 0 physical gate: **R4.0 ABORTED then recovery session — NOT PASSED** (forward fix validated; video-stall +
+  video_age-accuracy issues open) — re-run required
 - Phase 1 observability: COMPLETE FOR R4.0
 - Phase 2 cognition/model benchmarking: **BLOCKED** (requires an R4.0 PASS — not achieved)
 - Phase 3 personality: BLOCKED
