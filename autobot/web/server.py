@@ -398,10 +398,24 @@ async def _daily_memory_task():
 
 
 # ------------- state + settings -------------
+def _json_safe(obj):
+    """Coerce non-finite floats (inf/nan) to None so the payload is always JSON-serializable. When the video/
+    telemetry feed stalls, age fields become float('inf') — json.dumps rejects that and 500s the whole state
+    endpoint (UI + harness depend on it). A frozen feed must degrade to null, not break the API."""
+    import math as _m
+    if isinstance(obj, float):
+        return obj if _m.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def _state_payload() -> dict:
     tts_ok, tts_backend = tts.available()
     s = SETTINGS.snapshot()
-    return {
+    return _json_safe({
         "settings": SETTINGS.public_dict(),
         "brain": brain.status_dict(),
         "tts": {"available": tts_ok, "backend": tts_backend, "voices": tts.list_voices(),
@@ -417,7 +431,7 @@ def _state_payload() -> dict:
         "audio": (AUDIO_SINK.audio_status() if (AUDIO_SINK and hasattr(AUDIO_SINK, "audio_status")) else None),
         "build": _frontend_build(),
         "journal": (obs.journal().health() if obs.journal() is not None else {"configured": False}),
-    }
+    })
 
 
 @app.get("/api/state")
